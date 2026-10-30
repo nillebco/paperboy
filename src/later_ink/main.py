@@ -23,6 +23,7 @@ from .connectors.instapaper import InstapaperConnector
 from .connectors.readwise import ReadwiseConnector
 from .connectors.wallabag import WallabagConnector
 from .epub import BUILD_VERSION, build_epub
+from .matins import api as matins_api
 from .matins import catalogues as matins_catalogues
 from .matins import config as matins_config
 from .matins import routes as matins_routes
@@ -203,6 +204,7 @@ app = FastAPI(
 
 # Registered before the catch-all tenant routes below, so /{secret}/issues/
 # resolves here rather than to a connector folder lookup.
+app.include_router(matins_api.router)
 app.include_router(matins_routes.router)
 
 

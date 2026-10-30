@@ -58,6 +58,10 @@ What is added on top of Later.Ink:
   timezone, webhook and email, and a `POST /<secret>/save` endpoint for share
   shortcuts.
 
+There is a JSON API at `/api/v1/` (bearer: the catalogue secret) for agents and
+scripts — queue links (with optional pre-extracted `content`), manage feeds,
+preview and compose issues. Endpoints and examples: [`docs/matins.md`](docs/matins.md).
+
 Deployment for a single OCI VM (compute + Caddy + DNS) is in
 [`deploy/oci/`](deploy/oci/README.md). Architecture, data model and the
 security decisions behind them are in [`docs/matins.md`](docs/matins.md).

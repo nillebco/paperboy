@@ -930,3 +930,115 @@ def test_removing_a_feed_and_a_saved_link(client):
     saved = client.app.state.matins.list_saved(secret)[0]
     client.post(f"/{secret}/saved/{saved.id}/delete", data={"csrf": csrf})
     assert client.app.state.matins.list_saved(secret) == []
+
+
+# ----------------------------------------------------------------------- API
+
+
+def _api(secret: str) -> dict:
+    return {"Authorization": f"Bearer {secret}"}
+
+
+def test_api_requires_a_bearer_secret(client):
+    secret = _signup_without_readwise(client)
+    assert client.get("/api/v1/items").status_code == 401
+    assert client.get("/api/v1/items", headers={"authorization": "Bearer nope"}).status_code == 404
+    assert client.get("/api/v1/items", headers=_api(secret)).status_code == 200
+
+
+def test_api_queues_items_with_and_without_content(client):
+    secret = _signup_without_readwise(client)
+    created = client.post(
+        "/api/v1/items",
+        headers=_api(secret),
+        json={"url": "https://example.com/a", "title": "From an agent"},
+    )
+    assert created.status_code == 201
+    assert created.json()["queued"] is True
+
+    duplicate = client.post(
+        "/api/v1/items", headers=_api(secret), json={"url": "https://example.com/a"}
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["queued"] is False
+
+    with_content = client.post(
+        "/api/v1/items",
+        headers=_api(secret),
+        json={
+            "url": "https://example.com/paywalled",
+            "title": "Supplied body",
+            "content": "<p>Text the server could never have fetched.</p>",
+        },
+    )
+    assert with_content.status_code == 201
+
+    listed = client.get("/api/v1/items", headers=_api(secret))
+    items = listed.json()["items"]
+    assert len(items) == 2
+    assert any(item["has_content"] for item in items)
+
+    # The supplied body is used instead of fetching the page.
+    saved = [i for i in client.app.state.matins.list_saved(secret) if i.content]
+    assert saved
+    from later_ink.matins.queue import QueueConnector
+
+    connector = QueueConnector(client.app.state.matins, secret)
+    article, html = __import__("asyncio").run(
+        connector.get_article_html(str(saved[0].id))
+    )
+    assert "Text the server could never have fetched" in html
+
+
+def test_api_rejects_a_bad_item_and_a_huge_body(client):
+    secret = _signup_without_readwise(client)
+    assert (
+        client.post("/api/v1/items", headers=_api(secret), json={"url": "nope"}).status_code
+        == 400
+    )
+    too_big = client.post(
+        "/api/v1/items",
+        headers=_api(secret),
+        json={"url": "https://example.com/x", "content": "x" * (600 * 1024)},
+    )
+    assert too_big.status_code == 413
+
+
+def test_api_manages_feeds(client):
+    secret = _signup_without_readwise(client)
+    added = client.post(
+        "/api/v1/feeds", headers=_api(secret), json={"url": "https://example.com/feed"}
+    )
+    assert added.status_code == 201
+    assert added.json()["title"] == "Example Feed"
+
+    listed = client.get("/api/v1/feeds", headers=_api(secret)).json()["feeds"]
+    assert len(listed) == 1
+
+    assert (
+        client.delete(
+            f"/api/v1/feeds/{listed[0]['id']}", headers=_api(secret)
+        ).status_code
+        == 204
+    )
+    assert client.get("/api/v1/feeds", headers=_api(secret)).json()["feeds"] == []
+
+
+def test_api_previews_and_composes(client):
+    secret = _signup_without_readwise(client)
+    client.post("/api/v1/feeds", headers=_api(secret), json={"url": "https://example.com/feed"})
+    client.post(
+        "/api/v1/items", headers=_api(secret), json={"url": "https://example.com/saved"}
+    )
+
+    preview = client.get("/api/v1/issues/preview", headers=_api(secret)).json()
+    assert len(preview["articles"]) >= 2
+
+    first = client.post("/api/v1/issues", headers=_api(secret))
+    assert first.status_code == 201
+    assert first.json()["articles"] >= 2
+
+    again = client.post("/api/v1/issues", headers=_api(secret))
+    assert again.status_code == 409
+    forced = client.post("/api/v1/issues?force=1", headers=_api(secret))
+    assert forced.status_code in (200, 201)

@@ -62,6 +62,10 @@ class QueueConnector(Connector):
         item = self._store.get_saved(self._secret, saved_id)
         if item is None:
             raise ArticleUnavailable("That saved item is gone", 404)
+        if item.content:
+            # Supplied by the caller (API/agent): trust it as text, but it still
+            # goes through the same sanitising EPUB path as fetched HTML.
+            return _article(item), item.content
         page = await _fetch_page(item.url)
         content = extract.html_to_content(page, item.url) if page else None
         if not content:

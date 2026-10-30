@@ -34,6 +34,11 @@ class SavedItem:
     url: str
     title: str | None
     added_at: float
+    # Clean article HTML supplied by whoever saved the link (an agent, a share
+    # extension with a reader mode). When present it is used instead of fetching
+    # the page, which is the only way to queue something unfetchable.
+    content: str | None = None
+    consumed_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +109,7 @@ class MatinsStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS saved_pending ON saved (secret, consumed_by)"
             )
+            _ensure_column(conn, "saved", "content", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS issues (
@@ -247,7 +253,9 @@ class MatinsStore:
 
     # -------------------------------------------------------- saved queue
 
-    def save_url(self, secret: str, url: str, title: str | None = None) -> bool:
+    def save_url(
+        self, secret: str, url: str, title: str | None = None, content: str | None = None
+    ) -> bool:
         """Queue a link. True if it was new, False if already queued.
 
         Re-saving a consumed link is allowed and re-queues it: the user's intent
@@ -259,40 +267,59 @@ class MatinsStore:
             ).fetchone()
             if row is None:
                 conn.execute(
-                    "INSERT INTO saved (secret, url, title, added_at) VALUES (?, ?, ?, ?)",
-                    (secret, url, title, time.time()),
+                    "INSERT INTO saved (secret, url, title, added_at, content)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (secret, url, title, time.time(), content),
                 )
                 return True
             if row["consumed_by"] is not None:
                 conn.execute(
-                    "UPDATE saved SET consumed_by = NULL, added_at = ? WHERE id = ?",
-                    (time.time(), row["id"]),
+                    "UPDATE saved SET consumed_by = NULL, added_at = ?, content = ?"
+                    " WHERE id = ?",
+                    (time.time(), content, row["id"]),
                 )
+                return True
+            if content is not None:
+                # Re-saving a queued link with body text upgrades it: the agent
+                # may retry with more context than the first attempt had.
+                conn.execute("UPDATE saved SET content = ? WHERE id = ?", (content, row["id"]))
                 return True
             return False
 
     def list_saved(self, secret: str, include_consumed: bool = False) -> list[SavedItem]:
-        sql = "SELECT id, url, title, added_at FROM saved WHERE secret = ?"
+        sql = "SELECT id, url, title, added_at, content, consumed_by FROM saved WHERE secret = ?"
         if not include_consumed:
             sql += " AND consumed_by IS NULL"
         sql += " ORDER BY added_at"
         with self._conn() as conn:
             rows = conn.execute(sql, (secret,)).fetchall()
         return [
-            SavedItem(id=r["id"], url=r["url"], title=r["title"], added_at=r["added_at"])
+            SavedItem(
+                id=r["id"],
+                url=r["url"],
+                title=r["title"],
+                added_at=r["added_at"],
+                content=r["content"],
+                consumed_by=r["consumed_by"],
+            )
             for r in rows
         ]
 
     def get_saved(self, secret: str, saved_id: int) -> SavedItem | None:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT id, url, title, added_at FROM saved WHERE secret = ? AND id = ?",
+                "SELECT id, url, title, added_at, content FROM saved"
+                " WHERE secret = ? AND id = ?",
                 (secret, saved_id),
             ).fetchone()
         if row is None:
             return None
         return SavedItem(
-            id=row["id"], url=row["url"], title=row["title"], added_at=row["added_at"]
+            id=row["id"],
+            url=row["url"],
+            title=row["title"],
+            added_at=row["added_at"],
+            content=row["content"],
         )
 
     # --------------------------------------------------------------- email
@@ -596,6 +623,18 @@ class MatinsStore:
         with self._conn() as conn:
             rows = conn.execute("SELECT * FROM delivery WHERE enabled = 1").fetchall()
         return [_delivery(r, self._fernet) for r in rows]
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Add a column to an existing database.
+
+    CREATE TABLE IF NOT EXISTS does nothing on a database that already has the
+    table, so a column added in a later release has to be introduced here. Cheap
+    enough to check on every start, and it keeps deployments a plain restart.
+    """
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def _issue(row: sqlite3.Row) -> Issue:
