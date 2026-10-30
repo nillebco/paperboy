@@ -686,6 +686,7 @@ def dashboard(
         schedule=delivery.schedule if delivery else config.get_default_schedule(),
         timezone=delivery.timezone if delivery else config.get_default_timezone(),
         scheduling=bool(delivery.enabled) if delivery else False,
+        account_email=store.email_for_secret(secret),
         notice=notice,
         error=error,
     )

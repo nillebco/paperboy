@@ -325,6 +325,13 @@ class MatinsStore:
             ).fetchone()
         return row["secret"] if row else None
 
+    def email_for_secret(self, secret: str) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT email FROM emails WHERE secret = ?", (secret,)
+            ).fetchone()
+        return row["email"] if row else None
+
     def unlink_email(self, secret: str) -> None:
         with self._conn() as conn:
             conn.execute("DELETE FROM emails WHERE secret = ?", (secret,))

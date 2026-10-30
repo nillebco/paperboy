@@ -713,6 +713,45 @@ def test_scheduler_is_due_after_scheduled_time():
 # ------------------------------------------------------------------ sign-in
 
 
+def test_dashboard_prompts_for_an_email_until_one_is_linked(client):
+    secret = _signup_without_readwise(client)
+    before = client.get(f"/{secret}/", headers={"accept": "text/html"})
+    assert "Keep this catalogue recoverable" in before.text
+    assert f"/{secret}/settings" in before.text
+
+    csrf = _csrf(client, secret)
+    client.post(
+        f"/{secret}/settings",
+        data={"csrf": csrf, "email": "ivo@example.com", "schedule": "07:00", "enabled": "1"},
+        follow_redirects=False,
+    )
+    after = client.get(f"/{secret}/", headers={"accept": "text/html"})
+    assert "Keep this catalogue recoverable" not in after.text
+    assert "ivo@example.com" in after.text
+
+
+def test_an_email_cannot_open_two_catalogues(client):
+    first = _signup_without_readwise(client)
+    second = _signup_without_readwise(client)
+    for secret in (first, second):
+        csrf = _csrf(client, secret)
+        client.post(
+            f"/{secret}/settings",
+            data={"csrf": csrf, "email": "ivo@example.com", "schedule": "07:00"},
+            follow_redirects=False,
+        )
+    assert client.app.state.matins.secret_for_email("ivo@example.com") == first
+    # The second attempt is refused and says why, rather than silently stealing
+    # an address that already opens another catalogue.
+    csrf = _csrf(client, second)
+    resp = client.post(
+        f"/{second}/settings",
+        data={"csrf": csrf, "email": "ivo@example.com", "schedule": "07:00"},
+    )
+    assert resp.status_code == 400
+    assert "already opens another catalogue" in resp.text
+
+
 def test_signin_creates_and_recovers_the_same_catalogue(client):
     resp = client.post("/signin", data={"email": "Ivo@Example.com"})
     assert resp.status_code == 200

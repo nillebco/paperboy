@@ -125,6 +125,7 @@ def dashboard_page(
     schedule: str,
     timezone: str,
     scheduling: bool,
+    account_email: str | None = None,
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
@@ -188,11 +189,31 @@ def dashboard_page(
         for issue in issues
     ) or '<p class="meta">No issues yet. Compose one once you have feeds.</p>'
 
+    if account_email:
+        account_block = f"""
+<div class="card">
+  <h2 style="margin-top:0">Account</h2>
+  <p class="small">Sign in with <strong>{escape(account_email)}</strong> — the code
+  email takes you back to this catalogue on any device.</p>
+</div>"""
+    else:
+        account_block = f"""
+<div class="card">
+  <h2 style="margin-top:0">Keep this catalogue recoverable</h2>
+  <p class="small">No email is attached yet, so the URL above is the only way in.
+  Add an address and you can sign in with a one-time code instead.</p>
+  <div class="actions">
+    <a class="btn primary" href="/{secret}/settings">Add an email</a>
+  </div>
+</div>"""
+
     body = f"""
 <h1>Matins</h1>
 <p class="meta">Catalogue <code>/{escape(secret)}/</code> · {_plural(len(feeds), "feed")} ·
 {_plural(len(saved), "saved link")} · {_plural(len(issues), "issue")}</p>
 {banner}
+
+{account_block}
 
 <div class="card">
   <h2 style="margin-top:0">Next issue</h2>
@@ -279,12 +300,23 @@ def settings_page(
     body = f"""
 <p class="meta"><a href="/{escape(secret)}/">&larr; Back to the catalogue</a></p>
 <h1>Delivery</h1>
-<p class="small">When the issue is ready, Matins can call a webhook and send you an
-email. Neither carries the issue itself — that is pulled by your reader.</p>
+<p class="small">When the issue is ready, Matins can call a webhook and send a
+notification. Neither carries the issue itself — that is pulled by your reader.</p>
 {banner}
 
 <form method="post" action="/{escape(secret)}/settings">
   <input type="hidden" name="csrf" value="{escape(csrf)}">
+
+  <div class="card">
+    <h2 style="margin-top:0">Account</h2>
+    <label for="email">Email used to sign in</label>
+    <input type="email" id="email" name="email" value="{escape(email)}"
+      placeholder="you@example.com">
+    <p class="meta">Saving an address attaches it to this catalogue: from then on
+    <code>/signin</code> with a one-time code returns this catalogue, on any
+    device. One address can only open one catalogue. It is also where issue
+    notifications go.</p>
+  </div>
 
   <div class="card">
     <h2 style="margin-top:0">Schedule</h2>
@@ -297,14 +329,6 @@ email. Neither carries the issue itself — that is pulled by your reader.</p>
       <input type="checkbox" name="enabled" value="1" {'checked' if enabled else ''}>
       Compose and deliver automatically
     </label>
-  </div>
-
-  <div class="card">
-    <h2 style="margin-top:0">Email</h2>
-    <label for="email">Send a notification to</label>
-    <input type="email" id="email" name="email" value="{escape(email)}"
-      placeholder="you@example.com">
-    <p class="meta">Just a subject line and a link. The issue is never attached.</p>
   </div>
 
   <div class="card">
