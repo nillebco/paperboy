@@ -392,6 +392,14 @@ def client(tmp_path, monkeypatch):
     async def fake_page(url):
         return ARTICLE_HTML
 
+    sent_codes: dict[str, str] = {}
+
+    async def fake_send_code(recipient, code, **_kwargs):
+        sent_codes[recipient] = code
+        return True
+
+    monkeypatch.setattr("later_ink.matins.notify.send_code", fake_send_code)
+
     monkeypatch.setattr("later_ink.matins.rss.fetch_feed", fake_fetch_feed)
     monkeypatch.setattr("later_ink.matins.queue._fetch_page", fake_page)
 
@@ -401,6 +409,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(readwise, "validate_token", fake_validate)
 
     with TestClient(app=main.app) as c:
+        c.sent_codes = sent_codes
         yield c
 
 
@@ -410,6 +419,15 @@ def _signup_without_readwise(client) -> str:
     match = re.search(rf"/{SECRET_PAT}/regenerate", resp.text)
     assert match
     return match.group(1)
+
+
+def _add_feed(client, secret: str, url: str = "https://example.com/feed"):
+    csrf = _csrf(client, secret)
+    resp = client.post(
+        f"/{secret}/feeds", data={"csrf": csrf, "url": url}, follow_redirects=False
+    )
+    assert resp.status_code == 303, resp.text
+    return resp.headers["location"]
 
 
 def _csrf(client, secret: str) -> str:
@@ -428,7 +446,7 @@ def test_catalogue_can_be_created_without_readwise(client):
     assert "Saved" in root.text
 
 
-def test_settings_adds_feeds_and_saves_delivery(client):
+def test_settings_saves_delivery(client):
     secret = _signup_without_readwise(client)
     csrf = _csrf(client, secret)
 
@@ -436,21 +454,6 @@ def test_settings_adds_feeds_and_saves_delivery(client):
         f"/{secret}/settings",
         data={
             "csrf": csrf,
-            "feeds": "https://example.com/feed\nnot a url",
-            "schedule": "07:00",
-            "timezone": "Europe/Paris",
-            "enabled": "1",
-        },
-        follow_redirects=False,
-    )
-    assert resp.status_code == 400
-    assert "not a url" in resp.text
-
-    resp = client.post(
-        f"/{secret}/settings",
-        data={
-            "csrf": csrf,
-            "feeds": "https://example.com/feed",
             "email": "me@example.com",
             "webhook_url": "https://example.com/hook",
             "webhook_secret": "whsec",
@@ -463,12 +466,30 @@ def test_settings_adds_feeds_and_saves_delivery(client):
     assert resp.status_code == 303
 
     page = client.get(f"/{secret}/settings").text
-    assert "https://example.com/feed" in page
     assert "07:15" in page
+    assert "me@example.com" in page
     delivery = client.app.state.matins.get_delivery(secret)
     assert delivery is not None
     assert delivery.email == "me@example.com"
     assert delivery.webhook_secret == "whsec"
+
+
+def test_settings_rejects_a_bad_timezone_and_keeps_the_rest(client):
+    secret = _signup_without_readwise(client)
+    csrf = _csrf(client, secret)
+    resp = client.post(
+        f"/{secret}/settings",
+        data={
+            "csrf": csrf,
+            "email": "me@example.com",
+            "schedule": "07:15",
+            "timezone": "Nowhere/Nope",
+        },
+    )
+    assert resp.status_code == 400
+    assert "Nowhere/Nope" in resp.text
+    # The other field the user typed survives the re-render.
+    assert "me@example.com" in resp.text
 
 
 def test_settings_render_after_saving_blank_optional_fields(client):
@@ -478,7 +499,6 @@ def test_settings_render_after_saving_blank_optional_fields(client):
         f"/{secret}/settings",
         data={
             "csrf": csrf,
-            "feeds": "https://example.com/feed",
             "email": "",
             "webhook_url": "",
             "webhook_secret": "",
@@ -493,7 +513,7 @@ def test_settings_render_after_saving_blank_optional_fields(client):
     # them must not blow up on escape(None).
     page = client.get(f"/{secret}/settings?saved=1")
     assert page.status_code == 200
-    assert "feeds" in page.text
+    assert "Webhook" in page.text
 
 
 def test_save_endpoint_queues_a_link(client):
@@ -556,11 +576,7 @@ def test_issue_download_is_scoped_to_its_catalogue(client):
     first = _signup_without_readwise(client)
     second = _signup_without_readwise(client)
     csrf = _csrf(client, first)
-    client.post(
-        f"/{first}/settings",
-        data={"csrf": csrf, "feeds": "https://example.com/feed", "schedule": "07:00"},
-        follow_redirects=False,
-    )
+    _add_feed(client, first)
     client.post(f"/{first}/issues/build", data={"csrf": csrf})
     issue = client.app.state.matins.list_issues(first)[0]
 
@@ -570,11 +586,7 @@ def test_issue_download_is_scoped_to_its_catalogue(client):
 def test_deleting_a_catalogue_removes_its_feeds_queue_and_issues(client):
     secret = _signup_without_readwise(client)
     csrf = _csrf(client, secret)
-    client.post(
-        f"/{secret}/settings",
-        data={"csrf": csrf, "feeds": "https://example.com/feed", "schedule": "07:00"},
-        follow_redirects=False,
-    )
+    _add_feed(client, secret)
     client.post(f"/{secret}/save", json={"url": "https://example.com/later"})
     client.post(f"/{secret}/issues/build", data={"csrf": csrf})
     issue = client.app.state.matins.list_issues(secret)[0]
@@ -600,9 +612,10 @@ def test_browser_gets_a_dashboard_and_readers_get_opds(client):
     html = client.get(f"/{secret}/", headers={"accept": "text/html"})
     assert html.status_code == 200
     assert html.headers["content-type"].startswith("text/html")
-    assert "Compose an issue now" in html.text
+    assert "Compose now" in html.text
     assert f"/{secret}/settings" in html.text
     assert f"/{secret}/issues/preview" in html.text
+    assert f"/{secret}/read" in html.text
 
     # A reader asking for nothing (or for Atom) still gets the catalogue.
     feed = client.get(f"/{secret}/", headers={"accept": "*/*"})
@@ -632,11 +645,7 @@ def test_landing_lists_the_catalogues_this_browser_has(client):
 def test_preview_and_issue_use_the_feed_title_not_its_url(client):
     secret = _signup_without_readwise(client)
     csrf = _csrf(client, secret)
-    client.post(
-        f"/{secret}/settings",
-        data={"csrf": csrf, "feeds": "https://example.com/feed", "schedule": "07:00"},
-        follow_redirects=False,
-    )
+    _add_feed(client, secret)
     preview = client.get(f"/{secret}/issues/preview")
     assert "Example Feed" in preview.text
     assert "https://example.com/feed" not in preview.text
@@ -655,11 +664,7 @@ def test_preview_shows_the_selection_without_composing(client):
     assert empty.status_code == 200
     assert "Nothing is queued" in empty.text
 
-    client.post(
-        f"/{secret}/settings",
-        data={"csrf": csrf, "feeds": "https://example.com/feed", "schedule": "07:00"},
-        follow_redirects=False,
-    )
+    _add_feed(client, secret)
     client.post(f"/{secret}/save", json={"url": "https://example.com/later"})
 
     preview = client.get(f"/{secret}/issues/preview")
@@ -678,14 +683,10 @@ def test_preview_shows_the_selection_without_composing(client):
 def test_admin_run_requires_token(client, monkeypatch):
     secret = _signup_without_readwise(client)
     csrf = _csrf(client, secret)
+    _add_feed(client, secret)
     client.post(
         f"/{secret}/settings",
-        data={
-            "csrf": csrf,
-            "feeds": "https://example.com/feed",
-            "schedule": "07:00",
-            "enabled": "1",
-        },
+        data={"csrf": csrf, "schedule": "07:00", "enabled": "1"},
         follow_redirects=False,
     )
 
@@ -707,3 +708,186 @@ def test_scheduler_is_due_after_scheduled_time():
     assert not scheduler._due("07:00", "Europe/Paris", datetime(2026, 10, 30, 4, 0, tzinfo=UTC))
     assert not scheduler._due("garbage", "Europe/Paris", datetime(2026, 10, 30, 9, 0, tzinfo=UTC))
     assert not scheduler._due("07:00", "Nowhere/Nope", datetime(2026, 10, 30, 9, 0, tzinfo=UTC))
+
+
+# ------------------------------------------------------------------ sign-in
+
+
+def test_signin_creates_and_recovers_the_same_catalogue(client):
+    resp = client.post("/signin", data={"email": "Ivo@Example.com"})
+    assert resp.status_code == 200
+    assert "Check your email" in resp.text
+    code = client.sent_codes["ivo@example.com"]
+    assert len(code) == 6 and code.isdigit()
+
+    wrong = client.post(
+        "/signin/code", data={"email": "ivo@example.com", "code": "000000"}
+    )
+    assert wrong.status_code == 400
+
+    ok = client.post(
+        "/signin/code", data={"email": "ivo@example.com", "code": code},
+        follow_redirects=False,
+    )
+    assert ok.status_code == 303
+    first = ok.headers["location"]
+
+    # A different browser, same address: same catalogue, no link to keep.
+    other = TestClient(app=main.app)
+    client.sent_codes.clear()
+    other.post("/signin", data={"email": "ivo@example.com"})
+    again = other.post(
+        "/signin/code",
+        data={"email": "ivo@example.com", "code": client.sent_codes["ivo@example.com"]},
+        follow_redirects=False,
+    )
+    assert again.status_code == 303
+    assert again.headers["location"] == first
+
+
+def test_signin_codes_expire_and_are_rate_limited(client):
+    client.post("/signin", data={"email": "ivo@example.com"})
+    code = client.sent_codes["ivo@example.com"]
+
+    with client.app.state.matins._conn() as conn:
+        conn.execute("UPDATE otp SET expires_at = 0 WHERE email = ?", ("ivo@example.com",))
+    expired = client.post("/signin/code", data={"email": "ivo@example.com", "code": code})
+    assert "expired" in expired.text
+
+    # A live challenge that has already spent its attempts is refused outright.
+    import time as _time
+
+    with client.app.state.matins._conn() as conn:
+        conn.execute(
+            "UPDATE otp SET expires_at = ?, attempts = 5 WHERE email = ?",
+            (_time.time() + 600, "ivo@example.com"),
+        )
+    blocked = client.post(
+        "/signin/code", data={"email": "ivo@example.com", "code": "111111"}
+    )
+    assert blocked.status_code == 429
+
+
+def test_signin_does_not_say_whether_an_address_exists(client):
+    # Same shape for an unknown address and one with a catalogue.
+    client.post("/signin", data={"email": "nobody@example.com"})
+    unknown = client.post("/signin", data={"email": "nobody@example.com"})
+    _secret = _signup_without_readwise(client)
+    known = client.post("/signin", data={"email": "nobody@example.com"})
+    assert unknown.status_code == known.status_code == 200
+    assert "Check your email" in unknown.text and "Check your email" in known.text
+
+
+def test_a_catalogue_saved_with_an_email_can_be_found_by_code(client):
+    secret = _signup_without_readwise(client)
+    csrf = _csrf(client, secret)
+    client.post(
+        f"/{secret}/settings",
+        data={
+            "csrf": csrf,
+            "email": "ivo@example.com",
+            "schedule": "07:00",
+            "enabled": "1",
+        },
+        follow_redirects=False,
+    )
+    other = TestClient(app=main.app)
+    client.sent_codes.clear()
+    other.post("/signin", data={"email": "ivo@example.com"})
+    landed = other.post(
+        "/signin/code",
+        data={"email": "ivo@example.com", "code": client.sent_codes["ivo@example.com"]},
+        follow_redirects=False,
+    )
+    assert landed.headers["location"] == f"/{secret}/"
+
+
+# ------------------------------------------------------------------- reader
+
+
+def test_reader_lists_items_and_opening_one_marks_it_read(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    client.post(f"/{secret}/save", json={"url": "https://example.com/later"})
+
+    page = client.get(f"/{secret}/read")
+    assert page.status_code == 200
+    assert "First story" in page.text
+    assert "Saved for later" in page.text
+    # The list is newest-first, so pick the item by title rather than position.
+    match = re.search(
+        rf'href="/{re.escape(secret)}/read/([^"]+)"[^>]*>First story', page.text
+    )
+    assert match, page.text
+    article_id = match.group(1)
+    assert article_id.startswith("feeds:")
+    opened = client.get(f"/{secret}/read/{article_id}")
+    assert opened.status_code == 200
+    assert "Body text of the first story" in opened.text
+    assert "script" not in opened.text.lower()
+
+    after = client.get(f"/{secret}/read")
+    assert f"/read/{article_id}" not in after.text
+    everything = client.get(f"/{secret}/read?all=1")
+    assert f"/read/{article_id}" in everything.text
+
+    client.post(f"/{secret}/read/{article_id}/unread", data={"csrf": _csrf(client, secret)})
+    assert f"/read/{article_id}" in client.get(f"/{secret}/read").text
+
+
+def test_reader_article_html_is_sanitised():
+    from later_ink.matins.reader import to_page_html
+
+    out = to_page_html(
+        '<p>ok</p><script>alert(1)</script>'
+        '<a href="javascript:alert(1)">bad</a>'
+        '<a href="https://example.com/x">good</a>'
+        '<img src="https://example.com/i.png" onerror="alert(1)">'
+    )
+    assert "script" not in out.lower()
+    assert "javascript:" not in out
+    assert "onerror" not in out
+    assert 'target="_blank"' in out
+
+
+# ------------------------------------------------------------------- sources
+
+
+def test_adding_a_feed_validates_it_immediately(client, monkeypatch):
+    secret = _signup_without_readwise(client)
+    csrf = _csrf(client, secret)
+
+    bad_url = client.post(
+        f"/{secret}/feeds",
+        data={"csrf": csrf, "url": "not a url"},
+        follow_redirects=False,
+    )
+    assert bad_url.status_code == 303
+    assert "error=" in bad_url.headers["location"]
+
+    async def html_body(url, *, timeout, max_bytes):
+        return b"<html><body>not a feed</body></html>"
+
+    monkeypatch.setattr("later_ink.matins.rss.fetch_feed", html_body)
+    not_feed = client.post(
+        f"/{secret}/feeds",
+        data={"csrf": csrf, "url": "https://example.com/page"},
+        follow_redirects=False,
+    )
+    assert "error=" in not_feed.headers["location"]
+    assert client.app.state.matins.list_feeds(secret) == []
+
+
+def test_removing_a_feed_and_a_saved_link(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    client.post(f"/{secret}/save", json={"url": "https://example.com/later"})
+    csrf = _csrf(client, secret)
+
+    feed = client.app.state.matins.list_feeds(secret)[0]
+    client.post(f"/{secret}/feeds/{feed.id}/delete", data={"csrf": csrf})
+    assert client.app.state.matins.list_feeds(secret) == []
+
+    saved = client.app.state.matins.list_saved(secret)[0]
+    client.post(f"/{secret}/saved/{saved.id}/delete", data={"csrf": csrf})
+    assert client.app.state.matins.list_saved(secret) == []

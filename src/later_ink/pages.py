@@ -465,6 +465,7 @@ def landing(
     Every item is fetched as a clean EPUB, images and all, that reads fully offline.</p>
   {note}
   <div class="cta-row">{cta}{ghost}</div>
+  <p class="small" style="margin-top:1rem"><a class="inline" href="/signin">Already have a catalogue? Sign in with your email</a></p>
 </section>
 
 <figure class="demo">

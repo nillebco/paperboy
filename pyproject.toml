@@ -17,8 +17,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://later.ink"
-Source = "https://github.com/brendanlefebvre/later-ink"
+Homepage = "https://matins.nilleb.co"
+Source = "https://github.com/nillebco/paperboy"
+Upstream = "https://github.com/brendanlefebvre/later-ink"
 
 [project.optional-dependencies]
 dev = [

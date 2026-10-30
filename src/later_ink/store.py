@@ -172,8 +172,8 @@ def classify_user_agent(ua: str | None) -> tuple[str, str]:
 
 
 RESERVED_PATHS = {
-    "opds", "start", "health", "healthz", "version", "stats", "static", "assets",
-    "docs", "openapi.json", "favicon.ico", "robots.txt",
+    "opds", "start", "signin", "health", "healthz", "version", "stats", "static",
+    "assets", "docs", "openapi.json", "favicon.ico", "robots.txt", "admin",
 }
 
 # Four words ≈ 35 bits over the 419-word list — guessable-any-user math stops

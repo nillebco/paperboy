@@ -45,7 +45,7 @@ sudo netfilter-persistent save    # or iptables-services / Oracle's persistence
 
 ```bash
 sudo mkdir -p /srv/matins && sudo chown "$USER" /srv/matins
-git clone git@github.com:nilleb/matins.git /srv/matins/app   # or a release tarball
+git clone git@github.com:nillebco/paperboy.git /srv/matins/app   # or a release tarball
 cd /srv/matins/app/deploy/oci
 
 cp env.example /srv/matins/env

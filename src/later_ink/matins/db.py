@@ -141,6 +141,47 @@ class MatinsStore:
                 "CREATE INDEX IF NOT EXISTS issue_items_seen"
                 " ON issue_items (secret, article_id)"
             )
+            # Email -> catalogue, so a one-time code can recover a catalogue on
+            # a new device. One address maps to one catalogue: an email that
+            # opened two would have to guess which one a code meant.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS emails (
+                    email TEXT PRIMARY KEY,
+                    secret TEXT NOT NULL,
+                    linked_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS emails_by_secret ON emails (secret)"
+            )
+            # One live challenge per address. Only a hash is stored: a database
+            # copy must not be enough to replay a code that is still valid.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS otp (
+                    email TEXT PRIMARY KEY,
+                    code_hash TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    sent_at REAL NOT NULL
+                )
+                """
+            )
+            # Read state for the in-browser reader. Separate from issues: having
+            # printed an article is not the same as having read it, and one must
+            # not imply the other in the unread count.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reads (
+                    secret TEXT NOT NULL,
+                    article_id TEXT NOT NULL,
+                    read_at REAL NOT NULL,
+                    PRIMARY KEY (secret, article_id)
+                )
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS delivery (
@@ -254,6 +295,125 @@ class MatinsStore:
             id=row["id"], url=row["url"], title=row["title"], added_at=row["added_at"]
         )
 
+    # --------------------------------------------------------------- email
+
+    def link_email(self, secret: str, email: str) -> None:
+        """Attach an address to a catalogue.
+
+        Raises ValueError when the address already belongs to a different
+        catalogue: silently stealing it would hand one person's catalogue to
+        whoever controls the other mailbox.
+        """
+        with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT secret FROM emails WHERE email = ?", (email,)
+            ).fetchone()
+            if existing is not None and existing["secret"] != secret:
+                raise ValueError("that email already opens another catalogue")
+            conn.execute("DELETE FROM emails WHERE secret = ?", (secret,))
+            conn.execute(
+                "INSERT INTO emails (email, secret, linked_at) VALUES (?, ?, ?)"
+                " ON CONFLICT (email) DO UPDATE SET secret = excluded.secret,"
+                " linked_at = excluded.linked_at",
+                (email, secret, time.time()),
+            )
+
+    def secret_for_email(self, email: str) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT secret FROM emails WHERE email = ?", (email,)
+            ).fetchone()
+        return row["secret"] if row else None
+
+    def unlink_email(self, secret: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM emails WHERE secret = ?", (secret,))
+
+    def set_otp(self, email: str, code_hash: str, *, ttl: float) -> None:
+        now = time.time()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO otp (email, code_hash, expires_at, attempts, sent_at)"
+                " VALUES (?, ?, ?, 0, ?)"
+                " ON CONFLICT (email) DO UPDATE SET code_hash = excluded.code_hash,"
+                " expires_at = excluded.expires_at, attempts = 0, sent_at = excluded.sent_at",
+                (email, code_hash, now + ttl, now),
+            )
+
+    def otp_state(self, email: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM otp WHERE email = ?", (email,)).fetchone()
+        return dict(row) if row else None
+
+    def bump_otp_attempts(self, email: str) -> int:
+        with self._conn() as conn:
+            conn.execute("UPDATE otp SET attempts = attempts + 1 WHERE email = ?", (email,))
+            row = conn.execute("SELECT attempts FROM otp WHERE email = ?", (email,)).fetchone()
+        return row["attempts"] if row else 0
+
+    def clear_otp(self, email: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM otp WHERE email = ?", (email,))
+
+    def otp_cooldown_ok(self, email: str, *, cooldown: float) -> bool:
+        """One send per address per cooldown. The hourly cap is a durable
+        limiter keyed by the address (see routes), not a row count — the row is
+        overwritten in place, so counting it would always say "one"."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT sent_at FROM otp WHERE email = ?", (email,)).fetchone()
+        return row is None or time.time() - row["sent_at"] >= cooldown
+
+    # ------------------------------------------------------------- reading
+
+    def mark_read(self, secret: str, article_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO reads (secret, article_id, read_at) VALUES (?, ?, ?)"
+                " ON CONFLICT (secret, article_id) DO UPDATE SET read_at = excluded.read_at",
+                (secret, article_id, time.time()),
+            )
+
+    def mark_unread(self, secret: str, article_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM reads WHERE secret = ? AND article_id = ?",
+                (secret, article_id),
+            )
+
+    def is_read(self, secret: str, article_id: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM reads WHERE secret = ? AND article_id = ?",
+                (secret, article_id),
+            ).fetchone()
+        return row is not None
+
+    def read_ids(self, secret: str, article_ids: list[str]) -> set[str]:
+        seen: set[str] = set()
+        for i in range(0, len(article_ids), 500):
+            chunk = article_ids[i : i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            with self._conn() as conn:
+                rows = conn.execute(
+                    f"SELECT article_id FROM reads WHERE secret = ?"
+                    f" AND article_id IN ({placeholders})",
+                    (secret, *chunk),
+                ).fetchall()
+            seen.update(r["article_id"] for r in rows)
+        return seen
+
+    def forget_reads(self, secret: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM reads WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM emails WHERE secret = ?", (secret,))
+
+    def delete_saved(self, secret: str, saved_id: int) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM saved WHERE secret = ? AND id = ?", (secret, saved_id)
+            )
+        return cur.rowcount > 0
+
     def consume_saved(self, secret: str, ids: list[int], issue_id: str) -> None:
         if not ids:
             return
@@ -351,6 +511,8 @@ class MatinsStore:
             conn.execute("DELETE FROM saved WHERE secret = ?", (secret,))
             conn.execute("DELETE FROM feeds WHERE secret = ?", (secret,))
             conn.execute("DELETE FROM delivery WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM reads WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM emails WHERE secret = ?", (secret,))
 
     def has_issue_for_day(self, secret: str, local_day: str) -> bool:
         with self._conn() as conn:

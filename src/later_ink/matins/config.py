@@ -69,6 +69,16 @@ def get_scheduler_interval() -> float:
     return float(_int("MATINS_SCHEDULER_INTERVAL_SECONDS", 60, minimum=5))
 
 
+def get_otp_per_hour() -> int:
+    """Sign-in codes one address may request per hour. A person needs one or
+    two; a loop needs to be stopped."""
+    return _int("OTP_PER_HOUR", 5, minimum=1)
+
+
+def get_otp_cooldown() -> float:
+    return float(_int("OTP_COOLDOWN_SECONDS", 60, minimum=1))
+
+
 def get_admin_token() -> str | None:
     return os.environ.get("ADMIN_TOKEN") or None
 

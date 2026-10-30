@@ -32,6 +32,31 @@ def issue_body(issue, catalog_url: str) -> str:
     )
 
 
+async def send_code(recipient: str, code: str, *, smtp: dict | None = None) -> bool:
+    """Send a sign-in code. Short, text-only, no link — a code email with a link
+    trains people to click, which is the phishing habit this avoids."""
+    smtp = smtp or config.get_smtp_config()
+    if not smtp:
+        logger.warning("no SMTP configured; cannot send a sign-in code")
+        return False
+    message = EmailMessage()
+    message["From"] = str(smtp["sender"])
+    message["To"] = recipient
+    message["Subject"] = f"{code} is your Matins code"
+    message.set_content(
+        f"Your Matins sign-in code is {code}.\n\n"
+        "It expires in 10 minutes and can be used once.\n\n"
+        "If you did not ask for this, ignore the message — nobody can sign in "
+        "without the code.\n"
+    )
+    try:
+        await asyncio.to_thread(_send, smtp, recipient, message)
+    except (OSError, smtplib.SMTPException) as e:
+        logger.warning("code email to %s failed: %s", _mask(recipient), e)
+        return False
+    return True
+
+
 async def send_issue_notification(
     recipient: str, issue, catalog_url: str, *, smtp: dict | None = None
 ) -> bool:

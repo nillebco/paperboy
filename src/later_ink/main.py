@@ -138,6 +138,12 @@ async def lifespan(app: FastAPI):
         limit=config.get_signup_rate_limit(),
         window=3600.0,
     )
+    app.state.otp_limiter = DurableLimiter(
+        app.state.store,
+        bucket="otp",
+        limit=matins_config.get_otp_per_hour(),
+        window=3600.0,
+    )
     app.state.feed_limiter = MemoryLimiter(
         limit=config.get_feed_rate_limit(), window=60.0
     )
@@ -803,7 +809,14 @@ async def tenant_delete(secret: str, request: Request, csrf: str | None = Form(N
 async def tenant_root(secret: str, request: Request):
     _resolve_secret(secret, request)
     if _wants_html(request):
-        response = HTMLResponse(matins_routes.dashboard(request, secret))
+        response = HTMLResponse(
+            matins_routes.dashboard(
+                request,
+                secret,
+                notice=request.query_params.get("notice"),
+                error=request.query_params.get("error"),
+            )
+        )
         matins_catalogues.remember(secret, request, response)
         return response
     c = await _tenant_connector(secret)

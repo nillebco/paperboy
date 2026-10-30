@@ -13,6 +13,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from html import unescape
 
 import httpx
 from lxml import etree
@@ -236,7 +237,11 @@ def _parse_date(value: str | None) -> datetime | None:
 def _text(el) -> str:
     if el is None:
         return ""
-    return " ".join((el.text_content() if hasattr(el, "text_content") else el.text or "").split())
+    raw = el.text_content() if hasattr(el, "text_content") else el.text or ""
+    # Publishers double-encode: the title is HTML-escaped, then XML-escaped, so
+    # lxml decodes once and "AI Isn&#x27;t…" survives as literal text. Decoding
+    # again is safe here because this is a text field, never markup.
+    return " ".join(unescape(raw).split())
 
 
 def _element_html(el) -> str | None:

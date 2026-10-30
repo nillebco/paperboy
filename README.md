@@ -36,7 +36,7 @@ can be turned on for cross-device reading-progress sync; see below.)
 
 ## Matins
 
-This repository is a fork of Later.Ink, extended into **Matins**: a multi-user
+[This repository](https://github.com/nillebco/paperboy) is a fork of Later.Ink, extended into **Matins**: a multi-user
 service that composes a dated **issue** — your saved links plus everything new
 in your RSS feeds — into one EPUB, and delivers it to an e-reader over OPDS.
 
