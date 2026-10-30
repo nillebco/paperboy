@@ -95,9 +95,10 @@ class IssueService:
         reader,
         local_day: str,
         now: datetime | None = None,
+        only: str | None = None,
     ) -> Issue | None:
         now = now or datetime.now(UTC)
-        candidates = await self.plan(secret, reader, now)
+        candidates = await self.plan(secret, reader, now, only=only)
         logger.info("issue for %s on %s: %d candidates", _mask(secret), local_day, len(candidates))
         if not candidates:
             return None
@@ -234,6 +235,7 @@ class IssueService:
         secret: str,
         reader,
         now: datetime | None = None,
+        only: str | None = None,
     ) -> list[Candidate]:
         """What the next issue would contain, without fetching anything.
 
@@ -243,8 +245,15 @@ class IssueService:
 
         Saved items come first and are exempt from the per-feed cap: a link the
         user deliberately queued is a stronger signal than anything a feed
-        pushed at them."""
+        pushed at them.
+
+        `only="queue"` stops after the queue. An external curator (an agent that
+        has already read the feeds and picked) composes an issue from exactly
+        what it queued, instead of having the automatic feed selection add to
+        it."""
         now = now or datetime.now(UTC)
+        if only not in (None, "queue"):
+            raise ValueError(f"unknown issue source filter: {only!r}")
         selected: list[Candidate] = []
         limits = limits_for(self.store.get_delivery(secret))
         budget = limits.max_words
@@ -264,7 +273,7 @@ class IssueService:
                 selected.append(Candidate("later", article, SAVED_SECTION))
                 budget -= cost
 
-        feeds = reader.sources.get("rss")
+        feeds = None if only == "queue" else reader.sources.get("rss")
         if feeds is not None:
             try:
                 folders = await feeds.list_folders()

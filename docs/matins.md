@@ -146,8 +146,8 @@ pages use the same service layer, so nothing here has powers the UI lacks.
 | GET/POST | `/api/v1/feeds` | list / subscribe `{url}` |
 | DELETE | `/api/v1/feeds/{id}` | unsubscribe |
 | GET | `/api/v1/issues` | composed issues and download paths |
-| GET | `/api/v1/issues/preview` | exactly what the next issue would contain |
-| POST | `/api/v1/issues?force=0\|1` | compose and deliver now (409 if today's exists) |
+| GET | `/api/v1/issues/preview` | exactly what the next issue would contain (`only=queue` for a curated preview) |
+| POST | `/api/v1/issues?force=0\|1` | compose and deliver now (409 if today's exists); `only=queue` composes the queue alone |
 
 ```bash
 S=your-four-word-secret
@@ -160,6 +160,13 @@ curl -sS -X POST https://matins.example/api/v1/items \
 as-is instead of the server fetching the page (capped at 512 KiB). That is how
 you queue something the server cannot reach — a paywall, an authenticated page,
 a generated summary — and it still goes through the same sanitising EPUB path.
+
+`only=queue` is the curator's option. A client that already chose the day's
+articles queues them and composes with `POST /api/v1/issues?only=queue`: the
+automatic feed selection is skipped, so the edition contains exactly the queue
+(and the queue's own cap). Preview accepts the same parameter, so the choice can
+be checked before anything is written. Both endpoints reject any other `only`
+value; "everything" is the absence of the parameter.
 
 Why not Readwise: it works only if the catalogue has a Readwise token wired in,
 it costs a subscription, and it cannot express feeds. Matins owns the queue and

@@ -191,11 +191,16 @@ async def list_issues(request: Request):
 
 
 @router.get("/issues/preview")
-async def preview_issue(request: Request):
-    """Exactly what the next issue would contain, without composing it."""
+async def preview_issue(request: Request, only: str | None = None):
+    """Exactly what the next issue would contain, without composing it.
+
+    `only=queue` previews a curated issue: the saved queue alone, without the
+    automatic feed selection.
+    """
+    only = _only(only)
     secret = _secret(request)
     reader = await request.app.state.tenant_reader(secret)
-    candidates = await request.app.state.issues.plan(secret, reader)
+    candidates = await request.app.state.issues.plan(secret, reader, only=only)
     return {
         "articles": [
             {
@@ -211,8 +216,14 @@ async def preview_issue(request: Request):
 
 
 @router.post("/issues", status_code=201)
-async def compose_issue(request: Request, force: int = 0):
-    """Compose and deliver now. Idempotent per local day unless `force=1`."""
+async def compose_issue(request: Request, force: int = 0, only: str | None = None):
+    """Compose and deliver now. Idempotent per local day unless `force=1`.
+
+    `only=queue` composes from the queue alone — the entry point for an agent
+    that curates the day's articles itself and does not want the automatic feed
+    selection added on top.
+    """
+    only = _only(only)
     secret = _secret(request)
     store = _store(request)
     service = request.app.state.issues
@@ -221,7 +232,7 @@ async def compose_issue(request: Request, force: int = 0):
     if not force and store.has_issue_for_day(secret, day):
         raise HTTPException(409, "An issue already exists for today; pass force=1 to build another")
     reader = await request.app.state.tenant_reader(secret)
-    issue = await service.build(secret=secret, reader=reader, local_day=day)
+    issue = await service.build(secret=secret, reader=reader, local_day=day, only=only)
     if issue is None:
         return JSONResponse({"issue": None, "reason": "nothing new to compose"}, status_code=200)
     await service.deliver(secret, issue)
@@ -235,6 +246,17 @@ async def compose_issue(request: Request, force: int = 0):
 
 
 # ------------------------------------------------------------------- shared
+
+
+def _only(value: str | None) -> str | None:
+    """Validate the optional source filter. Only the queue is selectable today:
+    "everything" is the absence of the parameter, which keeps the common call
+    and every existing client unchanged."""
+    if value in (None, ""):
+        return None
+    if value != "queue":
+        raise HTTPException(400, "only must be 'queue' when given")
+    return value
 
 
 async def _json(request: Request) -> dict:

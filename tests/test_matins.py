@@ -1384,3 +1384,34 @@ def test_api_previews_and_composes(client):
     assert again.status_code == 409
     forced = client.post("/api/v1/issues?force=1", headers=_api(secret))
     assert forced.status_code in (200, 201)
+
+
+def test_api_queue_only_issue_is_exactly_what_an_agent_queued(client):
+    """A curator queues its picks and asks for those alone: the automatic feed
+    selection must not dilute the edition it just chose."""
+    secret = _signup_without_readwise(client)
+    client.post("/api/v1/feeds", headers=_api(secret), json={"url": "https://example.com/feed"})
+    client.post(
+        "/api/v1/items", headers=_api(secret), json={"url": "https://example.com/pick"}
+    )
+
+    everything = client.get("/api/v1/issues/preview", headers=_api(secret)).json()
+    assert {a["url"] for a in everything["articles"]} == {
+        "https://example.com/pick",
+        "https://example.com/first",
+        "https://example.com/second",
+    }
+
+    queue_only = client.get(
+        "/api/v1/issues/preview?only=queue", headers=_api(secret)
+    ).json()
+    assert [a["url"] for a in queue_only["articles"]] == ["https://example.com/pick"]
+
+    composed = client.post("/api/v1/issues?only=queue", headers=_api(secret))
+    assert composed.status_code == 201
+    assert composed.json()["articles"] == 1
+
+    # The parameter is deliberately narrow: "everything" is its absence.
+    bad = client.get("/api/v1/issues/preview?only=feeds", headers=_api(secret))
+    assert bad.status_code == 400
+    assert client.post("/api/v1/issues?only=nope", headers=_api(secret)).status_code == 400
