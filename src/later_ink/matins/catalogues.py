@@ -56,6 +56,10 @@ def forget(secret: str, request: Request, response: Response) -> None:
     _write(request, response, [s for s in read(request) if s != secret])
 
 
+def replace(old: str, new: str, request: Request, response: Response) -> None:
+    _write(request, response, [new, *[s for s in read(request) if s not in (old, new)]])
+
+
 def _write(request: Request, response: Response, secrets: list[str]) -> None:
     if not secrets:
         response.delete_cookie(COOKIE, path="/")

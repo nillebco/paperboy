@@ -67,14 +67,13 @@ lockfiles, and Caddy issues the certificate on first request.
 
 ## 5. First account
 
-1. Open `https://matins.nilleb.co/start`.
-2. Leave the Readwise token empty (feeds-only) or paste one.
-3. Save the catalogue URL — four dictionary words, typeable on e-ink.
-4. Open `/<secret>/settings`, add feeds, set the schedule and timezone, and
-   optionally an email address and webhook URL.
-5. Add `https://matins.nilleb.co/<secret>/` as an OPDS catalogue in KOReader
-   (or CrossPoint's OPDS browser).
-6. Press **Compose an issue now** once to check the result end to end.
+1. Open `https://matins.nilleb.co/signin` and sign in with an email, or use
+   `/start` for a catalogue with no email.
+2. Under **Feeds**, paste a site or feed address, or import an OPML file. The first
+   feed turns on the daily issue.
+3. Under **Next issue**, review the selection and press **Compose this issue**.
+4. Under **Settings**, set the schedule and limits, and copy the address from
+   **Reader** into KOReader or CrossPoint.
 
 ## Operations
 

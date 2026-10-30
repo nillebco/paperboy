@@ -26,6 +26,14 @@ class Feed:
     id: str
     url: str
     title: str
+    # A paused feed stays subscribed and readable but stops feeding issues.
+    paused: bool = False
+    # Outcome of the last real fetch, so the feeds page can say which sources
+    # are healthy without hitting every publisher on each page load.
+    last_fetched_at: float | None = None
+    last_error: str | None = None
+    item_count: int | None = None
+    last_item_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +69,27 @@ class Delivery:
     schedule: str
     timezone: str
     enabled: bool
+    # Per-catalogue overrides of the instance's issue limits. None = the default.
+    max_articles: int | None = None
+    max_per_feed: int | None = None
+    max_words: int | None = None
+    window_hours: int | None = None
+
+
+@dataclass(frozen=True)
+class IssueEntry:
+    article_id: str
+    title: str
+    url: str | None
+    section: str
+
+
+@dataclass(frozen=True)
+class SkippedArticle:
+    article_id: str
+    title: str
+    section: str
+    url: str | None
 
 
 def feed_id(secret: str, url: str) -> str:
@@ -90,6 +119,11 @@ class MatinsStore:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS feeds_by_user ON feeds (secret)")
+            _ensure_column(conn, "feeds", "paused", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "feeds", "last_fetched_at", "REAL")
+            _ensure_column(conn, "feeds", "last_error", "TEXT")
+            _ensure_column(conn, "feeds", "item_count", "INTEGER")
+            _ensure_column(conn, "feeds", "last_item_at", "REAL")
             # The queue a user fills with the share sheet or POST /{secret}/save.
             # consumed_by records which issue took the item, so a link is never
             # printed twice even across restarts.
@@ -201,6 +235,23 @@ class MatinsStore:
                 )
                 """
             )
+            for column in ("max_articles", "max_per_feed", "max_words", "window_hours"):
+                _ensure_column(conn, "delivery", column, "INTEGER")
+            # Articles the user took out of the next issue. Kept with their title
+            # so the list can offer "put it back" without refetching the feed.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS issue_skips (
+                    secret TEXT NOT NULL,
+                    article_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    section TEXT NOT NULL,
+                    url TEXT,
+                    skipped_at REAL NOT NULL,
+                    PRIMARY KEY (secret, article_id)
+                )
+                """
+            )
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -224,18 +275,18 @@ class MatinsStore:
     def list_feeds(self, secret: str) -> list[Feed]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT id, url, title FROM feeds WHERE secret = ? ORDER BY added_at",
+                "SELECT * FROM feeds WHERE secret = ? ORDER BY added_at",
                 (secret,),
             ).fetchall()
-        return [Feed(id=r["id"], url=r["url"], title=r["title"]) for r in rows]
+        return [_feed(r) for r in rows]
 
     def get_feed(self, secret: str, fid: str) -> Feed | None:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT id, url, title FROM feeds WHERE secret = ? AND id = ?",
+                "SELECT * FROM feeds WHERE secret = ? AND id = ?",
                 (secret, fid),
             ).fetchone()
-        return Feed(id=row["id"], url=row["url"], title=row["title"]) if row else None
+        return _feed(row) if row else None
 
     def rename_feed(self, secret: str, fid: str, title: str) -> None:
         with self._conn() as conn:
@@ -243,6 +294,40 @@ class MatinsStore:
                 "UPDATE feeds SET title = ? WHERE secret = ? AND id = ?",
                 (title, secret, fid),
             )
+
+    def set_feed_paused(self, secret: str, fid: str, paused: bool) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE feeds SET paused = ? WHERE secret = ? AND id = ?",
+                (int(paused), secret, fid),
+            )
+        return cur.rowcount > 0
+
+    def record_feed_fetch(
+        self,
+        secret: str,
+        fid: str,
+        *,
+        error: str | None = None,
+        item_count: int | None = None,
+        last_item_at: float | None = None,
+    ) -> None:
+        """Remember how the last fetch went. A failure keeps the previous counts:
+        "this feed had 20 items yesterday and is down now" is the useful answer."""
+        now = time.time()
+        with self._conn() as conn:
+            if error:
+                conn.execute(
+                    "UPDATE feeds SET last_fetched_at = ?, last_error = ?"
+                    " WHERE secret = ? AND id = ?",
+                    (now, error, secret, fid),
+                )
+            else:
+                conn.execute(
+                    "UPDATE feeds SET last_fetched_at = ?, last_error = NULL,"
+                    " item_count = ?, last_item_at = ? WHERE secret = ? AND id = ?",
+                    (now, item_count, last_item_at, secret, fid),
+                )
 
     def delete_feed(self, secret: str, fid: str) -> bool:
         with self._conn() as conn:
@@ -506,6 +591,36 @@ class MatinsStore:
             word_count=word_count,
         )
 
+    def issue_entries(self, secret: str, issue_id: str) -> list[IssueEntry]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT article_id, title, url, section FROM issue_items"
+                " WHERE secret = ? AND issue_id = ? ORDER BY rowid",
+                (secret, issue_id),
+            ).fetchall()
+        return [
+            IssueEntry(
+                article_id=r["article_id"], title=r["title"], url=r["url"], section=r["section"]
+            )
+            for r in rows
+        ]
+
+    def release_issue(self, secret: str, issue_id: str) -> None:
+        """Forget an issue and hand its articles back to the next one."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE saved SET consumed_by = NULL WHERE secret = ? AND consumed_by = ?",
+                (secret, issue_id),
+            )
+        self.delete_issue(secret, issue_id)
+
+    def set_issue_path(self, secret: str, issue_id: str, path: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE issues SET path = ? WHERE secret = ? AND id = ?",
+                (path, secret, issue_id),
+            )
+
     def list_issues(self, secret: str, limit: int = 50) -> list[Issue]:
         with self._conn() as conn:
             rows = conn.execute(
@@ -547,6 +662,57 @@ class MatinsStore:
             conn.execute("DELETE FROM delivery WHERE secret = ?", (secret,))
             conn.execute("DELETE FROM reads WHERE secret = ?", (secret,))
             conn.execute("DELETE FROM emails WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM issue_skips WHERE secret = ?", (secret,))
+
+    def rename_secret(self, old: str, new: str) -> None:
+        """Move everything to a new secret when the catalogue URL is rotated.
+
+        The credential changes; the catalogue does not. Without this a rotated
+        URL opens an empty catalogue while the old rows sit unreachable."""
+        with self._conn() as conn:
+            for table in _SECRET_TABLES:
+                conn.execute(f"UPDATE {table} SET secret = ? WHERE secret = ?", (new, old))
+
+    # --------------------------------------------------------------- skips
+
+    def skip_article(
+        self, secret: str, article_id: str, title: str, section: str, url: str | None
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO issue_skips (secret, article_id, title, section, url, skipped_at)"
+                " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (secret, article_id) DO NOTHING",
+                (secret, article_id, title[:300], section[:120], url, time.time()),
+            )
+
+    def unskip_article(self, secret: str, article_id: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM issue_skips WHERE secret = ? AND article_id = ?",
+                (secret, article_id),
+            )
+
+    def list_skips(self, secret: str, *, max_age: float | None = None) -> list[SkippedArticle]:
+        sql = "SELECT article_id, title, section, url FROM issue_skips WHERE secret = ?"
+        params: list = [secret]
+        if max_age is not None:
+            sql += " AND skipped_at >= ?"
+            params.append(time.time() - max_age)
+        with self._conn() as conn:
+            rows = conn.execute(f"{sql} ORDER BY skipped_at DESC", params).fetchall()
+        return [
+            SkippedArticle(
+                article_id=r["article_id"], title=r["title"], section=r["section"], url=r["url"]
+            )
+            for r in rows
+        ]
+
+    def skipped_ids(self, secret: str) -> set[str]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT article_id FROM issue_skips WHERE secret = ?", (secret,)
+            ).fetchall()
+        return {r["article_id"] for r in rows}
 
     def has_issue_for_day(self, secret: str, local_day: str) -> bool:
         with self._conn() as conn:
@@ -612,6 +778,42 @@ class MatinsStore:
                 ),
             )
 
+    def ensure_delivery(
+        self, secret: str, *, schedule: str, timezone: str, email: str | None = None
+    ) -> None:
+        """Create the delivery row on first use, leaving an existing one alone.
+
+        The scheduler only sees catalogues with a row, so without this a
+        catalogue that added feeds but never opened settings gets no issues."""
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO delivery (secret, email, schedule, timezone, enabled)"
+                " VALUES (?, ?, ?, ?, 1) ON CONFLICT (secret) DO NOTHING",
+                (secret, _blank_to_none(email), schedule, timezone),
+            )
+
+    def set_enabled(self, secret: str, enabled: bool) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE delivery SET enabled = ? WHERE secret = ?", (int(enabled), secret)
+            )
+
+    def set_issue_limits(
+        self,
+        secret: str,
+        *,
+        max_articles: int | None,
+        max_per_feed: int | None,
+        max_words: int | None,
+        window_hours: int | None,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE delivery SET max_articles = ?, max_per_feed = ?, max_words = ?,"
+                " window_hours = ? WHERE secret = ?",
+                (max_articles, max_per_feed, max_words, window_hours, secret),
+            )
+
     def get_delivery(self, secret: str) -> Delivery | None:
         with self._conn() as conn:
             row = conn.execute(
@@ -635,6 +837,33 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+# Every table keyed by the catalogue secret; a new one must be added here so
+# rotating the URL carries it along.
+_SECRET_TABLES = (
+    "feeds",
+    "saved",
+    "issues",
+    "issue_items",
+    "emails",
+    "reads",
+    "delivery",
+    "issue_skips",
+)
+
+
+def _feed(row: sqlite3.Row) -> Feed:
+    return Feed(
+        id=row["id"],
+        url=row["url"],
+        title=row["title"],
+        paused=bool(row["paused"]),
+        last_fetched_at=row["last_fetched_at"],
+        last_error=row["last_error"],
+        item_count=row["item_count"],
+        last_item_at=row["last_item_at"],
+    )
 
 
 def _issue(row: sqlite3.Row) -> Issue:
@@ -668,6 +897,10 @@ def _delivery(row: sqlite3.Row, fernet: Fernet) -> Delivery:
         schedule=row["schedule"],
         timezone=row["timezone"],
         enabled=bool(row["enabled"]),
+        max_articles=row["max_articles"],
+        max_per_feed=row["max_per_feed"],
+        max_words=row["max_words"],
+        window_hours=row["window_hours"],
     )
 
 

@@ -440,7 +440,9 @@ def test_csp_hashes_cover_every_inline_script(app_client):
     # If a script is edited and the hash isn't regenerated, the browser silently
     # drops it and the theme toggle stops working. The hashes are derived from
     # the same constants the page emits, so this asserts they stay in step.
-    body = app_client.get("/").text
+    # The Matins pages carry no script at all; pages.py still does (the stats page).
+    assert "<script" not in app_client.get("/").text
+    body = pages.deleted()
     csp = app_client.get("/").headers["content-security-policy"]
     for js in pages._INLINE_SCRIPTS:
         assert f"<script>{js}</script>" in body

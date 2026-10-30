@@ -553,8 +553,10 @@ def test_compose_now_builds_a_downloadable_issue(client):
     built = client.post(
         f"/{secret}/issues/build", data={"csrf": csrf}, follow_redirects=False
     )
-    assert built.status_code == 200
-    assert "Composed" in built.text
+    assert built.status_code == 303
+    landed = client.get(built.headers["location"])
+    assert "Composed" in landed.text
+    assert ".epub" in landed.text
 
     shelf = client.get(f"/{secret}/issues/")
     assert shelf.status_code == 200
@@ -930,6 +932,346 @@ def test_removing_a_feed_and_a_saved_link(client):
     saved = client.app.state.matins.list_saved(secret)[0]
     client.post(f"/{secret}/saved/{saved.id}/delete", data={"csrf": csrf})
     assert client.app.state.matins.list_saved(secret) == []
+
+
+# ------------------------------------------------------------------- the app
+
+
+HTML = {"accept": "text/html"}
+
+
+def test_every_page_shares_the_navigation(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    feed = client.app.state.matins.list_feeds(secret)[0]
+    for path in ("", "feeds", f"feeds/{feed.id}", "issues/preview", "issues/", "settings", "read"):
+        page = client.get(f"/{secret}/{path}", headers=HTML)
+        assert page.status_code == 200, path
+        for target in ("issues/preview", "feeds", "issues/", "read", "settings"):
+            assert f'href="/{secret}/{target}"' in page.text, (path, target)
+        assert page.text.count("aria-current=page") == 1, path
+
+
+def test_issues_list_is_html_for_people_and_opds_for_readers(client):
+    secret = _signup_without_readwise(client)
+    assert "<h1>Issues</h1>" in client.get(f"/{secret}/issues/", headers=HTML).text
+    assert "<feed" in client.get(f"/{secret}/issues/", headers={"accept": "*/*"}).text
+
+
+def test_a_first_feed_turns_on_the_daily_issue(client):
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    assert store.get_delivery(secret) is None
+    _add_feed(client, secret)
+    delivery = store.get_delivery(secret)
+    assert delivery is not None and delivery.enabled
+    assert secret in {d.secret for d in store.list_deliveries()}
+
+    # An explicit "off" is not overridden by adding another feed.
+    csrf = _csrf(client, secret)
+    client.post(f"/{secret}/schedule", data={"csrf": csrf, "enabled": "0"})
+    _add_feed(client, secret, "https://example.com/other")
+    assert not store.get_delivery(secret).enabled
+
+
+def test_signing_up_by_email_schedules_issues_and_notifies_that_address(client):
+    client.post("/signin", data={"email": "ivo@example.com"})
+    landed = client.post(
+        "/signin/code",
+        data={"email": "ivo@example.com", "code": client.sent_codes["ivo@example.com"]},
+        follow_redirects=False,
+    )
+    secret = landed.headers["location"].strip("/")
+    delivery = client.app.state.matins.get_delivery(secret)
+    assert delivery.enabled and delivery.email == "ivo@example.com"
+    assert 'value="ivo@example.com"' in client.get(f"/{secret}/settings").text
+
+
+def test_clearing_the_email_removes_sign_in(client):
+    secret = _signup_without_readwise(client)
+    csrf = _csrf(client, secret)
+    for email in ("ivo@example.com", ""):
+        client.post(
+            f"/{secret}/settings",
+            data={"csrf": csrf, "email": email, "schedule": "07:00", "enabled": "1"},
+        )
+    assert client.app.state.matins.email_for_secret(secret) is None
+
+
+def test_skipping_takes_an_article_out_and_putting_back_restores_it(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    csrf = _csrf(client, secret)
+    preview = client.get(f"/{secret}/issues/preview").text
+    article = re.search(r'name="article" value="(feeds:[^"]+)"', preview).group(1)
+    title = re.search(r'name="title" value="([^"]+)"', preview).group(1)
+
+    done = client.post(
+        f"/{secret}/issues/skip",
+        data={"csrf": csrf, "article": article, "title": title, "section": "Example Feed"},
+    )
+    assert "Skipped" in done.text
+    assert f'name="title" value="{title}"' not in done.text
+    assert "Put back" in done.text
+
+    client.post(f"/{secret}/issues/build", data={"csrf": csrf})
+    store = client.app.state.matins
+    with store._conn() as conn:
+        printed = {r["article_id"] for r in conn.execute("select article_id from issue_items")}
+    assert article not in printed
+
+    client.post(f"/{secret}/issues/skip/undo", data={"csrf": csrf, "article": article})
+    assert store.skipped_ids(secret) == set()
+
+
+def test_skip_needs_csrf_and_a_feed_article(client):
+    secret = _signup_without_readwise(client)
+    assert client.post(f"/{secret}/issues/skip", data={"article": "feeds:x"}).status_code == 403
+    csrf = _csrf(client, secret)
+    bad = client.post(f"/{secret}/issues/skip", data={"csrf": csrf, "article": "saved:1"})
+    assert bad.status_code == 400
+
+
+def test_a_paused_feed_stays_out_of_the_issue(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    csrf = _csrf(client, secret)
+    feed = client.app.state.matins.list_feeds(secret)[0]
+    client.post(f"/{secret}/feeds/{feed.id}/pause", data={"csrf": csrf, "paused": "1"})
+    assert "Nothing is queued" in client.get(f"/{secret}/issues/preview").text
+    client.post(f"/{secret}/feeds/{feed.id}/pause", data={"csrf": csrf, "paused": "0"})
+    assert "First story" in client.get(f"/{secret}/issues/preview").text
+
+
+def test_limits_in_settings_shape_the_issue_and_are_validated(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    csrf = _csrf(client, secret)
+    form = {"csrf": csrf, "schedule": "07:00", "timezone": "Europe/Paris", "enabled": "1"}
+
+    bad = client.post(f"/{secret}/settings", data={**form, "max_articles": "5000"})
+    assert bad.status_code == 400
+    assert "between 1 and 100" in bad.text
+    assert 'value="5000"' in bad.text
+
+    client.post(f"/{secret}/settings", data={**form, "max_per_feed": "1"})
+    assert client.app.state.matins.get_delivery(secret).max_per_feed == 1
+    preview = client.get(f"/{secret}/issues/preview").text
+    assert preview.count('name="article"') == 1
+
+
+def test_feed_page_explains_each_article(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    csrf = _csrf(client, secret)
+    feed = client.app.state.matins.list_feeds(secret)[0]
+    assert client.get(f"/{secret}/feeds/nope").status_code == 404
+
+    client.post(f"/{secret}/feeds/{feed.id}/rename", data={"csrf": csrf, "title": "My name"})
+    page = client.get(f"/{secret}/feeds/{feed.id}").text
+    assert "My name" in page
+    assert "First story" in page
+    assert "In next issue" in page or "Too old" in page
+    assert "OK" in page
+
+
+def test_feed_failures_are_recorded_and_shown(client, monkeypatch):
+    from later_ink.connectors.base import UpstreamError
+
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    csrf = _csrf(client, secret)
+
+    async def down(url, *, timeout, max_bytes):
+        raise UpstreamError("Could not fetch that feed", 502)
+
+    monkeypatch.setattr("later_ink.matins.rss.fetch_feed", down)
+    client.post(f"/{secret}/feeds/refresh", data={"csrf": csrf})
+    feed = client.app.state.matins.list_feeds(secret)[0]
+    assert feed.last_error == "Could not fetch that feed"
+    assert "Failing" in client.get(f"/{secret}/feeds").text
+    assert "1 feed failing" in client.get(f"/{secret}/", headers=HTML).text
+
+
+def test_a_site_address_subscribes_to_the_feed_it_advertises(client, monkeypatch):
+    secret = _signup_without_readwise(client)
+    csrf = _csrf(client, secret)
+    site = (
+        b'<html><head><link rel="alternate" type="application/rss+xml" href="/rss.xml">'
+        b"</head><body>Hi</body></html>"
+    )
+
+    async def fetch(url, *, timeout, max_bytes):
+        return RSS_XML if url.endswith("/rss.xml") else site
+
+    monkeypatch.setattr("later_ink.matins.rss.fetch_feed", fetch)
+    client.post(f"/{secret}/feeds", data={"csrf": csrf, "url": "https://example.com/"})
+    feeds = client.app.state.matins.list_feeds(secret)
+    assert [feed.url for feed in feeds] == ["https://example.com/rss.xml"]
+    assert feeds[0].title == "Example Feed"
+
+
+def test_opml_round_trip(client):
+    secret = _signup_without_readwise(client)
+    csrf = _csrf(client, secret)
+    opml = b"""<?xml version="1.0"?><opml version="2.0"><body>
+      <outline text="Folder">
+        <outline text="One &amp; only" xmlUrl="https://one.example/feed"/>
+        <outline text="Bad" xmlUrl="javascript:alert(1)"/>
+      </outline>
+      <outline title="Two" xmlUrl="https://two.example/feed"/>
+    </body></opml>"""
+    done = client.post(
+        f"/{secret}/feeds/import",
+        data={"csrf": csrf},
+        files={"file": ("subs.opml", opml, "text/xml")},
+    )
+    assert "Imported 2 feeds" in done.text
+    assert client.app.state.matins.get_delivery(secret).enabled
+
+    exported = client.get(f"/{secret}/feeds.opml")
+    assert exported.headers["content-type"].startswith("text/x-opml")
+    assert 'text="One &amp; only"' in exported.text
+    assert "javascript" not in exported.text
+
+    again = client.post(
+        f"/{secret}/feeds/import",
+        data={"csrf": csrf},
+        files={"file": ("subs.opml", exported.content, "text/xml")},
+    )
+    assert "Nothing new" in again.text
+
+    junk = client.post(
+        f"/{secret}/feeds/import",
+        data={"csrf": csrf},
+        files={"file": ("subs.opml", b"<html></html>", "text/xml")},
+    )
+    assert "not valid OPML" in junk.text
+
+
+def test_issue_page_lists_contents_and_deleting_releases_the_articles(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    client.post(f"/{secret}/save", json={"url": "https://example.com/later"})
+    csrf = _csrf(client, secret)
+    client.post(f"/{secret}/issues/build", data={"csrf": csrf})
+    store = client.app.state.matins
+    issue = store.list_issues(secret)[0]
+    assert store.list_saved(secret) == []
+
+    page = client.get(f"/{secret}/issues/{issue.id}", headers=HTML)
+    assert "First story" in page.text
+    assert f"/{issue.id}.epub" in page.text
+    home = client.get(f"/{secret}/", headers=HTML).text
+    assert f"/issues/{issue.id}.epub" in home
+
+    from pathlib import Path
+
+    client.post(f"/{secret}/issues/{issue.id}/delete", data={"csrf": csrf})
+    assert store.list_issues(secret) == []
+    assert not Path(issue.path).exists()
+    assert len(store.list_saved(secret)) == 1
+    assert "First story" in client.get(f"/{secret}/issues/preview").text
+
+
+def test_a_slow_compose_hands_over_to_a_polling_page(client, monkeypatch):
+    import asyncio
+
+    from later_ink.matins import routes
+
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    csrf = _csrf(client, secret)
+    gate: dict = {}
+    real = routes._compose
+
+    async def slow(app, target):
+        gate["event"] = asyncio.Event()
+        await gate["event"].wait()
+        return await real(app, target)
+
+    monkeypatch.setattr(routes, "_compose", slow)
+    monkeypatch.setattr(routes, "COMPOSE_WAIT", 0.01)
+
+    started = client.post(
+        f"/{secret}/issues/build", data={"csrf": csrf}, follow_redirects=False
+    )
+    assert started.headers["location"] == f"/{secret}/issues/composing"
+    waiting = client.get(f"/{secret}/issues/composing", follow_redirects=False)
+    assert waiting.status_code == 200
+    assert 'http-equiv="refresh"' in waiting.text
+
+    client.portal.call(gate["event"].set)
+    routes_task = routes._composing[secret]
+    client.portal.call(asyncio.wait, {routes_task})
+    done = client.get(f"/{secret}/issues/composing", follow_redirects=False)
+    assert done.status_code == 303
+    assert "/issues/" in done.headers["location"]
+    assert "Composed" in client.get(done.headers["location"]).text
+
+
+def test_rotating_the_address_keeps_the_catalogue(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    csrf = _csrf(client, secret)
+    client.post(
+        f"/{secret}/settings",
+        data={"csrf": csrf, "email": "ivo@example.com", "schedule": "06:30", "enabled": "1"},
+    )
+    client.post(f"/{secret}/save", json={"url": "https://example.com/later"})
+    client.post(f"/{secret}/issues/build", data={"csrf": csrf})
+    store = client.app.state.matins
+    old_issue = store.list_issues(secret)[0]
+
+    rotated = client.post(f"/{secret}/regenerate", data={"csrf": csrf}, follow_redirects=False)
+    assert rotated.status_code == 303
+    new = rotated.headers["location"].split("/")[1]
+    assert new != secret
+
+    assert client.get(f"/{secret}/").status_code == 404
+    assert [f.url for f in store.list_feeds(new)] == ["https://example.com/feed"]
+    assert store.get_delivery(new).schedule == "06:30"
+    assert store.secret_for_email("ivo@example.com") == new
+    download = client.get(f"/{new}/issues/{old_issue.id}.epub")
+    assert download.status_code == 200 and download.content[:2] == b"PK"
+    # Nothing printed before the rotation is printed again after it.
+    assert "Nothing is queued" in client.get(f"/{new}/issues/preview").text
+    assert store.list_feeds(secret) == []
+    landing = client.get("/").text
+    assert new in landing and secret not in landing
+
+
+def test_browsers_get_a_page_for_errors_and_the_api_keeps_json(client):
+    missing = client.get("/not-a-catalogue-at-all/", headers=HTML)
+    assert missing.status_code == 404
+    assert "Sign in" in missing.text
+    assert client.get("/not-a-catalogue-at-all/").headers["content-type"].startswith(
+        "application/json"
+    )
+
+
+def test_next_run_says_when_in_words():
+    from later_ink.matins.issues import next_run
+
+    early = datetime(2026, 10, 30, 4, 0, tzinfo=UTC)
+    late = datetime(2026, 10, 30, 9, 0, tzinfo=UTC)
+    assert next_run("07:00", "Europe/Paris", issued_today=False, now=early) == "Today at 07:00"
+    assert next_run("07:00", "Europe/Paris", issued_today=True, now=early) == "Tomorrow at 07:00"
+    assert next_run("07:00", "Europe/Paris", issued_today=False, now=late).startswith("Due now")
+
+
+def test_user_text_is_escaped_in_feed_pages(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    csrf = _csrf(client, secret)
+    feed = client.app.state.matins.list_feeds(secret)[0]
+    client.post(
+        f"/{secret}/feeds/{feed.id}/rename", data={"csrf": csrf, "title": "<script>x</script>"}
+    )
+    for path in ("feeds", f"feeds/{feed.id}", "issues/preview"):
+        assert "<script>x" not in client.get(f"/{secret}/{path}").text
+    flash = client.get(f"/{secret}/feeds?notice=%3Cimg%20src%3Dx%3E").text
+    assert "<img src=x>" not in flash
 
 
 # ----------------------------------------------------------------------- API

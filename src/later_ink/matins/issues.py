@@ -48,6 +48,25 @@ class Candidate:
         return getattr(self.article, "word_count", None) or DEFAULT_ITEM_WORDS
 
 
+@dataclass(frozen=True)
+class IssueLimits:
+    """The editorial rules for one catalogue: its overrides, else the instance's."""
+
+    max_articles: int
+    max_per_feed: int
+    max_words: int
+    window_hours: int
+
+
+def limits_for(delivery) -> IssueLimits:
+    return IssueLimits(
+        max_articles=getattr(delivery, "max_articles", None) or config.get_issue_max_articles(),
+        max_per_feed=getattr(delivery, "max_per_feed", None) or config.get_issue_max_per_feed(),
+        max_words=getattr(delivery, "max_words", None) or config.get_issue_max_words(),
+        window_hours=getattr(delivery, "window_hours", None) or config.get_issue_window_hours(),
+    )
+
+
 class IssueService:
     def __init__(self, store: MatinsStore, issues_dir: Path):
         self.store = store
@@ -156,6 +175,28 @@ class IssueService:
         )
         return issue
 
+    def delete(self, secret: str, issue_id: str) -> bool:
+        """Delete one edition. Its articles become eligible for the next one."""
+        issue = self.store.get_issue(secret, issue_id)
+        if issue is None:
+            return False
+        try:
+            Path(issue.path).unlink(missing_ok=True)
+        except OSError:
+            logger.debug("could not remove %s", issue.path, exc_info=True)
+        self.store.release_issue(secret, issue_id)
+        return True
+
+    def rename(self, old: str, new: str) -> None:
+        """Carry a catalogue's data and issue files over to a rotated secret."""
+        self.store.rename_secret(old, new)
+        source = self._directory(old)
+        target = self._directory(new)
+        if source.exists():
+            os.replace(source, target)
+        for issue in self.store.list_issues(new, limit=10_000):
+            self.store.set_issue_path(new, issue.id, str(target / Path(issue.path).name))
+
     def forget(self, secret: str) -> None:
         """Drop a catalogue's issues (files included) and its source settings.
 
@@ -163,8 +204,7 @@ class IssueService:
         a hash of the secret, so removing that directory is enough to take the
         composed EPUBs with it.
         """
-        directory = self.issues_dir / hashlib.sha1(secret.encode()).hexdigest()[:16]
-        shutil.rmtree(directory, ignore_errors=True)
+        shutil.rmtree(self._directory(secret), ignore_errors=True)
         self.store.delete_user_data(secret)
 
     async def deliver(self, secret: str, issue: Issue) -> None:
@@ -185,10 +225,16 @@ class IssueService:
             )
             if not ok:
                 logger.warning("webhook for %s did not succeed", issue.id)
-        if delivery.email:
-            await notify.send_issue_notification(delivery.email, issue, catalog_url)
+        email = delivery.email or self.store.email_for_secret(secret)
+        if email:
+            await notify.send_issue_notification(email, issue, catalog_url)
 
-    async def plan(self, secret: str, reader, now: datetime | None = None) -> list[Candidate]:
+    async def plan(
+        self,
+        secret: str,
+        reader,
+        now: datetime | None = None,
+    ) -> list[Candidate]:
         """What the next issue would contain, without fetching anything.
 
         Public because the preview page needs exactly this view: selection is
@@ -200,8 +246,10 @@ class IssueService:
         pushed at them."""
         now = now or datetime.now(UTC)
         selected: list[Candidate] = []
-        budget = config.get_issue_max_words()
-        max_articles = config.get_issue_max_articles()
+        limits = limits_for(self.store.get_delivery(secret))
+        budget = limits.max_words
+        max_articles = limits.max_articles
+        skipped = self.store.skipped_ids(secret)
 
         queue = reader.sources.get("later")
         if queue is not None:
@@ -222,6 +270,7 @@ class IssueService:
                 folders = await feeds.list_folders()
             except UpstreamError:
                 folders = []
+            await feeds.refresh()
             for folder in folders:
                 if len(selected) >= max_articles or budget <= 0:
                     break
@@ -241,17 +290,20 @@ class IssueService:
                 # URL, and that URL would otherwise become this section's name in
                 # both the preview and the issue's table of contents.
                 stored = self.store.get_feed(secret, folder.id)
+                if stored is not None and stored.paused:
+                    continue
                 section = (stored.title if stored else "") or folder.title
                 already = self.store.issued_articles(secret, list(keys.values()))
                 fresh = [
                     a
                     for a in articles
                     if keys[a.id] not in already
-                    and _fresh(a, now, config.get_issue_window_hours())
+                    and keys[a.id] not in skipped
+                    and _fresh(a, now, limits.window_hours)
                 ]
                 per_feed = 0
                 for article in fresh:
-                    if per_feed >= config.get_issue_max_per_feed():
+                    if per_feed >= limits.max_per_feed:
                         break
                     if len(selected) >= max_articles:
                         break
@@ -265,7 +317,7 @@ class IssueService:
         return selected
 
     def _write(self, secret: str, issue_id: str, result: BuildResult) -> Path:
-        directory = self.issues_dir / hashlib.sha1(secret.encode()).hexdigest()[:16]
+        directory = self._directory(secret)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{issue_id}.epub"
         # Write beside the target and rename: a reader that opens the catalogue
@@ -274,6 +326,9 @@ class IssueService:
         tmp.write_bytes(result.data)
         os.replace(tmp, path)
         return path
+
+    def _directory(self, secret: str) -> Path:
+        return self.issues_dir / hashlib.sha1(secret.encode()).hexdigest()[:16]
 
     def _prune(self, secret: str) -> None:
         retention = config.get_issue_retention()
@@ -302,6 +357,31 @@ def local_day(tz_name: str, now: datetime | None = None) -> str:
     except Exception:
         tz = ZoneInfo(config.get_default_timezone())
     return now.astimezone(tz).date().isoformat()
+
+
+def next_run(
+    schedule: str, tz_name: str, *, issued_today: bool, now: datetime | None = None
+) -> str:
+    """When the next scheduled issue is due, in words: "Tomorrow at 07:00".
+
+    Mirrors the scheduler's catch-up rule: past the scheduled time with no issue
+    today, it is due at the next tick rather than tomorrow."""
+    now = now or datetime.now(UTC)
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo(config.get_default_timezone())
+    local = now.astimezone(tz)
+    hour, _, minute = schedule.partition(":")
+    try:
+        scheduled = local.replace(hour=int(hour), minute=int(minute or 0))
+    except ValueError:
+        return f"At {schedule}"
+    if issued_today:
+        return f"Tomorrow at {scheduled:%H:%M}"
+    if local < scheduled:
+        return f"Today at {scheduled:%H:%M}"
+    return "Due now, within a minute or two"
 
 
 def _fresh(article, now: datetime, hours: int) -> bool:

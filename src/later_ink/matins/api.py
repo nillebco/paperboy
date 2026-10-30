@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ..connectors.base import UpstreamError
-from . import config, rss
+from . import config, routes, rss
 from .issues import local_day
 
 logger = logging.getLogger(__name__)
@@ -80,15 +80,12 @@ async def add_feed(request: Request):
     if any(feed.url == url for feed in store.list_feeds(secret)):
         return JSONResponse({"url": url, "created": False}, status_code=200)
     try:
-        raw = await rss.fetch_feed(
-            url,
-            timeout=config.get_feed_fetch_timeout(),
-            max_bytes=config.get_feed_max_bytes(),
-        )
-        parsed = rss.parse_feed(raw, url)
+        url, parsed = await rss.resolve_feed(url)
     except UpstreamError as e:
         raise HTTPException(422, str(e)) from None
-    feed = store.add_feed(secret, url, parsed.title[:120])
+    if any(feed.url == url for feed in store.list_feeds(secret)):
+        return JSONResponse({"url": url, "created": False}, status_code=200)
+    feed = routes.subscribe(request, secret, url, parsed)
     return {"id": feed.id, "url": url, "title": parsed.title, "created": True}
 
 
@@ -251,9 +248,7 @@ async def _json(request: Request) -> dict:
 
 
 def _url(raw) -> str:
-    from .routes import _valid_url
-
-    url = _valid_url(str(raw or ""))
+    url = routes._valid_url(str(raw or ""))
     if url is None:
         raise HTTPException(400, "Expected an http(s) url")
     return url

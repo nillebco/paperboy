@@ -7,6 +7,7 @@ between fetches defeats the dedupe table. Feeds offer no stable id in general â€
 from the link, which is the only field that is both stable and present.
 """
 
+import asyncio
 import hashlib
 import time
 from collections import OrderedDict
@@ -14,9 +15,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from html import unescape
+from urllib.parse import urljoin
+from xml.sax.saxutils import quoteattr
 
 import httpx
 from lxml import etree
+from lxml import html as lxml_html
 
 from ..connectors.base import (
     Article,
@@ -73,6 +77,17 @@ class ParsedFeed:
 
 
 _cache: OrderedDict[str, tuple[float, ParsedFeed]] = OrderedDict()
+
+# A feed that just failed is not retried for a while: one dead publisher must not
+# cost its full timeout on every page that walks the feeds.
+_FAILURE_TTL = 300.0
+_failures: dict[str, tuple[float, str]] = {}
+
+_FEED_TYPES = ("application/rss+xml", "application/atom+xml", "application/rdf+xml")
+
+# Enough to keep one slow publisher from delaying a page, few enough to stay a
+# polite client when a catalogue has a hundred subscriptions.
+_FETCH_CONCURRENCY = 8
 
 
 def parse_feed(xml: bytes, feed_url: str, feed_id: str = "") -> ParsedFeed:
@@ -287,6 +302,68 @@ async def fetch_feed(url: str, *, timeout: float, max_bytes: int) -> bytes:
     return body
 
 
+def discover_feed_url(page: bytes, page_url: str) -> str | None:
+    """The feed a web page advertises through <link rel="alternate">."""
+    try:
+        document = lxml_html.fromstring(page)
+    except (etree.ParserError, ValueError):
+        return None
+    for link in document.iter("link"):
+        rel = (link.get("rel") or "").lower().split()
+        kind = (link.get("type") or "").lower()
+        href = link.get("href")
+        if href and "alternate" in rel and kind in _FEED_TYPES:
+            return urljoin(page_url, href)
+    return None
+
+
+async def resolve_feed(url: str) -> tuple[str, ParsedFeed]:
+    """Fetch and parse what the user pasted, which is often a site, not a feed.
+
+    Returns the URL to subscribe to. Raises UpstreamError with a message fit to
+    show them when neither the URL nor anything it advertises is a feed.
+    """
+    timeout = config.get_feed_fetch_timeout()
+    max_bytes = config.get_feed_max_bytes()
+    body = await fetch_feed(url, timeout=timeout, max_bytes=max_bytes)
+    try:
+        return url, parse_feed(body, url)
+    except UpstreamError as not_a_feed:
+        advertised = discover_feed_url(body, url)
+        if advertised is None:
+            raise UpstreamError("no feed found at that address") from not_a_feed
+    body = await fetch_feed(advertised, timeout=timeout, max_bytes=max_bytes)
+    return advertised, parse_feed(body, advertised)
+
+
+def parse_opml(document: bytes) -> list[tuple[str, str]]:
+    """(feed URL, title) for every subscription in an OPML file, nested or not."""
+    try:
+        root = etree.fromstring(document, parser=_PARSER)
+    except etree.XMLSyntaxError as e:
+        raise UpstreamError("That file is not valid OPML") from e
+    if root is None or _localname(root).lower() != "opml":
+        raise UpstreamError("That file is not valid OPML")
+    found: list[tuple[str, str]] = []
+    for outline in root.iter("outline"):
+        url = (outline.get("xmlUrl") or "").strip()
+        if url:
+            found.append((url, " ".join((outline.get("title") or outline.get("text") or "").split())))
+    return found
+
+
+def to_opml(feeds: list[Feed]) -> str:
+    outlines = "\n".join(
+        f"    <outline type=\"rss\" text={quoteattr(feed.title or feed.url)}"
+        f" xmlUrl={quoteattr(feed.url)}/>"
+        for feed in feeds
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<opml version="2.0">\n'
+        f"  <head><title>Matins feeds</title></head>\n  <body>\n{outlines}\n  </body>\n</opml>\n"
+    )
+
+
 class RssConnector(Connector):
     """One catalogue folder per subscription, ordered as the user added them."""
 
@@ -348,6 +425,26 @@ class RssConnector(Connector):
             "Could not extract that article; open it at the source", 422
         )
 
+    async def refresh(self, *, force: bool = False) -> None:
+        """Load every subscription concurrently; failures land in the store.
+
+        `force` ignores the cache, for "check my feeds now". Otherwise this just
+        warms it, so whatever walks the feeds one by one next does not wait for
+        them one by one."""
+        limit = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
+        async def load(feed: Feed) -> None:
+            async with limit:
+                if force:
+                    _cache.pop(f"{feed.id}|{feed.url}", None)
+                    _failures.pop(f"{feed.id}|{feed.url}", None)
+                try:
+                    await self._load(feed)
+                except UpstreamError:
+                    pass  # recorded by _load
+
+        await asyncio.gather(*(load(feed) for feed in self._store.list_feeds(self._secret)))
+
     async def _load(self, feed: Feed) -> ParsedFeed:
         # Keyed by feed, not by URL. Item ids embed the feed id, which is
         # derived from the owning secret, so a URL-only cache would hand one
@@ -361,12 +458,30 @@ class RssConnector(Connector):
         if cached and now - cached[0] < _CACHE_TTL:
             _cache.move_to_end(key)
             return cached[1]
-        body = await fetch_feed(
-            feed.url,
-            timeout=config.get_feed_fetch_timeout(),
-            max_bytes=config.get_feed_max_bytes(),
+        failed = _failures.get(key)
+        if failed and now - failed[0] < _FAILURE_TTL:
+            raise UpstreamError(failed[1])
+        try:
+            body = await fetch_feed(
+                feed.url,
+                timeout=config.get_feed_fetch_timeout(),
+                max_bytes=config.get_feed_max_bytes(),
+            )
+            parsed = parse_feed(body, feed.url, feed.id)
+        except UpstreamError as e:
+            self._store.record_feed_fetch(self._secret, feed.id, error=str(e))
+            if len(_failures) >= _CACHE_MAX:
+                _failures.clear()
+            _failures[key] = (now, str(e))
+            raise
+        _failures.pop(key, None)
+        dates = [item.published for item in parsed.items if item.published]
+        self._store.record_feed_fetch(
+            self._secret,
+            feed.id,
+            item_count=len(parsed.items),
+            last_item_at=max(dates).replace(tzinfo=UTC).timestamp() if dates else None,
         )
-        parsed = parse_feed(body, feed.url, feed.id)
         _cache[key] = (now, parsed)
         _cache.move_to_end(key)
         while len(_cache) > _CACHE_MAX:
@@ -405,4 +520,5 @@ def recent_since(items: list[FeedItem], hours: int) -> list[FeedItem]:
 def clear_cache() -> None:
     """Tests only."""
     _cache.clear()
+    _failures.clear()
 

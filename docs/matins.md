@@ -36,7 +36,7 @@ so the fork adds:
 | Signed webhooks | `matins/webhooks.py` |
 | Notification email | `matins/notify.py` |
 | Scheduler (asyncio loop) | `matins/scheduler.py` |
-| Settings, save, issues OPDS, admin | `matins/routes.py` |
+| The app: home, feeds, next issue, issues, settings; admin | `matins/routes.py`, `matins/pages.py` |
 | Tables (feeds, saved, issues, delivery) | `matins/db.py` |
 
 `later_ink/main.py` changes in four places: the router include, the tenant
@@ -81,11 +81,32 @@ its scheduled local time while today's issue is missing, so a restart at 09:00
 still produces the 07:00 paper. Failed builds retry every 30 minutes rather than
 every tick.
 
+**One shell, no script.** Every catalogue page goes through `pages._shell`, so
+navigation and post-action messages live in one place. Confirmations are
+`<details>`, and a slow compose hands over to a page with a meta refresh: the CSP
+stays script-free and the app works on the e-ink browsers it serves.
+
+**The first feed turns on the daily issue.** The scheduler only sees catalogues
+with a `delivery` row. Adding a feed or signing in by email creates one; an
+explicit "off" is left alone.
+
+**Feed health is recorded, not fetched per page.** Each real fetch writes its
+outcome to `feeds`, so the feeds page needs no network. A failed fetch is not
+retried for five minutes unless the user asks.
+
+**A rotated URL moves the catalogue.** `MatinsStore.rename_secret` covers every
+table in `_SECRET_TABLES`; a new secret-keyed table must be added there.
+
+**Reading time is shown only when known.** A feed's summary says nothing about the
+article's length, so previews show a time only for full-text items. The word
+budget still uses those estimates, so an issue can run past `max_words`.
+
 ## Data
 
 SQLite, same file as the users table (WAL), disjoint tables:
 
-- `feeds (id, secret, url, title, added_at)` — unique per `(secret, url)`.
+- `feeds (id, secret, url, title, added_at, paused, last_fetched_at, last_error,
+  item_count, last_item_at)` — unique per `(secret, url)`.
 - `saved (id, secret, url, title, added_at, consumed_by)` — the queue; re-saving
   a consumed link re-queues it.
 - `issues (id, secret, title, created_at, local_day, path, article_count,
@@ -94,7 +115,11 @@ SQLite, same file as the users table (WAL), disjoint tables:
 - `issue_items (issue_id, secret, article_id, title, url, section)` — membership
   and the dedupe set.
 - `delivery (secret, webhook_url, webhook_secret, email, schedule, timezone,
-  enabled)` — the webhook secret is Fernet-encrypted with the app key.
+  enabled, max_articles, max_per_feed, max_words, window_hours)` — the webhook
+  secret is Fernet-encrypted with the app key; a NULL limit means the instance
+  default.
+- `issue_skips (secret, article_id, title, section, url, skipped_at)` — articles
+  taken out of the next issue.
 
 Issue files: `ISSUES_DIR/<sha1(secret)[:16]>/<issue-id>.epub`, written to a temp
 name then renamed. The download route looks the path up in the database and

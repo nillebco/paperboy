@@ -13,7 +13,9 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Query, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__, config, opds, pages
 from .cache import EpubCache, build_cache, cache_key
@@ -26,6 +28,7 @@ from .epub import BUILD_VERSION, build_epub
 from .matins import api as matins_api
 from .matins import catalogues as matins_catalogues
 from .matins import config as matins_config
+from .matins import pages as matins_pages
 from .matins import routes as matins_routes
 from .matins import scheduler as matins_scheduler
 from .matins.db import MatinsStore
@@ -443,6 +446,18 @@ def _feed_id(secret: str) -> str:
     return "urn:later-ink:u:" + hashlib.sha1(secret.encode()).hexdigest()[:12]
 
 
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(request: Request, exc: StarletteHTTPException):
+    # A person gets a page with a way back; readers and the API keep plain errors.
+    if _wants_html(request) and not request.url.path.startswith("/api/"):
+        return HTMLResponse(
+            matins_pages.error_page(exc.status_code, str(exc.detail)),
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
+    return await http_exception_handler(request, exc)
+
+
 @app.exception_handler(UpstreamError)
 async def upstream_error_handler(request: Request, exc: UpstreamError):
     # KOReader shows response text on failed downloads — keep it readable.
@@ -479,10 +494,10 @@ async def landing(request: Request, background_tasks: BackgroundTasks):
             request.headers.get("referer"),
             ua[:300] if ua else None,
         )
-    return pages.landing(
-        config.get_stripe_payment_link(),
-        config.allow_free_signup(),
-        config.get_base_url(),
+    return matins_pages.landing_page(
+        payment_link=config.get_stripe_payment_link(),
+        free_signup=config.allow_free_signup(),
+        base_url=config.get_base_url(),
         catalogues=matins_catalogues.read(request),
     )
 
@@ -623,8 +638,8 @@ async def _check_payment(session_id: str | None) -> str | None:
 async def start_get(session_id: str | None = Query(None)):
     error = await _check_payment(session_id)
     if error:
-        return HTMLResponse(pages.start_form(None, error), status_code=403)
-    return pages.start_form(session_id)
+        return HTMLResponse(matins_pages.start_page(None, error), status_code=403)
+    return matins_pages.start_page(session_id)
 
 
 @app.post("/start", response_class=HTMLResponse)
@@ -636,12 +651,12 @@ async def start_post(
 ):
     error = await _check_payment(session_id)
     if error:
-        return HTMLResponse(pages.start_form(None, error), status_code=403)
+        return HTMLResponse(matins_pages.start_page(None, error), status_code=403)
 
     readwise_token = readwise_token.strip()
     if readwise_token and not await readwise.validate_token(readwise_token):
         return HTMLResponse(
-            pages.start_form(session_id, "That token was rejected by Readwise. Double-check it and try again."),
+            matins_pages.start_page(session_id, "That token was rejected by Readwise. Double-check it and try again."),
             status_code=400,
         )
 
@@ -653,11 +668,11 @@ async def start_post(
         # requests carrying the same cs_… can both pass it. Losing that race is
         # a duplicate submission, not a server error.
         return HTMLResponse(
-            pages.start_form(None, "This payment has already been used to create a catalog."),
+            matins_pages.start_page(None, "This payment has already been used to create a catalog."),
             status_code=403,
         )
     catalog_url = f"{config.get_base_url()}/{secret}/"
-    response = HTMLResponse(pages.success(catalog_url, secret, _csrf_token(secret)))
+    response = HTMLResponse(matins_pages.welcome_page(catalog_url, secret, _csrf_token(secret)))
     # So the landing page can say "your catalogues" instead of offering to
     # create another one the next time this browser visits.
     matins_catalogues.remember(secret, request, response)
@@ -791,8 +806,14 @@ async def tenant_regenerate(secret: str, request: Request, csrf: str | None = Fo
     new_secret = app.state.store.regenerate_secret(secret)
     if new_secret is None:
         raise HTTPException(404)
-    catalog_url = f"{config.get_base_url()}/{new_secret}/"
-    return pages.success(catalog_url, new_secret, _csrf_token(new_secret))
+    app.state.issues.rename(secret, new_secret)
+    conn = _tenant_connectors.pop(secret, None)
+    if conn is not None:
+        await conn.close()
+    notice = quote("New URL in place. Update it on your e-reader; the old one has stopped working.")
+    response = RedirectResponse(f"/{new_secret}/settings?notice={notice}#access", status_code=303)
+    matins_catalogues.replace(secret, new_secret, request, response)
+    return response
 
 
 @app.post("/{secret}/delete", response_class=HTMLResponse)
@@ -804,7 +825,9 @@ async def tenant_delete(secret: str, request: Request, csrf: str | None = Form(N
     conn = _tenant_connectors.pop(secret, None)
     if conn is not None:
         await conn.close()
-    return pages.deleted()
+    response = HTMLResponse(matins_pages.deleted_page())
+    matins_catalogues.forget(secret, request, response)
+    return response
 
 
 @app.api_route("/{secret}/", methods=["GET", "HEAD"])
@@ -812,7 +835,7 @@ async def tenant_root(secret: str, request: Request):
     _resolve_secret(secret, request)
     if _wants_html(request):
         response = HTMLResponse(
-            matins_routes.dashboard(
+            await matins_routes.dashboard(
                 request,
                 secret,
                 notice=request.query_params.get("notice"),

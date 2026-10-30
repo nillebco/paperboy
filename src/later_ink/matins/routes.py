@@ -9,21 +9,23 @@ the app uses. Every state-changing form additionally carries a CSRF token derive
 from the app key, because a browser is the only thing that submits them.
 """
 
+import asyncio
 import hashlib
 import hmac
 import logging
 import secrets as pysecrets
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from urllib.parse import quote, urlsplit
 
-from fastapi import APIRouter, Form, HTTPException, Request
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from .. import config as app_config
 from .. import opds
 from ..connectors.base import Article, ArticleUnavailable, UpstreamError
-from . import catalogues, config, notify, pages, rss
-from .issues import IssueService, local_day
+from . import catalogues, config, notify, pages, rss, webhooks
+from .issues import IssueLimits, IssueService, limits_for, local_day, next_run
 from .reader import to_page_html
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,28 @@ MAX_FEEDS = 100
 MAX_URL_LENGTH = 2048
 MAX_READER_ITEMS = 120
 EPUB_MEDIA = "application/epub+zip"
+MIN_KNOWN_WORDS = 150
+MAX_OPML_BYTES = 1024 * 1024
+
+# The home page shows what the next issue holds, which can mean fetching feeds.
+# Past this it renders without the count rather than making the page feel broken.
+HOME_PLAN_TIMEOUT = 3.0
+FEEDS_REFRESH_TIMEOUT = 45.0
+# A compose answers directly if it finishes this fast; otherwise the browser is
+# sent to a page that polls, so a slow build never looks like a hung request.
+COMPOSE_WAIT = 6.0
+SKIP_LIST_MAX_AGE = 14 * 24 * 3600
+
+# Where a form may return to, by name: a closed list cannot be an open redirect.
+BACK_TARGETS = {"home": "", "feeds": "feeds", "next": "issues/preview", "read": "read"}
+
+# Accepted range per catalogue, for the issue limits in settings.
+LIMIT_BOUNDS = {
+    "max_articles": (1, 100),
+    "max_per_feed": (1, 50),
+    "max_words": (500, 200_000),
+    "window_hours": (1, 720),
+}
 
 # Sign-in codes: six digits, ten minutes, five tries, one send a minute.
 OTP_TTL = 600.0
@@ -173,6 +197,7 @@ async def signin_verify(
     if secret is None or request.app.state.store.get_token(secret) is None:
         secret = request.app.state.store.create_user("")
         store.link_email(secret, address)
+    _ensure_delivery(request, secret)
     response = RedirectResponse(f"/{secret}/", status_code=303)
     catalogues.remember(secret, request, response)
     return response
@@ -196,6 +221,48 @@ def _code_hash(request: Request, email: str, code: str) -> str:
 # ------------------------------------------------------------------ sources
 
 
+def subscribe(request: Request, secret: str, url: str, parsed):
+    """Add a checked subscription; the first one also turns on the daily issue."""
+    store = _store(request)
+    feed = store.add_feed(secret, url, parsed.title[:120])
+    dates = [item.published for item in parsed.items if item.published]
+    store.record_feed_fetch(
+        secret,
+        feed.id,
+        item_count=len(parsed.items),
+        last_item_at=max(dates).replace(tzinfo=UTC).timestamp() if dates else None,
+    )
+    _ensure_delivery(request, secret)
+    return feed
+
+
+def _ensure_delivery(request: Request, secret: str) -> None:
+    store = _store(request)
+    store.ensure_delivery(
+        secret,
+        schedule=config.get_default_schedule(),
+        timezone=config.get_default_timezone(),
+        email=store.email_for_secret(secret),
+    )
+
+
+@router.get("/{secret}/feeds", response_class=HTMLResponse)
+async def feeds_index(
+    secret: str, request: Request, notice: str | None = None, error: str | None = None
+):
+    """Rendered from what the last fetch recorded: no network, so it is instant."""
+    _resolve(secret, request)
+    return _html(
+        pages.feeds_page(
+            secret=secret,
+            csrf=_csrf_token(secret),
+            feeds=_feed_rows(request, secret),
+            notice=notice,
+            error=error,
+        )
+    )
+
+
 @router.post("/{secret}/feeds")
 async def add_feed(
     secret: str, request: Request, csrf: str = Form(""), url: str = Form("")
@@ -204,35 +271,176 @@ async def add_feed(
 
     The URL is fetched and parsed once here so a typo, a 404 or an HTML page
     pasted as a feed produces an immediate, specific message instead of a
-    silently empty issue.
+    silently empty issue. A page that advertises a feed subscribes to that feed.
     """
     _resolve(secret, request)
     _require_csrf(secret, csrf)
     target = _valid_url(url)
     if not target:
-        return _back(secret, error="That is not an http(s) URL.")
+        return _back(secret, to="feeds", error="That is not an http(s) URL.")
 
     store = _store(request)
     if any(feed.url == target for feed in store.list_feeds(secret)):
-        return _back(secret, notice="That feed is already subscribed.")
+        return _back(secret, to="feeds", notice="That feed is already subscribed.")
     if len(store.list_feeds(secret)) >= MAX_FEEDS:
-        return _back(secret, error=f"The limit is {MAX_FEEDS} feeds.")
+        return _back(secret, to="feeds", error=f"The limit is {MAX_FEEDS} feeds.")
 
     try:
-        body = await rss.fetch_feed(
-            target,
-            timeout=config.get_feed_fetch_timeout(),
-            max_bytes=config.get_feed_max_bytes(),
-        )
-        parsed = rss.parse_feed(body, target)
+        target, parsed = await rss.resolve_feed(target)
     except UpstreamError as e:
-        return _back(secret, error=f"Could not use that feed: {e}")
+        return _back(secret, to="feeds", error=f"Could not use that feed: {e}")
     except Exception:
         logger.exception("feed add failed")
-        return _back(secret, error="Could not read that feed.")
+        return _back(secret, to="feeds", error="Could not read that feed.")
 
-    store.add_feed(secret, target, parsed.title[:120])
-    return _back(secret, notice=f"Added {parsed.title or target}.")
+    if any(feed.url == target for feed in store.list_feeds(secret)):
+        return _back(secret, to="feeds", notice="That feed is already subscribed.")
+    subscribe(request, secret, target, parsed)
+    return _back(secret, to="feeds", notice=f"Added {parsed.title or target}.")
+
+
+@router.post("/{secret}/feeds/refresh")
+async def refresh_feeds(secret: str, request: Request, csrf: str = Form("")):
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    reader = await _reader(request, secret)
+    try:
+        await asyncio.wait_for(reader.sources["rss"].refresh(force=True), FEEDS_REFRESH_TIMEOUT)
+    except TimeoutError:
+        return _back(secret, to="feeds", error="Some feeds are slow to answer; try again shortly.")
+    failing = sum(1 for feed in _store(request).list_feeds(secret) if feed.last_error)
+    if failing:
+        return _back(secret, to="feeds", error=f"Checked. {failing} failing, marked below.")
+    return _back(secret, to="feeds", notice="Checked. All feeds answered.")
+
+
+@router.post("/{secret}/feeds/import")
+async def import_feeds(
+    secret: str, request: Request, csrf: str = Form(""), file: UploadFile = File(...)
+):
+    """Subscribe to everything in an OPML file, unchecked.
+
+    Not fetched one by one here: a large export would hold the request for
+    minutes. Each feed's health shows up after the next fetch."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    document = await file.read(MAX_OPML_BYTES + 1)
+    if len(document) > MAX_OPML_BYTES:
+        return _back(secret, to="feeds", error="That file is too large to be a feed list.")
+    try:
+        outlines = rss.parse_opml(document)
+    except UpstreamError as e:
+        return _back(secret, to="feeds", error=str(e))
+
+    store = _store(request)
+    known = {feed.url for feed in store.list_feeds(secret)}
+    added = 0
+    for raw_url, title in outlines:
+        url = _valid_url(raw_url)
+        if url is None or url in known:
+            continue
+        if len(known) >= MAX_FEEDS:
+            return _back(
+                secret, to="feeds", error=f"Imported {added}, then reached the {MAX_FEEDS} feed limit."
+            )
+        store.add_feed(secret, url, title[:120])
+        known.add(url)
+        added += 1
+    if not added:
+        return _back(secret, to="feeds", notice="Nothing new in that file.")
+    _ensure_delivery(request, secret)
+    return _back(secret, to="feeds", notice=f"Imported {_count(added, 'feed')}.")
+
+
+@router.get("/{secret}/feeds.opml")
+async def export_feeds(secret: str, request: Request):
+    _resolve(secret, request)
+    return Response(
+        rss.to_opml(_store(request).list_feeds(secret)),
+        media_type="text/x-opml",
+        headers={"Content-Disposition": 'attachment; filename="matins-feeds.opml"'},
+    )
+
+
+@router.get("/{secret}/feeds/{feed_id}", response_class=HTMLResponse)
+async def feed_detail(
+    secret: str,
+    feed_id: str,
+    request: Request,
+    notice: str | None = None,
+    error: str | None = None,
+):
+    """One source, and for each recent article why it is or is not in the issue."""
+    _resolve(secret, request)
+    store = _store(request)
+    feed = store.get_feed(secret, feed_id)
+    if feed is None:
+        raise HTTPException(404, "You are not subscribed to that feed.")
+    reader = await _reader(request, secret)
+    try:
+        articles, _ = await reader.sources["rss"].list_articles(feed_id)
+    except UpstreamError:
+        articles = []
+    candidates = await _service(request).plan(secret, reader)
+    limits = limits_for(store.get_delivery(secret))
+    keys = [reader.decorate_id("rss", a.id) for a in articles]
+    printed = store.issued_articles(secret, keys)
+    skipped = store.skipped_ids(secret)
+    planned = {reader.decorate_id(c.source, c.article.id) for c in candidates}
+    now = datetime.now(UTC)
+    rows = [
+        {
+            "id": key,
+            "title": article.title,
+            "published": f"{article.content_date:%d %b %Y}" if article.content_date else "",
+            "state": _article_state(key, article, now, limits, printed, skipped, planned),
+        }
+        for key, article in list(zip(keys, articles, strict=True))[:30]
+    ]
+    return _html(
+        pages.feed_page(
+            secret=secret,
+            csrf=_csrf_token(secret),
+            feed=_feed_row(store.get_feed(secret, feed_id)),
+            items=rows,
+            window_hours=limits.window_hours,
+            max_per_feed=limits.max_per_feed,
+            notice=notice,
+            error=error,
+        )
+    )
+
+
+@router.post("/{secret}/feeds/{feed_id}/rename")
+async def rename_feed(
+    secret: str, feed_id: str, request: Request, csrf: str = Form(""), title: str = Form("")
+):
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    store = _store(request)
+    if store.get_feed(secret, feed_id) is None:
+        raise HTTPException(404, "No such feed")
+    name = " ".join(title.split())[:120]
+    if not name:
+        return _back(secret, to=f"feeds/{feed_id}", error="A feed needs a name.")
+    store.rename_feed(secret, feed_id, name)
+    return _back(secret, to=f"feeds/{feed_id}", notice="Renamed.")
+
+
+@router.post("/{secret}/feeds/{feed_id}/pause")
+async def pause_feed(
+    secret: str, feed_id: str, request: Request, csrf: str = Form(""), paused: str = Form("1")
+):
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    pausing = paused == "1"
+    if not _store(request).set_feed_paused(secret, feed_id, pausing):
+        raise HTTPException(404, "No such feed")
+    return _back(
+        secret,
+        to=f"feeds/{feed_id}",
+        notice="Paused: left out of issues." if pausing else "Back in your issues.",
+    )
 
 
 @router.post("/{secret}/feeds/{feed_id}/delete")
@@ -241,16 +449,18 @@ async def remove_feed(secret: str, feed_id: str, request: Request, csrf: str = F
     _require_csrf(secret, csrf)
     if not _store(request).delete_feed(secret, feed_id):
         raise HTTPException(404, "No such feed")
-    return _back(secret, notice="Feed removed.")
+    return _back(secret, to="feeds", notice="Feed removed.")
 
 
 @router.post("/{secret}/saved/{saved_id}/delete")
-async def remove_saved(secret: str, saved_id: int, request: Request, csrf: str = Form("")):
+async def remove_saved(
+    secret: str, saved_id: int, request: Request, csrf: str = Form(""), back: str = Form("home")
+):
     _resolve(secret, request)
     _require_csrf(secret, csrf)
     if not _store(request).delete_saved(secret, saved_id):
         raise HTTPException(404, "No such saved link")
-    return _back(secret, notice="Removed from the queue.")
+    return _back(secret, to=BACK_TARGETS.get(back, ""), notice="Removed from the queue.")
 
 
 @router.post("/{secret}/forget")
@@ -268,6 +478,7 @@ async def save(secret: str, request: Request):
     _resolve(secret, request)
     url = ""
     title = None
+    back = "home"
     if request.headers.get("content-type", "").startswith("application/json"):
         try:
             body = await request.json()
@@ -283,6 +494,7 @@ async def save(secret: str, request: Request):
         url = str(form.get("url") or "")
         title = form.get("title")
         title = str(title)[:300] if title else None
+        back = str(form.get("back") or "home")
 
     url = _valid_url(url)
     if not url:
@@ -292,7 +504,11 @@ async def save(secret: str, request: Request):
         return JSONResponse(
             {"queued": queued, "url": url}, status_code=201 if queued else 200
         )
-    return _back(secret, notice="Saved for the next issue." if queued else "Already saved.")
+    return _back(
+        secret,
+        to=BACK_TARGETS.get(back, ""),
+        notice="Saved for the next issue." if queued else "Already saved.",
+    )
 
 
 # ------------------------------------------------------------------- reader
@@ -427,10 +643,18 @@ async def _reader_items(request: Request, secret: str) -> list[tuple[str, object
 
 
 @router.get("/{secret}/settings", response_class=HTMLResponse)
-async def settings_get(secret: str, request: Request, saved: int = 0):
+async def settings_get(
+    secret: str,
+    request: Request,
+    saved: int = 0,
+    notice: str | None = None,
+    error: str | None = None,
+):
     _resolve(secret, request)
     return _html(
-        _render_settings(request, secret, notice="Settings saved." if saved else None)
+        _render_settings(
+            request, secret, notice="Settings saved." if saved else notice, error=error
+        )
     )
 
 
@@ -445,8 +669,12 @@ async def settings_post(
     schedule: str = Form(""),
     timezone: str = Form(""),
     enabled: str = Form(""),
+    max_articles: str = Form(""),
+    max_per_feed: str = Form(""),
+    max_words: str = Form(""),
+    window_hours: str = Form(""),
 ):
-    """Delivery settings only. Sources are managed on the catalogue page."""
+    """Schedule, limits and notifications. Sources have their own page."""
     _resolve(secret, request)
     _require_csrf(secret, csrf)
 
@@ -456,6 +684,12 @@ async def settings_post(
         "schedule": schedule,
         "timezone": timezone,
         "enabled": bool(enabled),
+        "limits": {
+            "max_articles": max_articles,
+            "max_per_feed": max_per_feed,
+            "max_words": max_words,
+            "window_hours": window_hours,
+        },
     }
     schedule = _normalize_schedule(schedule) or config.get_default_schedule()
     timezone = (timezone or "").strip() or config.get_default_timezone()
@@ -480,6 +714,13 @@ async def settings_post(
             status=400,
         )
 
+    try:
+        limits = {key: _parse_limit(key, value) for key, value in overrides["limits"].items()}
+    except ValueError as e:
+        return _html(
+            _render_settings(request, secret, error=str(e), overrides=overrides), status=400
+        )
+
     address = _normalize_email(email) if email.strip() else None
     if email.strip() and address is None:
         return _html(
@@ -499,6 +740,8 @@ async def settings_post(
                 _render_settings(request, secret, error=str(e).capitalize(), overrides=overrides),
                 status=400,
             )
+    else:
+        _store(request).unlink_email(secret)
 
     previous = _store(request).get_delivery(secret)
     _store(request).set_delivery(
@@ -510,59 +753,172 @@ async def settings_post(
         timezone=timezone,
         enabled=bool(enabled),
     )
+    _store(request).set_issue_limits(secret, **limits)
     return RedirectResponse(f"/{secret}/settings?saved=1", status_code=303)
+
+
+@router.post("/{secret}/schedule")
+async def set_schedule(
+    secret: str, request: Request, csrf: str = Form(""), enabled: str = Form("1")
+):
+    """The one-click switch on the home page."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    _ensure_delivery(request, secret)
+    on = enabled == "1"
+    _store(request).set_enabled(secret, on)
+    return _back(secret, notice="Issues will arrive every morning." if on else "Automatic issues off.")
+
+
+@router.post("/{secret}/settings/test-email")
+async def test_email(secret: str, request: Request, csrf: str = Form("")):
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    store = _store(request)
+    address = store.email_for_secret(secret)
+    if not address:
+        return _back(secret, to="settings", error="Save an email address first.")
+    sample = SimpleNamespace(
+        id="test", title="Matins — test notification", article_count=0, word_count=0
+    )
+    if await notify.send_issue_notification(
+        address, sample, f"{app_config.get_base_url()}/{secret}/issues/"
+    ):
+        return _back(secret, to="settings", notice=f"Test email sent to {address}.")
+    return _back(secret, to="settings", error="The test email could not be sent.")
+
+
+@router.post("/{secret}/settings/test-webhook")
+async def test_webhook(secret: str, request: Request, csrf: str = Form("")):
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    delivery = _store(request).get_delivery(secret)
+    if delivery is None or not delivery.webhook_url:
+        return _back(secret, to="settings", error="Save a webhook URL first.")
+    payload = {"event": "test", "delivered_at": int(datetime.now(UTC).timestamp())}
+    if await webhooks.deliver(delivery.webhook_url, delivery.webhook_secret, payload):
+        return _back(secret, to="settings", notice="The webhook answered with a success.")
+    return _back(
+        secret, to="settings", error="The webhook did not accept the test. Check its URL and logs."
+    )
 
 
 # ------------------------------------------------------------------ issues
 
 
 @router.get("/{secret}/issues/preview", response_class=HTMLResponse)
-async def issues_preview(secret: str, request: Request):
-    """The next issue's selection, without writing anything."""
+async def issues_preview(
+    secret: str, request: Request, notice: str | None = None, error: str | None = None
+):
+    """The next issue's selection, editable, without writing anything."""
     _resolve(secret, request)
+    store = _store(request)
     reader = await _reader(request, secret)
     candidates = await _service(request).plan(secret, reader)
+    limits = limits_for(store.get_delivery(secret))
     return _html(
         pages.preview_page(
             secret=secret,
             csrf=_csrf_token(secret),
             candidates=[
                 {
+                    "id": reader.decorate_id(c.source, c.article.id),
                     "title": c.article.title,
                     "section": c.section,
-                    "source": c.source,
-                    "words": c.estimated_words,
+                    "url": c.article.url,
+                    "saved_id": c.article.id if c.source == "later" else None,
+                    # Only trust a count from a feed that ships the full text; a
+                    # summary's length says nothing about the article's.
+                    "words": w if (w := c.article.word_count or 0) >= MIN_KNOWN_WORDS else 0,
                 }
                 for c in candidates
             ],
-            window_hours=config.get_issue_window_hours(),
-            max_articles=config.get_issue_max_articles(),
+            skipped=[
+                {"id": item.article_id, "title": item.title, "section": item.section}
+                for item in store.list_skips(secret, max_age=SKIP_LIST_MAX_AGE)
+            ],
+            window_hours=limits.window_hours,
+            max_articles=limits.max_articles,
+            max_per_feed=limits.max_per_feed,
+            max_words=limits.max_words,
+            schedule_label=_schedule_label(request, secret),
+            has_feeds=bool(store.list_feeds(secret)),
+            notice=notice,
+            error=error,
         )
     )
 
 
-@router.post("/{secret}/issues/build", response_class=HTMLResponse)
-async def build_now(secret: str, request: Request, csrf: str = Form("")):
+@router.post("/{secret}/issues/skip")
+async def skip_article(
+    secret: str,
+    request: Request,
+    csrf: str = Form(""),
+    article: str = Form(""),
+    title: str = Form(""),
+    section: str = Form(""),
+    url: str = Form(""),
+):
     _resolve(secret, request)
     _require_csrf(secret, csrf)
-    delivery = _store(request).get_delivery(secret)
-    day = local_day(delivery.timezone if delivery else config.get_default_timezone())
-    issue = await _build(request, secret, day)
-    if issue is None:
-        message = "Nothing new to compose — no unprinted feed items and an empty queue."
-    else:
-        message = (
-            f"Composed “{issue.title}” with {issue.article_count} articles. "
-            "It is in the Issues folder now."
-        )
-        await _service(request).deliver(secret, issue)
-    return _html(pages.notice_page("Matins", message, f"/{secret}/"))
+    if not article.startswith("feeds:") or len(article) > 200:
+        raise HTTPException(400, "That article cannot be skipped")
+    _store(request).skip_article(secret, article, title or "Untitled", section, _valid_url(url))
+    return _back(secret, to="issues/preview", notice="Skipped. It stays out of future issues.")
+
+
+@router.post("/{secret}/issues/skip/undo")
+async def unskip_article(
+    secret: str, request: Request, csrf: str = Form(""), article: str = Form("")
+):
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    _store(request).unskip_article(secret, article)
+    return _back(secret, to="issues/preview", notice="Put back, if it is still recent enough.")
+
+
+@router.post("/{secret}/issues/build", response_class=HTMLResponse)
+async def build_now(secret: str, request: Request, csrf: str = Form("")):
+    """Compose now. Answers straight away when the build is quick, and otherwise
+    hands the browser to a page that polls: a real issue can take a minute."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    task = _composing.get(secret)
+    if task is None or task.done():
+        task = asyncio.create_task(_compose(request.app, secret))
+        _composing[secret] = task
+    done, _ = await asyncio.wait({task}, timeout=COMPOSE_WAIT)
+    if not done:
+        return RedirectResponse(f"/{secret}/issues/composing", status_code=303)
+    return _composed(secret)
+
+
+@router.get("/{secret}/issues/composing", response_class=HTMLResponse)
+async def composing(secret: str, request: Request):
+    _resolve(secret, request)
+    task = _composing.get(secret)
+    if task is None:
+        return RedirectResponse(f"/{secret}/issues/", status_code=303)
+    if not task.done():
+        return _html(pages.composing_page(secret=secret))
+    return _composed(secret)
 
 
 @router.api_route("/{secret}/issues/", methods=["GET", "HEAD"])
 async def issues_feed(secret: str, request: Request):
     _resolve(secret, request)
     issues = _service(request).issues_for(secret)
+    if _wants_html(request):
+        return _html(
+            pages.issues_page(
+                secret=secret,
+                issues=[_issue_row(issue) for issue in issues],
+                timezone=_timezone(request, secret),
+                retention=config.get_issue_retention(),
+                notice=request.query_params.get("notice"),
+                error=request.query_params.get("error"),
+            )
+        )
     articles = [
         Article(
             id=issue.id,
@@ -600,6 +956,44 @@ async def issue_epub(secret: str, issue_id: str, request: Request):
         media_type=EPUB_MEDIA,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get("/{secret}/issues/{issue_id}", response_class=HTMLResponse)
+async def issue_detail(
+    secret: str,
+    issue_id: str,
+    request: Request,
+    notice: str | None = None,
+    error: str | None = None,
+):
+    _resolve(secret, request)
+    store = _store(request)
+    issue = store.get_issue(secret, issue_id)
+    if issue is None:
+        raise HTTPException(404, "That issue no longer exists.")
+    return _html(
+        pages.issue_page(
+            secret=secret,
+            csrf=_csrf_token(secret),
+            issue=_issue_row(issue),
+            entries=[
+                {"title": entry.title, "url": entry.url, "section": entry.section}
+                for entry in store.issue_entries(secret, issue_id)
+            ],
+            timezone=_timezone(request, secret),
+            notice=notice,
+            error=error,
+        )
+    )
+
+
+@router.post("/{secret}/issues/{issue_id}/delete")
+async def delete_issue(secret: str, issue_id: str, request: Request, csrf: str = Form("")):
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    if not _service(request).delete(secret, issue_id):
+        raise HTTPException(404, "That issue no longer exists.")
+    return _back(secret, to="issues/", notice="Issue deleted. Its articles are back in line.")
 
 
 # --------------------------------------------------------------------- admin
@@ -646,7 +1040,47 @@ async def _build(request: Request, secret: str, day: str):
     )
 
 
-def dashboard(
+# One running compose per catalogue. Single-process by design (see the Dockerfile
+# CMD), the same assumption the scheduler makes. A strong reference is kept
+# because the event loop only holds weak ones to running tasks.
+_composing: dict[str, asyncio.Task] = {}
+
+
+async def _compose(app, secret: str):
+    """Build and deliver one issue. Returns the Issue, or None if nothing new."""
+    delivery = app.state.matins.get_delivery(secret)
+    day = local_day(delivery.timezone if delivery else config.get_default_timezone())
+    reader = await app.state.tenant_reader(secret)
+    issue = await app.state.issues.build(secret=secret, reader=reader, local_day=day)
+    if issue is not None:
+        await app.state.issues.deliver(secret, issue)
+    return issue
+
+
+def _composed(secret: str):
+    """Where to go once a compose has finished."""
+    task = _composing.pop(secret)
+    try:
+        issue = task.result()
+    except Exception:
+        logger.exception("compose failed")
+        return _back(
+            secret, to="issues/preview", error="Composing failed. Nothing was published; try again."
+        )
+    if issue is None:
+        return _back(
+            secret,
+            to="issues/preview",
+            notice="Nothing new to compose: no unprinted feed items and an empty queue.",
+        )
+    return _back(
+        secret,
+        to=f"issues/{issue.id}",
+        notice=f"Composed, with {_count(issue.article_count, 'article')}.",
+    )
+
+
+async def dashboard(
     request: Request,
     secret: str,
     *,
@@ -657,39 +1091,112 @@ def dashboard(
     tenant root, which owns the route and the cookie."""
     store = _store(request)
     delivery = store.get_delivery(secret)
-    saved = store.list_saved(secret)
     return pages.dashboard_page(
         secret=secret,
-        base_url=app_config.get_base_url(),
         csrf=_csrf_token(secret),
-        feeds=[
-            {"id": feed.id, "title": feed.title or feed.url, "url": feed.url}
-            for feed in store.list_feeds(secret)
-        ],
-        saved=[
-            {
-                "id": item.id,
-                "title": item.title or _title_from_url(item.url),
-                "url": item.url,
-            }
-            for item in saved
-        ],
-        issues=[
-            {
-                "id": issue.id,
-                "title": issue.title,
-                "count": issue.article_count,
-                "words": issue.word_count,
-            }
-            for issue in _service(request).issues_for(secret)[:8]
-        ],
-        schedule=delivery.schedule if delivery else config.get_default_schedule(),
-        timezone=delivery.timezone if delivery else config.get_default_timezone(),
+        feeds=_feed_rows(request, secret),
+        saved_count=len(store.list_saved(secret)),
+        issues=[_issue_row(issue) for issue in _service(request).issues_for(secret)[:1]],
+        schedule_label=_schedule_label(request, secret) or "",
+        timezone=_timezone(request, secret),
         scheduling=bool(delivery.enabled) if delivery else False,
+        plan=await _plan_summary(request, secret),
         account_email=store.email_for_secret(secret),
         notice=notice,
         error=error,
     )
+
+
+async def _plan_summary(request: Request, secret: str) -> dict | None:
+    reader = await _reader(request, secret)
+    try:
+        candidates = await asyncio.wait_for(
+            _service(request).plan(secret, reader), HOME_PLAN_TIMEOUT
+        )
+    except TimeoutError:
+        return None
+    return {"count": len(candidates)}
+
+
+def _timezone(request: Request, secret: str) -> str:
+    delivery = _store(request).get_delivery(secret)
+    return delivery.timezone if delivery else config.get_default_timezone()
+
+
+def _schedule_label(request: Request, secret: str) -> str | None:
+    """When the next automatic issue is due, or None if there will not be one."""
+    store = _store(request)
+    delivery = store.get_delivery(secret)
+    if delivery is None or not delivery.enabled:
+        return None
+    return next_run(
+        delivery.schedule,
+        delivery.timezone,
+        issued_today=store.has_issue_for_day(secret, local_day(delivery.timezone)),
+    )
+
+
+def _feed_row(feed) -> dict:
+    return {
+        "id": feed.id,
+        "title": feed.title or feed.url,
+        "url": feed.url,
+        "paused": feed.paused,
+        "error": feed.last_error,
+        "fetched_at": feed.last_fetched_at,
+        "item_count": feed.item_count,
+        "last_item_at": feed.last_item_at,
+    }
+
+
+def _feed_rows(request: Request, secret: str) -> list[dict]:
+    return [_feed_row(feed) for feed in _store(request).list_feeds(secret)]
+
+
+def _issue_row(issue) -> dict:
+    return {
+        "id": issue.id,
+        "title": issue.title,
+        "count": issue.article_count,
+        "words": issue.word_count,
+        "created_at": issue.created_at,
+    }
+
+
+def _article_state(
+    key: str,
+    article,
+    now: datetime,
+    limits: IssueLimits,
+    printed: set[str],
+    skipped: set[str],
+    planned: set[str],
+) -> str:
+    if key in printed:
+        return "printed"
+    if key in skipped:
+        return "skipped"
+    if key in planned:
+        return "next"
+    if not _is_fresh(article, now, limits.window_hours):
+        return "old"
+    return "waiting"
+
+
+def _is_fresh(article, now: datetime, hours: int) -> bool:
+    from .issues import _fresh
+
+    return _fresh(article, now, hours)
+
+
+def _count(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def _wants_html(request: Request) -> bool:
+    from ..main import _wants_html as wants
+
+    return wants(request)
 
 
 def _title_from_url(url: str) -> str:
@@ -698,14 +1205,16 @@ def _title_from_url(url: str) -> str:
     return title_from_url(url)
 
 
-def _back(secret: str, *, notice: str | None = None, error: str | None = None):
-    """Post/redirect/get back to the catalogue with a one-line message."""
+def _back(
+    secret: str, *, to: str = "", notice: str | None = None, error: str | None = None
+):
+    """Post/redirect/get with a one-line message, by default back to home."""
     query = ""
     if notice:
         query = f"?notice={quote(notice)}"
     elif error:
         query = f"?error={quote(error)}"
-    return RedirectResponse(f"/{secret}/{query}", status_code=303)
+    return RedirectResponse(f"/{secret}/{to}{query}", status_code=303)
 
 
 def _html(body: str, *, status: int = 200, csp: str | None = None) -> HTMLResponse:
@@ -744,17 +1253,23 @@ def _issue_summary(issue) -> str:
 def _render_settings(
     request, secret, *, notice=None, error=None, overrides: dict | None = None
 ):
-    delivery = _store(request).get_delivery(secret)
+    store = _store(request)
+    delivery = store.get_delivery(secret)
     values = {
-        "email": (delivery.email if delivery else None) or "",
+        "email": store.email_for_secret(secret) or (delivery.email if delivery else None) or "",
         "webhook_url": (delivery.webhook_url if delivery else None) or "",
         "schedule": delivery.schedule if delivery else config.get_default_schedule(),
         "timezone": delivery.timezone if delivery else config.get_default_timezone(),
         "enabled": bool(delivery.enabled) if delivery else True,
+        "limits": {
+            key: getattr(delivery, key, None) if delivery else None for key in LIMIT_BOUNDS
+        },
     }
     values.update(overrides or {})
+    defaults = limits_for(None)
     return pages.settings_page(
         secret=secret,
+        base_url=app_config.get_base_url(),
         csrf=_csrf_token(secret),
         email=values["email"],
         webhook_url=values["webhook_url"],
@@ -762,9 +1277,29 @@ def _render_settings(
         timezone=values["timezone"],
         enabled=values["enabled"],
         webhook_secret_set=bool(delivery and delivery.webhook_secret),
+        limits=values["limits"],
+        defaults={key: getattr(defaults, key) for key in LIMIT_BOUNDS},
+        bounds=LIMIT_BOUNDS,
+        schedule_label=_schedule_label(request, secret),
         notice=notice,
         error=error,
     )
+
+
+def _parse_limit(key: str, raw: str) -> int | None:
+    """A limit from the settings form; blank means the instance default."""
+    value = (raw or "").strip()
+    if not value:
+        return None
+    low, high = LIMIT_BOUNDS[key]
+    label = key.replace("_", " ")
+    try:
+        number = int(value)
+    except ValueError:
+        raise ValueError(f"{label.capitalize()} must be a whole number.") from None
+    if not low <= number <= high:
+        raise ValueError(f"{label.capitalize()} must be between {low} and {high}.")
+    return number
 
 
 def _secrets_unchanged(previous, submitted: str) -> str | None:
