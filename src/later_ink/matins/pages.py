@@ -39,6 +39,7 @@ body {
   font: 16px/1.5 var(--sans);
 }
 .wrap { max-width: 46rem; margin-inline: auto; padding: 0 1rem; }
+.wrap.wide { max-width: 92rem; }
 .masthead { border-bottom: 3px double var(--fg); padding-top: 1.1rem; }
 .wordmark {
   font: 700 1.7rem/1.1 var(--serif); letter-spacing: -.015em; text-decoration: none;
@@ -160,7 +161,7 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .article a { text-decoration: underline; }
 .tabs { display: flex; gap: 1rem; margin: .8rem 0 0; font-size: .92rem; flex-wrap: wrap; }
 .tabs a[aria-current] { font-weight: 700; text-decoration: none; }
-.reader-split { display: grid; grid-template-columns: minmax(0, 22rem) minmax(0, 1fr);
+.reader-split { display: grid; grid-template-columns: minmax(0, 26rem) minmax(0, 1fr);
   gap: 1.2rem; align-items: start; margin-top: .8rem; }
 .reader-list { max-height: calc(100vh - 10rem); overflow-y: auto; padding: .2rem .3rem; }
 .reader-list .row { padding: .5rem .45rem; border-radius: 8px; }
@@ -172,6 +173,7 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .article-toolbar { display: flex; gap: .4rem; flex-wrap: wrap; margin: 0 0 1rem; }
 .article-toolbar form { margin: 0; }
 .reader-pane .card h1 { margin-top: 0; }
+.reader-pane .article { max-width: 42rem; }
 @media (max-width: 820px) {
   .reader-split { grid-template-columns: 1fr; }
   .reader-list { max-height: none; }
@@ -220,8 +222,12 @@ def _shell(
     *,
     notice: str | None = None,
     error: str | None = None,
+    wide: bool = False,
 ) -> str:
-    """The app frame around every catalogue page."""
+    """The app frame around every catalogue page.
+
+    `wide` is for the Reader: a mailbox needs the screen width, while prose
+    pages stay at the reading measure."""
     base = f"/{escape(secret)}/"
     links = "".join(
         f'<a href="{base}{path}"{" aria-current=page" if key == active else ""}>{label}</a>'
@@ -229,7 +235,7 @@ def _shell(
     )
     return _document(
         f"{title} · Matins" if title != "Matins" else title,
-        f"""<div class="wrap">
+        f"""<div class="wrap{" wide" if wide else ""}">
 <header class="masthead">
   <a class="wordmark" href="{base}">Matins</a>
   <nav class="nav" aria-label="Catalogue">{links}</nav>
@@ -1179,7 +1185,7 @@ is interesting; add what you want to read next.</p>
   <div>{pane}</div>
 </div>
 """
-    return _shell(secret, "read", "Reader", body_html, error=error)
+    return _shell(secret, "read", "Reader", body_html, error=error, wide=True)
 
 
 def reader_article_page(
