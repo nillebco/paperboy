@@ -35,7 +35,9 @@ router = APIRouter()
 
 MAX_FEEDS = 100
 MAX_URL_LENGTH = 2048
-MAX_READER_ITEMS = 120
+# The list is one page, no paging: a few hundred rows are cheaper to render than
+# a "load more" round trip, and the counts must not promise rows the page omits.
+MAX_READER_ITEMS = 400
 EPUB_MEDIA = "application/epub+zip"
 MIN_KNOWN_WORDS = 150
 MAX_OPML_BYTES = 1024 * 1024
