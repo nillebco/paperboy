@@ -1109,13 +1109,15 @@ def settings_page(
 READER_SCROLL_JS = (
     "(function(){var l=document.querySelector('.reader-list');if(!l)return;"
     "var k='matins-scroll:'+location.pathname;"
-    "try{var y=sessionStorage.getItem(k);"
-    "if(y!==null){l.scrollTop=+y;var p=sessionStorage.getItem(k+':page');"
-    "if(p!==null)window.scrollTo(0,+p);}}catch(e){}"
+    "if('scrollRestoration' in history)history.scrollRestoration='manual';"
+    "function restore(){try{var y=sessionStorage.getItem(k);"
+    "if(y!==null)l.scrollTop=+y;var p=sessionStorage.getItem(k+':page');"
+    "if(p!==null)window.scrollTo(0,+p);}catch(e){}}"
     "function save(){try{sessionStorage.setItem(k,l.scrollTop);"
     "sessionStorage.setItem(k+':page',window.scrollY);}catch(e){}}"
     "window.addEventListener('pagehide',save);"
-    "l.addEventListener('click',save);l.addEventListener('submit',save);}());"
+    "l.addEventListener('click',save);l.addEventListener('submit',save);"
+    "restore();window.addEventListener('load',restore);}());"
 )
 
 _READER_VIEWS = (
