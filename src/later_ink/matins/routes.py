@@ -255,11 +255,13 @@ async def feeds_index(
 ):
     """Rendered from what the last fetch recorded: no network, so it is instant."""
     _resolve(secret, request)
+    store = _store(request)
     return _html(
         pages.feeds_page(
             secret=secret,
             csrf=_csrf_token(secret),
             feeds=_feed_rows(request, secret),
+            bluesky=store.candidate_stats(secret),
             notice=notice,
             error=error,
         )

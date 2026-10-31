@@ -507,6 +507,7 @@ def feeds_page(
     secret: str,
     csrf: str,
     feeds: list[dict],
+    bluesky: dict,
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
@@ -537,6 +538,14 @@ def feeds_page(
         if feeds
         else ""
     )
+    posts = int(bluesky.get("posts") or 0)
+    accounts = int(bluesky.get("accounts") or 0)
+    bluesky_status = (
+        f"{_plural(posts, 'post')} from {_plural(accounts, 'account')} · "
+        f"{_ago(bluesky.get('last_at') or 0)}"
+        if posts
+        else "No posts yet — the curator syncs at 06:00."
+    )
     body = f"""
 <h1>Feeds</h1>
 <p class="lede">The sources your issues are made from.</p>
@@ -554,6 +563,20 @@ def feeds_page(
 <h2>{_plural(len(feeds), "subscription")}</h2>
 {listing}
 {refresh}
+
+<h2>Curator sources</h2>
+<div class="card">
+  <div class="row">
+    <div class="row-main">
+      <span class="row-title">Bluesky</span>
+      <span class="row-sub">{bluesky_status}</span>
+    </div>
+    <div class="row-actions"><a class="btn tiny" href="{base}/read?view=all&source=Bluesky">Open in the Reader</a></div>
+  </div>
+  <p class="hint">Not an RSS subscription: the 06:00 curator reads the following
+  timeline from Bluesky and pushes the posts here as candidates. They are browsable
+  and rateable, and printed only when added to an issue.</p>
+</div>
 
 <h2>Import and export</h2>
 <div class="card">

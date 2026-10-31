@@ -990,6 +990,31 @@ def test_reading_time_is_hidden_when_only_a_summary_is_known(client):
     )
 
 
+def test_feeds_page_lists_bluesky_as_a_curator_source(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    client.post(
+        "/api/v1/candidates",
+        headers=_api(secret),
+        json={
+            "items": [
+                {
+                    "id": "b1",
+                    "url": "https://bsky.app/profile/alice.example/post/3k1",
+                    "title": "A Bluesky post",
+                    "source": "@alice.example",
+                    "content": "<p>Post body</p>",
+                }
+            ]
+        },
+    )
+
+    page = client.get(f"/{secret}/feeds")
+    assert "Curator sources" in page.text
+    assert "1 post from 1 account" in page.text
+    assert "source=Bluesky" in page.text
+
+
 def test_a_subscriber_cookie_is_encrypted_and_editable(client, tmp_path):
     secret = _signup_without_readwise(client)
     _add_feed(client, secret)

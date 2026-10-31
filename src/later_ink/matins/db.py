@@ -709,7 +709,7 @@ class MatinsStore:
                     " ON CONFLICT (secret, url) DO UPDATE SET"
                     " id = excluded.id, title = excluded.title, source = excluded.source,"
                     " summary = excluded.summary, content = excluded.content,"
-                    " published = excluded.published",
+                    " published = excluded.published, added_at = excluded.added_at",
                     (
                         str(item["id"]),
                         secret,
@@ -742,6 +742,19 @@ class MatinsStore:
                 (secret, max(1, min(limit, 500))),
             ).fetchall()
         return [_candidate(row) for row in rows]
+
+    def candidate_stats(self, secret: str) -> dict[str, int | float | None]:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS posts, COUNT(DISTINCT source) AS accounts,"
+                " MAX(added_at) AS last_at FROM candidates WHERE secret = ?",
+                (secret,),
+            ).fetchone()
+        return {
+            "posts": int(row["posts"] or 0),
+            "accounts": int(row["accounts"] or 0),
+            "last_at": row["last_at"],
+        }
 
     def get_candidate(self, secret: str, cid: str) -> CandidateItem | None:
         with self._conn() as conn:
