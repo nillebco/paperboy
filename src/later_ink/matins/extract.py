@@ -57,6 +57,28 @@ _MIN_ARTICLE_CHARS = 200
 _WS = re.compile(r"[ \t\r\f\v]+")
 _BLANK_LINES = re.compile(r"\n{3,}")
 
+# Pages that answer 200 with a wall instead of the article. Le Monde's is the
+# one that prompted this list ("A required part of this site couldn't load");
+# the extractor would otherwise print that error as the article body.
+_BLOCK_MARKERS = (
+    "a required part of this site couldn't load",
+    "une partie requise de ce site n'a pas pu se charger",
+    "please enable javascript",
+    "activez javascript",
+    "javascript is disabled",
+    "access denied",
+    "just a moment...",
+    "verify you are human",
+    "unusual traffic",
+    "captcha",
+)
+
+
+def looks_blocked(raw: str) -> bool:
+    """True when a fetched page is a wall, not an article."""
+    text = visible_text(raw).casefold()
+    return any(marker in text for marker in _BLOCK_MARKERS)
+
 
 def visible_text(html: str) -> str:
     """Plain text of an HTML fragment, for word counts and length checks."""

@@ -415,7 +415,9 @@ class RssConnector(Connector):
             return article, item.content_html
 
         page = await self._fetch_page(item.link)
-        if page:
+        # A wall (paywall interstitial, consent shell, JS challenge) is not an
+        # article: keep the feed's own lede rather than printing the error.
+        if page and not extract.looks_blocked(page):
             extracted = extract.html_to_content(page, item.link)
             if extracted:
                 return article, extracted

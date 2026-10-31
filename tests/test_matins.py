@@ -119,6 +119,18 @@ def test_extract_returns_none_on_thin_page():
     assert html_to_content("<html><body><p>Hi</p></body></html>", "https://e.com") is None
 
 
+def test_extract_flags_a_blocked_page():
+    from later_ink.matins.extract import looks_blocked
+
+    wall = (
+        "<html><body><p>A required part of this site couldn't load. This may be "
+        "due to a browser extension, network issues, or browser settings.</p>"
+        "</body></html>"
+    )
+    assert looks_blocked(wall)
+    assert not looks_blocked(ARTICLE_HTML)
+
+
 def test_word_count_ignores_markup():
     assert word_count("<p>one two <b>three</b></p>") == 3
 
@@ -928,6 +940,27 @@ def test_reader_like_and_next_issue_are_stateful(client):
         follow_redirects=False,
     )
     assert "First story" not in client.get(f"/{secret}/read?view=queued").text
+
+
+def test_a_blocked_article_falls_back_to_the_feed_summary(client, monkeypatch):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    # The second item has no content:encoded, so the connector must try the page.
+    article_id = _reader_article_id(client, secret, "Second story")
+
+    async def blocked(_self, _url):
+        return (
+            "<html><body><p>A required part of this site couldn't load. "
+            "Please check your connection, disable any ad blockers, or try "
+            "using a different browser.</p></body></html>"
+        )
+
+    monkeypatch.setattr("later_ink.matins.rss.RssConnector._fetch_page", blocked)
+    page = client.get(
+        f"/{secret}/read", params={"view": "all", "article": article_id}
+    )
+    assert "Another summary." in page.text
+    assert "required part of this site" not in page.text
 
 
 def test_reader_filters_by_source(client):
