@@ -154,7 +154,7 @@ pages use the same service layer, so nothing here has powers the UI lacks.
 | GET | `/api/v1/issues` | composed issues and download paths |
 | GET | `/api/v1/issues/preview` | exactly what the next issue would contain (`only=queue` for a curated preview) |
 | POST | `/api/v1/issues?force=0\|1` | compose and deliver now (409 if today's exists); `only=queue` composes the queue alone |
-| GET/POST | `/api/v1/signals` | likes / not-for-me, keyed by URL |
+| GET/POST | `/api/v1/signals` | likes, not-for-me, reads and opens, keyed by URL with a weight |
 | GET/POST | `/api/v1/candidates` | browsable-but-not-printed items (Bluesky posts) |
 
 ```bash
@@ -168,6 +168,13 @@ curl -sS -X POST https://matins.example/api/v1/items \
 as-is instead of the server fetching the page (capped at 512 KiB). That is how
 you queue something the server cannot reach — a paywall, an authenticated page,
 a generated summary — and it still goes through the same sanitising EPUB path.
+
+`GET /api/v1/signals` returns `{url, title, source, rating, weight, kind}`. An
+explicit like/dislike is `kind: like|dislike`, `weight: ±1`, and wins over
+implicit events. Otherwise opening an article in the reader is `kind: read`,
+`weight: 0.35`, and handing it to the publisher (`/read/open`) is
+`kind: opened`, `weight: 0.7`. A curator should aggregate `weight`, not count
+rows: ten reads are not ten likes.
 
 `only=queue` is the curator's option. A client that already chose the day's
 articles queues them and composes with `POST /api/v1/issues?only=queue`: the

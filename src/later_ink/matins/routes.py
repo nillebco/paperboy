@@ -551,6 +551,7 @@ async def reader_index(
                 "source": section,
                 "url": url,
                 "kind": kind,
+                "signal_source": getattr(source_article, "signal_source", section),
                 "saved": saved is not None,
                 "saved_id": saved.id if saved else None,
                 "rating": ratings.get(url, 0),
@@ -606,6 +607,16 @@ async def reader_index(
         if body is not None:
             store.mark_read(secret, selected["id"])
             selected["read"] = True
+            if selected["url"]:
+                # Opening it is interest, weaker than a like but real.
+                store.record_event(
+                    secret,
+                    selected["url"],
+                    article_id=selected["id"],
+                    title=selected["title"],
+                    source=selected["signal_source"],
+                    kind="read",
+                )
             # Keep it in the list even when the current filter would hide it:
             # a click must not make the row vanish under the pointer.
             if selected not in shown:
@@ -720,6 +731,28 @@ async def _find_reader_item(
             "kind": kind,
         }
     return None
+
+
+@router.get("/{secret}/read/open")
+async def reader_open(secret: str, request: Request, article: str):
+    """Hand the reader to the publisher, and count it as interest.
+
+    A GET redirect rather than a form: the link stays a link (middle-click, new
+    tab). The destination comes from the catalogue item, never from the query.
+    """
+    _resolve(secret, request)
+    item = await _find_reader_item(request, secret, article)
+    if item is None or not item["url"]:
+        raise HTTPException(404, "No such article")
+    _store(request).record_event(
+        secret,
+        item["url"],
+        article_id=item["id"],
+        title=item["title"],
+        source=item["source"],
+        kind="opened",
+    )
+    return RedirectResponse(item["url"], status_code=302)
 
 
 @router.post("/{secret}/read/feedback")
@@ -901,7 +934,18 @@ async def reader_article(secret: str, article_id: str, request: Request):
     body = to_page_html(raw)
     if body is None:
         raise HTTPException(422, "Could not render that article")
-    _store(request).mark_read(secret, article_id)
+    store = _store(request)
+    store.mark_read(secret, article_id)
+    found = await _find_reader_item(request, secret, article_id)
+    if article.url:
+        store.record_event(
+            secret,
+            article.url,
+            article_id=article_id,
+            title=article.title,
+            source=found["source"] if found else "",
+            kind="read",
+        )
     return _html(
         pages.reader_article_page(
             secret=secret,

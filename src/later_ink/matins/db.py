@@ -128,6 +128,18 @@ class ArchivedArticle:
 
 
 @dataclass(frozen=True)
+class ArticleEvent:
+    """An implicit interest signal: the article was opened, or read in-app."""
+
+    url: str
+    article_id: str | None
+    title: str
+    source: str
+    kind: str  # "read" | "opened"
+    created_at: float
+
+
+@dataclass(frozen=True)
 class ArticleSignal:
     """One like/dislike, keyed by URL so an external curator can use it too."""
 
@@ -341,6 +353,22 @@ class MatinsStore:
                 """
             )
             _ensure_column(conn, "archived_articles", "kind", "TEXT")
+            # Implicit interest: opened in the reader, or handed to the
+            # publisher. Weaker than a like, but still a statement.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS article_events (
+                    secret TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    article_id TEXT,
+                    title TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (secret, url, kind)
+                )
+                """
+            )
             # Like / not for me. Keyed by URL, not by connector id: the curator
             # ranks next morning's feeds and has no catalogue ids to work with.
             conn.execute(
@@ -781,6 +809,49 @@ class MatinsStore:
             found.update(r["url"] for r in rows)
         return found
 
+    # ------------------------------------------------------------ events
+
+    def record_event(
+        self,
+        secret: str,
+        url: str,
+        *,
+        article_id: str | None = None,
+        title: str = "",
+        source: str = "",
+        kind: str,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO article_events"
+                " (secret, url, article_id, title, source, kind, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (secret, url, kind) DO UPDATE SET"
+                " article_id = COALESCE(excluded.article_id, article_events.article_id),"
+                " title = excluded.title, source = excluded.source,"
+                " created_at = excluded.created_at",
+                (secret, url, article_id, title, source, kind, time.time()),
+            )
+
+    def list_events(self, secret: str, limit: int = 1000) -> list[ArticleEvent]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM article_events WHERE secret = ?"
+                " ORDER BY created_at DESC LIMIT ?",
+                (secret, max(1, min(limit, 3000))),
+            ).fetchall()
+        return [
+            ArticleEvent(
+                url=r["url"],
+                article_id=r["article_id"],
+                title=r["title"],
+                source=r["source"],
+                kind=r["kind"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
     # ----------------------------------------------------------- signals
 
     def set_signal(
@@ -982,6 +1053,7 @@ class MatinsStore:
             conn.execute("DELETE FROM candidates WHERE secret = ?", (secret,))
             conn.execute("DELETE FROM article_signals WHERE secret = ?", (secret,))
             conn.execute("DELETE FROM archived_articles WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM article_events WHERE secret = ?", (secret,))
 
     def rename_secret(self, old: str, new: str) -> None:
         """Move everything to a new secret when the catalogue URL is rotated.
@@ -1179,6 +1251,7 @@ _SECRET_TABLES = (
     "candidates",
     "article_signals",
     "archived_articles",
+    "article_events",
 )
 
 

@@ -993,6 +993,39 @@ def test_archived_bluesky_posts_stay_under_the_bluesky_source(client):
     assert "Bluesky · @alice.example" in archived.text
 
 
+def test_reading_and_opening_count_as_interest(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    article_id = _reader_article_id(client, secret, "First story")
+
+    client.get(f"/{secret}/read", params={"view": "all", "article": article_id})
+    signals = client.get("/api/v1/signals", headers=_api(secret)).json()["signals"]
+    assert [(s["url"], s["kind"], s["weight"]) for s in signals] == [
+        ("https://example.com/first", "read", 0.35)
+    ]
+
+    opened = client.get(
+        f"/{secret}/read/open",
+        params={"article": article_id},
+        follow_redirects=False,
+    )
+    assert opened.status_code == 302
+    assert opened.headers["location"] == "https://example.com/first"
+
+    signals = client.get("/api/v1/signals", headers=_api(secret)).json()["signals"]
+    assert [(s["kind"], s["weight"]) for s in signals] == [("opened", 0.7)]
+
+    # An explicit like still wins over the implicit events.
+    csrf = _csrf(client, secret)
+    client.post(
+        f"/{secret}/read/feedback",
+        data={"csrf": csrf, "article_id": article_id, "value": "like", "view": "all"},
+        follow_redirects=False,
+    )
+    signals = client.get("/api/v1/signals", headers=_api(secret)).json()["signals"]
+    assert [(s["kind"], s["weight"]) for s in signals] == [("like", 1.0)]
+
+
 def test_reader_archive_hides_signals_unqueues_and_restores(client):
     secret = _signup_without_readwise(client)
     _add_feed(client, secret)

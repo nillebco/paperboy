@@ -169,22 +169,51 @@ async def list_candidates(request: Request, limit: int = 100):
 
 @router.get("/signals")
 async def list_signals(request: Request, limit: int = 500):
-    """What the reader liked and disliked. The curator ranks next morning with it."""
+    """Everything the reader expressed, explicit and implicit.
+
+    An explicit like/dislike wins. Otherwise opening an article counts for less
+    than handing it to the publisher, and both count for less than a like. The
+    `weight` is what a curator should aggregate; `rating` stays for clients that
+    only know up/down.
+    """
     secret = _secret(request)
-    return {
-        "signals": [
-            {
-                "url": signal.url,
-                "title": signal.title,
-                "source": signal.source,
-                "rating": "interesting" if signal.rating > 0 else "not_interested",
-                "updated_at": int(signal.updated_at),
-            }
-            for signal in _store(request).list_signals(
-                secret, limit=max(1, min(limit, 2000))
-            )
-        ]
-    }
+    store = _store(request)
+    rows: dict[str, dict] = {}
+    for signal in store.list_signals(secret, limit=2000):
+        positive = signal.rating > 0
+        rows[signal.url] = {
+            "url": signal.url,
+            "title": signal.title,
+            "source": signal.source,
+            "rating": "interesting" if positive else "not_interested",
+            "weight": 1.0 if positive else -1.0,
+            "kind": "like" if positive else "dislike",
+            "updated_at": int(signal.updated_at),
+        }
+
+    best: dict[str, tuple[float, object]] = {}
+    for event in store.list_events(secret, limit=3000):
+        weight = {"read": 0.35, "opened": 0.7}.get(event.kind, 0.0)
+        if weight <= 0:
+            continue
+        current = best.get(event.url)
+        if current is None or weight > current[0]:
+            best[event.url] = (weight, event)
+    for url, (weight, event) in best.items():
+        if url in rows:
+            continue
+        rows[url] = {
+            "url": url,
+            "title": getattr(event, "title", ""),
+            "source": getattr(event, "source", ""),
+            "rating": "interesting",
+            "weight": weight,
+            "kind": getattr(event, "kind", "read"),
+            "updated_at": int(getattr(event, "created_at", 0)),
+        }
+
+    ordered = sorted(rows.values(), key=lambda row: row["updated_at"], reverse=True)
+    return {"signals": ordered[: max(1, min(limit, 2000))]}
 
 
 @router.post("/signals", status_code=201)

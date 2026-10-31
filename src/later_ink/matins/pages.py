@@ -1151,7 +1151,8 @@ def _reader_pane(
     base = f"/{escape(secret)}"
     rating = selected["rating"]
     original = (
-        f'<a class="btn tiny" href="{escape(selected["url"])}" target="_blank" '
+        f'<a class="btn tiny" href="{base}/read/open?article='
+        f'{quote(selected["id"], safe="")}" target="_blank" '
         'rel="noopener noreferrer">Open original</a>'
         if selected["url"]
         else ""
@@ -1308,7 +1309,8 @@ def reader_article_page(
     if author:
         meta.insert(0, escape(author))
     original = (
-        f'<a class="btn tiny" href="{escape(source_url)}" target="_blank" '
+        f'<a class="btn tiny" href="{base}/read/open?article='
+        f'{quote(article_id, safe="")}" target="_blank" '
         'rel="noopener noreferrer">Open original</a>'
         if source_url
         else ""
