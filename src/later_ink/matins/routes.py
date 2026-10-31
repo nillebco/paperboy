@@ -519,7 +519,12 @@ async def save(secret: str, request: Request):
 
 @router.get("/{secret}/read", response_class=HTMLResponse)
 async def reader_index(
-    secret: str, request: Request, article: str | None = None, view: str = "all"
+    secret: str,
+    request: Request,
+    article: str | None = None,
+    view: str = "all",
+    source: str | None = None,
+    notice: str | None = None,
 ):
     """The mailbox: everything the catalogue can show, with one article open.
 
@@ -555,21 +560,30 @@ async def reader_index(
             }
         )
 
+    archived_rows = store.list_archived(secret, limit=MAX_READER_ITEMS)
     archived_urls = store.archived_urls(secret, [item["url"] for item in items if item["url"]])
     for item in items:
         item["archived"] = bool(item["url"]) and item["url"] in archived_urls
     visible = [item for item in items if not item["archived"]]
-    archived_count = len(store.list_archived(secret, limit=1000))
+    sources = sorted(
+        {item["source"] for item in visible}
+        | {row.source for row in archived_rows if row.source}
+    )
+    source = source or None
+    if source:
+        visible = [item for item in visible if item["source"] == source]
+        archived_rows = [row for row in archived_rows if row.source == source]
+
     counts = {
         "all": len(visible),
         "unread": sum(1 for item in visible if not item["read"]),
         "liked": sum(1 for item in visible if item["rating"] > 0),
         "queued": sum(1 for item in visible if item["saved"]),
-        "archived": archived_count,
+        "archived": len(archived_rows),
     }
     view = view if view in counts else "all"
     if view == "archived":
-        shown = [_archived_item(row) for row in store.list_archived(secret, limit=MAX_READER_ITEMS)]
+        shown = [_archived_item(row) for row in archived_rows]
     else:
         shown = _filter_reader(visible, view)
 
@@ -603,8 +617,11 @@ async def reader_index(
             items=shown[:MAX_READER_ITEMS],
             counts=counts,
             view=view,
+            sources=sources,
+            source=source,
             selected=selected,
             body=body,
+            notice=notice,
             error=error,
         ),
         csp=READER_CSP,
@@ -659,10 +676,20 @@ def _candidate_html(content: str) -> str:
     )
 
 
-def _read_href(secret: str, view: str, article: str | None = None) -> str:
+def _read_href(
+    secret: str,
+    view: str,
+    article: str | None = None,
+    notice: str | None = None,
+    source: str | None = None,
+) -> str:
     target = f"/{secret}/read?view={quote(view)}"
     if article:
         target += f"&article={quote(article, safe='')}"
+    if source:
+        target += f"&source={quote(source)}"
+    if notice:
+        target += f"&notice={quote(notice)}"
     return target
 
 
@@ -690,6 +717,7 @@ async def reader_feedback(
     article_id: str = Form(""),
     value: str = Form("like"),
     view: str = Form("all"),
+    source: str = Form(""),
 ):
     """Like / not for me, keyed by URL so the curator can rank next morning."""
     _resolve(secret, request)
@@ -710,7 +738,7 @@ async def reader_feedback(
         )
     else:
         store.clear_signal(secret, item["url"])
-    return RedirectResponse(_read_href(secret, view, article_id), status_code=303)
+    return RedirectResponse(_read_href(secret, view, article_id, source=source or None), status_code=303)
 
 
 @router.post("/{secret}/read/queue")
@@ -720,6 +748,7 @@ async def reader_queue(
     csrf: str = Form(""),
     article_id: str = Form(""),
     view: str = Form("all"),
+    source: str = Form(""),
 ):
     """Add any browsable item to the curated next issue."""
     _resolve(secret, request)
@@ -732,7 +761,7 @@ async def reader_queue(
         candidate = _store(request).get_candidate(secret, article_id.split(":", 1)[1])
         content = candidate.content if candidate else None
     _store(request).save_url(secret, item["url"], item["title"], content=content)
-    return RedirectResponse(_read_href(secret, view, article_id), status_code=303)
+    return RedirectResponse(_read_href(secret, view, article_id, source=source or None), status_code=303)
 
 
 @router.post("/{secret}/read/archive")
@@ -742,6 +771,7 @@ async def reader_archive(
     csrf: str = Form(""),
     article_id: str = Form(""),
     view: str = Form("all"),
+    source: str = Form(""),
 ):
     """Discard an item: hide it from the reader, tell the curator, unqueue it."""
     _resolve(secret, request)
@@ -772,7 +802,15 @@ async def reader_archive(
         store.delete_saved(secret, queued.id)
     # Do not select it: the row just left this view.
     target = "all" if view == "archived" else view
-    return RedirectResponse(_read_href(secret, target), status_code=303)
+    return RedirectResponse(
+        _read_href(
+            secret,
+            target,
+            notice="Archived. It is under the Archived tab if you want it back.",
+            source=source or None,
+        ),
+        status_code=303,
+    )
 
 
 @router.post("/{secret}/read/restore")
@@ -782,6 +820,7 @@ async def reader_restore(
     csrf: str = Form(""),
     article_id: str = Form(""),
     view: str = Form("archived"),
+    source: str = Form(""),
 ):
     """Bring an archived item back and clear the not-interested mark."""
     _resolve(secret, request)
@@ -793,7 +832,12 @@ async def reader_restore(
     store.unarchive_article(secret, archived.url)
     store.clear_signal(secret, archived.url)
     target = "all" if view == "archived" else view
-    return RedirectResponse(_read_href(secret, target), status_code=303)
+    return RedirectResponse(
+        _read_href(
+            secret, target, notice="Restored to the reader.", source=source or None
+        ),
+        status_code=303,
+    )
 
 
 @router.post("/{secret}/read/unqueue")
@@ -803,6 +847,7 @@ async def reader_unqueue(
     csrf: str = Form(""),
     article_id: str = Form(""),
     view: str = Form("all"),
+    source: str = Form(""),
 ):
     _resolve(secret, request)
     _require_csrf(secret, csrf)
@@ -815,7 +860,7 @@ async def reader_unqueue(
     )
     if queued is not None:
         store.delete_saved(secret, queued.id)
-    return RedirectResponse(_read_href(secret, view, article_id), status_code=303)
+    return RedirectResponse(_read_href(secret, view, article_id, source=source or None), status_code=303)
 
 
 @router.post("/{secret}/read/mark-all")
@@ -860,12 +905,19 @@ async def reader_article(secret: str, article_id: str, request: Request):
 
 @router.post("/{secret}/read/{article_id:path}/unread")
 async def reader_mark_unread(
-    secret: str, article_id: str, request: Request, csrf: str = Form("")
+    secret: str,
+    article_id: str,
+    request: Request,
+    csrf: str = Form(""),
+    view: str = Form("all"),
+    source: str = Form(""),
 ):
     _resolve(secret, request)
     _require_csrf(secret, csrf)
     _store(request).mark_unread(secret, article_id)
-    return RedirectResponse(f"/{secret}/read", status_code=303)
+    return RedirectResponse(
+        _read_href(secret, view, source=source or None), status_code=303
+    )
 
 
 async def _reader_items(request: Request, secret: str) -> list[tuple[str, object, str, str]]:

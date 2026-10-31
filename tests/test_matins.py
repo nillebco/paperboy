@@ -867,6 +867,7 @@ def test_reader_lists_items_and_opening_one_marks_it_read(client):
 
     page = client.get(f"/{secret}/read")
     assert page.status_code == 200
+    assert "no-store" in page.headers["cache-control"]
     assert "First story" in page.text
     assert "Saved for later" in page.text
     article_id = _reader_article_id(client, secret, "First story")
@@ -927,6 +928,37 @@ def test_reader_like_and_next_issue_are_stateful(client):
         follow_redirects=False,
     )
     assert "First story" not in client.get(f"/{secret}/read?view=queued").text
+
+
+def test_reader_filters_by_source(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    client.post(
+        "/api/v1/candidates",
+        headers=_api(secret),
+        json={
+            "items": [
+                {
+                    "id": "b1",
+                    "url": "https://bsky.app/profile/alice.example/post/3k1",
+                    "title": "A Bluesky post",
+                    "source": "@alice.example",
+                    "content": "<p>Post body</p>",
+                }
+            ]
+        },
+    )
+
+    bluesky = client.get(
+        f"/{secret}/read", params={"source": "Bluesky · @alice.example"}
+    )
+    assert "A Bluesky post" in bluesky.text
+    assert "First story" not in bluesky.text
+    assert 'name="source"' in bluesky.text
+
+    feed = client.get(f"/{secret}/read", params={"source": "Example Feed"})
+    assert "First story" in feed.text
+    assert "A Bluesky post" not in feed.text
 
 
 def test_reader_archive_hides_signals_unqueues_and_restores(client):

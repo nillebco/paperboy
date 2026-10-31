@@ -161,6 +161,11 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .article a { text-decoration: underline; }
 .tabs { display: flex; gap: 1rem; margin: .8rem 0 0; font-size: .92rem; flex-wrap: wrap; }
 .tabs a[aria-current] { font-weight: 700; text-decoration: none; }
+.source-filter { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+  margin: .7rem 0 0; }
+.source-filter label { font-size: .85rem; color: var(--muted); }
+.source-filter select { font: inherit; padding: .4em .6em; border: 1px solid var(--line);
+  border-radius: 7px; background: var(--card); color: inherit; max-width: 22rem; }
 /* Both panes share the viewport and scroll independently: a mailbox, not a
    page with one box that happens to scroll. */
 .reader-split { display: grid; grid-template-columns: minmax(0, 26rem) minmax(0, 1fr);
@@ -1064,14 +1069,20 @@ _READER_VIEWS = (
 )
 
 
-def _reader_href(secret: str, view: str, article: str | None = None) -> str:
+def _reader_href(
+    secret: str, view: str, article: str | None = None, source: str | None = None
+) -> str:
     base = f"/{escape(secret)}/read?view={quote(view)}"
+    if source:
+        base += f"&source={quote(source)}"
     if article:
         base += f"&article={quote(article, safe='')}"
     return base
 
 
-def _reader_row(secret: str, csrf: str, item: dict, view: str) -> str:
+def _reader_row(
+    secret: str, csrf: str, item: dict, view: str, source: str | None
+) -> str:
     """One list row: open it, like it, queue it, or discard it."""
     if item.get("archived"):
         restore = _button(
@@ -1079,7 +1090,7 @@ def _reader_row(secret: str, csrf: str, item: dict, view: str) -> str:
             csrf,
             "Restore",
             style="tiny",
-            fields={"article_id": item["id"], "view": "archived"},
+            fields={"article_id": item["id"], "view": "archived", "source": source or ""},
         )
         return f"""<div class="row archived">
   <div class="row-main">
@@ -1099,6 +1110,7 @@ def _reader_row(secret: str, csrf: str, item: dict, view: str) -> str:
             "article_id": item["id"],
             "value": "clear" if liked else "like",
             "view": view,
+            "source": source or "",
         },
     )
     queue = _button(
@@ -1106,20 +1118,20 @@ def _reader_row(secret: str, csrf: str, item: dict, view: str) -> str:
         csrf,
         "✓ Next" if queued else "+ Next",
         style="tiny on" if queued else "tiny",
-        fields={"article_id": item["id"], "view": view},
+        fields={"article_id": item["id"], "view": view, "source": source or ""},
     )
     archive = _button(
         f"/{escape(secret)}/read/archive",
         csrf,
         "Archive",
         style="tiny",
-        fields={"article_id": item["id"], "view": view},
+        fields={"article_id": item["id"], "view": view, "source": source or ""},
     )
     selected = " selected" if item.get("selected") else ""
     read = " read" if item["read"] else ""
     return f"""<div class="row{selected}{read}">
   <div class="row-main">
-    <a class="row-title" href="{_reader_href(secret, view, item["id"])}">{escape(item["title"])}</a>
+    <a class="row-title" href="{_reader_href(secret, view, item["id"], source)}">{escape(item["title"])}</a>
     <span class="row-sub">{escape(item["source"])} · {_minutes(item["minutes"] * 250)}</span>
   </div>
   <div class="row-actions">{like}{queue}{archive}</div>
@@ -1127,7 +1139,13 @@ def _reader_row(secret: str, csrf: str, item: dict, view: str) -> str:
 
 
 def _reader_pane(
-    *, secret: str, csrf: str, view: str, selected: dict, body: str
+    *,
+    secret: str,
+    csrf: str,
+    view: str,
+    source: str | None,
+    selected: dict,
+    body: str,
 ) -> str:
     base = f"/{escape(secret)}"
     rating = selected["rating"]
@@ -1142,14 +1160,19 @@ def _reader_pane(
         csrf,
         "✓ In next issue" if selected["saved"] else "+ Add to next issue",
         style="tiny on" if selected["saved"] else "tiny",
-        fields={"article_id": selected["id"], "view": view},
+        fields={"article_id": selected["id"], "view": view, "source": source or ""},
     )
     like = _button(
         f"{base}/read/feedback",
         csrf,
         "♥ Liked" if rating > 0 else "♥ Like",
         style="tiny on" if rating > 0 else "tiny",
-        fields={"article_id": selected["id"], "value": "clear" if rating > 0 else "like", "view": view},
+        fields={
+            "article_id": selected["id"],
+            "value": "clear" if rating > 0 else "like",
+            "view": view,
+            "source": source or "",
+        },
     )
     dislike = _button(
         f"{base}/read/feedback",
@@ -1160,6 +1183,7 @@ def _reader_pane(
             "article_id": selected["id"],
             "value": "clear" if rating < 0 else "dislike",
             "view": view,
+            "source": source or "",
         },
     )
     archive = _button(
@@ -1167,14 +1191,14 @@ def _reader_pane(
         csrf,
         "Archive",
         style="tiny",
-        fields={"article_id": selected["id"], "view": view},
+        fields={"article_id": selected["id"], "view": view, "source": source or ""},
     )
     unread = _button(
         f"{base}/read/{quote(selected['id'], safe=':-_')}/unread",
         csrf,
         "Mark unread",
         style="tiny",
-        fields={},
+        fields={"view": view, "source": source or ""},
     )
     return f"""<div class="card reader-pane">
 <h1>{escape(selected["title"])}</h1>
@@ -1191,8 +1215,11 @@ def reader_page(
     items: list[dict],
     counts: dict[str, int],
     view: str,
+    sources: list[str],
+    source: str | None = None,
     selected: dict | None = None,
     body: str | None = None,
+    notice: str | None = None,
     error: str | None = None,
 ) -> str:
     """The mailbox: all the news on the left, the chosen article on the right.
@@ -1201,17 +1228,48 @@ def reader_page(
     list can carry real forms whose state the server owns."""
     base = f"/{escape(secret)}"
     tabs = "".join(
-        f'<a href="{base}/read?view={key}"'
+        f'<a href="{_reader_href(secret, key, source=source)}"'
         + (' aria-current="page"' if key == view else "")
         + f">{label} ({counts.get(key, 0)})</a>"
         for key, label in _READER_VIEWS
     )
-    rows = "".join(_reader_row(secret, csrf, item, view) for item in items) or (
-        f'<p class="meta">Nothing here. <a href="{base}/feeds">Add a feed</a>'
-        " or save a link.</p>"
+    options = "".join(
+        f'<option value="{escape(name)}"{" selected" if name == source else ""}>'
+        f"{escape(name)}</option>"
+        for name in sources
     )
+    clear = (
+        f'<a class="meta" href="{_reader_href(secret, view)}">Clear</a>'
+        if source
+        else ""
+    )
+    filter_form = f"""<form class="source-filter" method="get" action="{base}/read">
+  <input type="hidden" name="view" value="{escape(view)}">
+  <label for="source-filter">Source</label>
+  <select id="source-filter" name="source">
+    <option value="">All sources</option>
+    {options}
+  </select>
+  <button class="btn tiny" type="submit">Filter</button>
+  {clear}
+</form>"""
+    empty = (
+        "Nothing from this source here."
+        if source
+        else f'Nothing here. <a href="{base}/feeds">Add a feed</a> or save a link.'
+    )
+    rows = "".join(
+        _reader_row(secret, csrf, item, view, source) for item in items
+    ) or f'<p class="meta">{empty}</p>'
     if selected and body is not None:
-        pane = _reader_pane(secret=secret, csrf=csrf, view=view, selected=selected, body=body)
+        pane = _reader_pane(
+            secret=secret,
+            csrf=csrf,
+            view=view,
+            source=source,
+            selected=selected,
+            body=body,
+        )
     else:
         pane = (
             '<div class="card reader-pane"><p class="meta">'
@@ -1226,12 +1284,15 @@ def reader_page(
 <p class="lede" style="margin-bottom:0">Everything your sources publish. Like what
 is interesting; add what you want to read next.</p>
 <div class="tabs">{tabs}</div>
+{filter_form}
 <div class="reader-split">
   <div class="card reader-list">{rows}</div>
   <div class="reader-pane-col">{pane}</div>
 </div>
 """
-    return _shell(secret, "read", "Reader", body_html, error=error, wide=True)
+    return _shell(
+        secret, "read", "Reader", body_html, notice=notice, error=error, wide=True
+    )
 
 
 def reader_article_page(
