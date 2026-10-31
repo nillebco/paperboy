@@ -70,7 +70,6 @@ _BLOCK_MARKERS = (
     "just a moment...",
     "verify you are human",
     "unusual traffic",
-    "captcha",
 )
 
 
