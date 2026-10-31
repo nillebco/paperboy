@@ -106,7 +106,10 @@ budget still uses those estimates, so an issue can run past `max_words`.
 SQLite, same file as the users table (WAL), disjoint tables:
 
 - `feeds (id, secret, url, title, added_at, paused, last_fetched_at, last_error,
-  item_count, last_item_at)` — unique per `(secret, url)`.
+  item_count, last_item_at, auth_cookie)` — unique per `(secret, url)`.
+  `auth_cookie` is an optional subscriber session cookie, Fernet-encrypted with
+  the app key, used only when fetching that feed's article pages (never for the
+  RSS fetch, and dropped after a redirect to another site).
 - `saved (id, secret, url, title, added_at, consumed_by)` — the queue; re-saving
   a consumed link re-queues it.
 - `issues (id, secret, title, created_at, local_day, path, article_count,
@@ -168,6 +171,19 @@ curl -sS -X POST https://matins.example/api/v1/items \
 as-is instead of the server fetching the page (capped at 512 KiB). That is how
 you queue something the server cannot reach — a paywall, an authenticated page,
 a generated summary — and it still goes through the same sanitising EPUB path.
+
+### Paywalled publishers
+
+A feed's detail page has a **Subscriber access** field: paste the `Cookie`
+request header from a logged-in browser tab, and Matins will use it when fetching
+that feed's article pages. The value is encrypted at rest, never rendered back,
+and only sent to hosts on the same registrable site as the article (a redirect
+to another domain drops it). The feed's RSS is always fetched without it.
+
+This is a session, not a licence: when the publisher logs the browser out, the
+cookie expires and the reader falls back to the feed's lede until a new one is
+pasted. Some publishers also challenge non-browser clients independently of the
+subscription (Le Monde's JS wall); a cookie cannot defeat that.
 
 `GET /api/v1/signals` returns `{url, title, source, rating, weight, kind}`. An
 explicit like/dislike is `kind: like|dislike`, `weight: ±1`, and wins over
