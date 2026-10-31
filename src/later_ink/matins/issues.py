@@ -219,6 +219,7 @@ class IssueService:
         if delivery is None:
             return
         catalog_url = f"{self._base_url()}/{secret}/issues/"
+        issue_url = f"{catalog_url}{issue.id}"
         if delivery.webhook_url:
             payload = webhooks.issue_payload(issue, catalog_url)
             ok = await webhooks.deliver(
@@ -228,7 +229,7 @@ class IssueService:
                 logger.warning("webhook for %s did not succeed", issue.id)
         email = delivery.email or self.store.email_for_secret(secret)
         if email:
-            await notify.send_issue_notification(email, issue, catalog_url)
+            await notify.send_issue_notification(email, issue, catalog_url, issue_url)
 
     async def plan(
         self,

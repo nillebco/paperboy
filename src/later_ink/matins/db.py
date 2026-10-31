@@ -1005,6 +1005,23 @@ class MatinsStore:
             word_count=word_count,
         )
 
+    def find_issue_item(self, secret: str, article_id: str) -> IssueEntry | None:
+        """The last issue that printed an article, for the reader's issue view."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT article_id, title, url, section FROM issue_items"
+                " WHERE secret = ? AND article_id = ? LIMIT 1",
+                (secret, article_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return IssueEntry(
+            article_id=row["article_id"],
+            title=row["title"],
+            url=row["url"],
+            section=row["section"],
+        )
+
     def issue_entries(self, secret: str, issue_id: str) -> list[IssueEntry]:
         with self._conn() as conn:
             rows = conn.execute(

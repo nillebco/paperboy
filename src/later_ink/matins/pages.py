@@ -926,6 +926,7 @@ def issue_page(
 <p class="lede">{_edition(issue, timezone)}</p>
 <div class="actions" style="margin-bottom:1rem">
   <a class="btn primary" href="{base}/issues/{escape(issue["id"])}.epub">Download EPUB</a>
+  <a class="btn" href="{base}/read?issue={escape(issue["id"])}">See in reader</a>
 </div>
 {blocks}
 <div class="actions" style="margin-top:2rem">
@@ -1101,6 +1102,22 @@ def settings_page(
 # --------------------------------------------------------------- reader
 
 
+# Progressive enhancement, not a dependency: without it the reader still works,
+# the list just jumps to the top after a click. A full-page navigation discards
+# both the inner list's scrollTop and the page scroll, so save them per tab and
+# restore on load. Kept as a constant because its hash is in the reader's CSP.
+READER_SCROLL_JS = (
+    "(function(){var l=document.querySelector('.reader-list');if(!l)return;"
+    "var k='matins-scroll:'+location.pathname;"
+    "try{var y=sessionStorage.getItem(k);"
+    "if(y!==null){l.scrollTop=+y;var p=sessionStorage.getItem(k+':page');"
+    "if(p!==null)window.scrollTo(0,+p);}}catch(e){}"
+    "function save(){try{sessionStorage.setItem(k,l.scrollTop);"
+    "sessionStorage.setItem(k+':page',window.scrollY);}catch(e){}}"
+    "window.addEventListener('pagehide',save);"
+    "l.addEventListener('click',save);l.addEventListener('submit',save);}());"
+)
+
 _READER_VIEWS = (
     ("all", "All"),
     ("unread", "Unread"),
@@ -1111,18 +1128,29 @@ _READER_VIEWS = (
 
 
 def _reader_href(
-    secret: str, view: str, article: str | None = None, source: str | None = None
+    secret: str,
+    view: str,
+    article: str | None = None,
+    source: str | None = None,
+    issue: str | None = None,
 ) -> str:
     base = f"/{escape(secret)}/read?view={quote(view)}"
     if source:
         base += f"&source={quote(source)}"
+    if issue:
+        base += f"&issue={quote(issue)}"
     if article:
         base += f"&article={quote(article, safe='')}"
     return base
 
 
 def _reader_row(
-    secret: str, csrf: str, item: dict, view: str, source: str | None
+    secret: str,
+    csrf: str,
+    item: dict,
+    view: str,
+    source: str | None,
+    issue: str | None,
 ) -> str:
     """One list row: open it, like it, queue it, or discard it."""
     if item.get("archived"):
@@ -1131,7 +1159,12 @@ def _reader_row(
             csrf,
             "Restore",
             style="tiny",
-            fields={"article_id": item["id"], "view": "archived", "source": source or ""},
+            fields={
+                "article_id": item["id"],
+                "view": "archived",
+                "source": source or "",
+                "issue": issue or "",
+            },
         )
         return f"""<div class="row archived">
   <div class="row-main">
@@ -1152,6 +1185,7 @@ def _reader_row(
             "value": "clear" if liked else "like",
             "view": view,
             "source": source or "",
+            "issue": issue or "",
         },
     )
     queue = _button(
@@ -1159,21 +1193,31 @@ def _reader_row(
         csrf,
         "✓ Next" if queued else "+ Next",
         style="tiny on" if queued else "tiny",
-        fields={"article_id": item["id"], "view": view, "source": source or ""},
+        fields={
+            "article_id": item["id"],
+            "view": view,
+            "source": source or "",
+            "issue": issue or "",
+        },
     )
     archive = _button(
         f"/{escape(secret)}/read/archive",
         csrf,
         "Archive",
         style="tiny",
-        fields={"article_id": item["id"], "view": view, "source": source or ""},
+        fields={
+            "article_id": item["id"],
+            "view": view,
+            "source": source or "",
+            "issue": issue or "",
+        },
     )
     selected = " selected" if item.get("selected") else ""
     read = " read" if item["read"] else ""
     timing = f" · {_minutes(item['minutes'] * 250)}" if item["minutes"] else ""
     return f"""<div class="row{selected}{read}">
   <div class="row-main">
-    <a class="row-title" href="{_reader_href(secret, view, item["id"], source)}">{escape(item["title"])}</a>
+    <a class="row-title" href="{_reader_href(secret, view, item["id"], source, issue)}">{escape(item["title"])}</a>
     <span class="row-sub">{escape(item["source"])}{timing}</span>
   </div>
   <div class="row-actions">{like}{queue}{archive}</div>
@@ -1186,6 +1230,7 @@ def _reader_pane(
     csrf: str,
     view: str,
     source: str | None,
+    issue: str | None,
     selected: dict,
     body: str,
 ) -> str:
@@ -1203,7 +1248,7 @@ def _reader_pane(
         csrf,
         "✓ In next issue" if selected["saved"] else "+ Add to next issue",
         style="tiny on" if selected["saved"] else "tiny",
-        fields={"article_id": selected["id"], "view": view, "source": source or ""},
+        fields={"article_id": selected["id"], "view": view, "source": source or "", "issue": issue or ""},
     )
     like = _button(
         f"{base}/read/feedback",
@@ -1215,6 +1260,7 @@ def _reader_pane(
             "value": "clear" if rating > 0 else "like",
             "view": view,
             "source": source or "",
+            "issue": issue or "",
         },
     )
     dislike = _button(
@@ -1227,6 +1273,7 @@ def _reader_pane(
             "value": "clear" if rating < 0 else "dislike",
             "view": view,
             "source": source or "",
+            "issue": issue or "",
         },
     )
     archive = _button(
@@ -1234,14 +1281,14 @@ def _reader_pane(
         csrf,
         "Archive",
         style="tiny",
-        fields={"article_id": selected["id"], "view": view, "source": source or ""},
+        fields={"article_id": selected["id"], "view": view, "source": source or "", "issue": issue or ""},
     )
     unread = _button(
         f"{base}/read/{quote(selected['id'], safe=':-_')}/unread",
         csrf,
         "Mark unread",
         style="tiny",
-        fields={"view": view, "source": source or ""},
+        fields={"view": view, "source": source or "", "issue": issue or ""},
     )
     timing = f" · {_minutes(selected['minutes'] * 250)}" if selected["minutes"] else ""
     return f"""<div class="card reader-pane">
@@ -1261,6 +1308,8 @@ def reader_page(
     view: str,
     sources: list[str],
     source: str | None = None,
+    issue: str | None = None,
+    issue_title: str | None = None,
     selected: dict | None = None,
     body: str | None = None,
     notice: str | None = None,
@@ -1268,37 +1317,51 @@ def reader_page(
 ) -> str:
     """The mailbox: all the news on the left, the chosen article on the right.
 
-    No JavaScript: a click is a navigation that re-renders both panes, so the
-    list can carry real forms whose state the server owns."""
+    No JavaScript is required: a click is a navigation that re-renders both
+    panes, so the list can carry real forms whose state the server owns. One
+    hashed script restores the list's scroll after that navigation. With
+    `issue`, the list is that edition instead of the live stream."""
     base = f"/{escape(secret)}"
     tabs = "".join(
-        f'<a href="{_reader_href(secret, key, source=source)}"'
+        f'<a href="{_reader_href(secret, key, source=source, issue=issue)}"'
         + (' aria-current="page"' if key == view else "")
         + f">{label} ({counts.get(key, 0)})</a>"
         for key, label in _READER_VIEWS
     )
     all_link = (
-        f'<a href="{_reader_href(secret, view)}"'
+        f'<a href="{_reader_href(secret, view, issue=issue)}"'
         + (' aria-current="page"' if not source else "")
         + ">All</a>"
     )
     source_links = "".join(
-        f'<a href="{_reader_href(secret, view, source=name)}"'
+        f'<a href="{_reader_href(secret, view, source=name, issue=issue)}"'
         + (' aria-current="page"' if name == source else "")
         + f">{escape(name)}</a>"
         for name in sources
     )
-    filter_form = (
-        f'<div class="source-filter"><span class="label">Source</span>'
-        f"{all_link}{source_links}</div>"
-    )
+    if issue:
+        filter_form = (
+            f'<div class="source-filter"><span class="label">Issue</span>'
+            f"<span>{escape(issue_title or issue)}</span>"
+            f'<a href="{base}/issues/{escape(issue)}">Issue page</a>'
+            f'<a href="{base}/read">All news</a></div>'
+        )
+    else:
+        filter_form = (
+            f'<div class="source-filter"><span class="label">Source</span>'
+            f"{all_link}{source_links}</div>"
+        )
     empty = (
-        "Nothing from this source here."
-        if source
-        else f'Nothing here. <a href="{base}/feeds">Add a feed</a> or save a link.'
+        "This issue has no articles here."
+        if issue
+        else (
+            "Nothing from this source here."
+            if source
+            else f'Nothing here. <a href="{base}/feeds">Add a feed</a> or save a link.'
+        )
     )
     rows = "".join(
-        _reader_row(secret, csrf, item, view, source) for item in items
+        _reader_row(secret, csrf, item, view, source, issue) for item in items
     ) or f'<p class="meta">{empty}</p>'
     if selected and body is not None:
         pane = _reader_pane(
@@ -1306,6 +1369,7 @@ def reader_page(
             csrf=csrf,
             view=view,
             source=source,
+            issue=issue,
             selected=selected,
             body=body,
         )
@@ -1314,20 +1378,27 @@ def reader_page(
             '<div class="card reader-pane"><p class="meta">'
             "Pick an article from the list to read it here.</p></div>"
         )
+    page_title = f"Issue · {issue_title}" if issue else "Reader"
+    lede = (
+        "The articles printed in this issue. Switch to All news for everything else."
+        if issue
+        else "Everything your sources publish. Like what is interesting; add what "
+        "you want to read next."
+    )
     body_html = f"""
 <div class="page-head">
-  <h1>Reader</h1>
+  <h1>{escape(page_title)}</h1>
   <p class="meta count" style="margin:.5rem 0 0">{counts.get("unread", 0)} unread ·
   {counts.get("queued", 0)} in the next issue · {counts.get("archived", 0)} archived</p>
 </div>
-<p class="lede" style="margin-bottom:0">Everything your sources publish. Like what
-is interesting; add what you want to read next.</p>
+<p class="lede" style="margin-bottom:0">{lede}</p>
 <div class="tabs">{tabs}</div>
 {filter_form}
 <div class="reader-split">
   <div class="card reader-list">{rows}</div>
   <div class="reader-pane-col">{pane}</div>
 </div>
+<script>{READER_SCROLL_JS}</script>
 """
     return _shell(
         secret, "read", "Reader", body_html, notice=notice, error=error, wide=True

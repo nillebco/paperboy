@@ -21,12 +21,16 @@ def issue_subject(issue) -> str:
     return f"Your issue is ready — {issue.article_count} articles"
 
 
-def issue_body(issue, catalog_url: str) -> str:
+def issue_body(issue, catalog_url: str, issue_url: str | None = None) -> str:
     minutes = max(1, round(issue.word_count / 250))
+    issue_link = (
+        f"Read or download this issue:\n{issue_url}\n\n" if issue_url else ""
+    )
     return (
         f"{issue.title}\n\n"
         f"{issue.article_count} articles · about {minutes} minutes of reading.\n\n"
-        f"Open your catalogue and download it:\n{catalog_url}\n\n"
+        f"{issue_link}"
+        f"Your catalogue (EPUB / reader):\n{catalog_url}\n\n"
         "Nothing is attached: the issue lives on your server, and your reader "
         "pulls it.\n"
     )
@@ -58,7 +62,12 @@ async def send_code(recipient: str, code: str, *, smtp: dict | None = None) -> b
 
 
 async def send_issue_notification(
-    recipient: str, issue, catalog_url: str, *, smtp: dict | None = None
+    recipient: str,
+    issue,
+    catalog_url: str,
+    issue_url: str | None = None,
+    *,
+    smtp: dict | None = None,
 ) -> bool:
     smtp = smtp or config.get_smtp_config()
     if not smtp:
@@ -67,7 +76,7 @@ async def send_issue_notification(
     message["From"] = str(smtp["sender"])
     message["To"] = recipient
     message["Subject"] = issue_subject(issue)
-    message.set_content(issue_body(issue, catalog_url))
+    message.set_content(issue_body(issue, catalog_url, issue_url))
     # No HTML part: the text version is the whole message, and an HTML twin
     # would only add a place for a tracking pixel to be expected.
     try:

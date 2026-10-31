@@ -64,7 +64,9 @@ reprinted the whole feed every day; the test
 `test_compose_now_builds_a_downloadable_issue` covers the regression.
 
 **Email is notification-only.** No attachment, no Send-to-Kindle path, no 25 MB
-ceiling. The issue is pulled. This also means SMTP being down never costs a
+ceiling. It links to the issue's browser page (contents + EPUB download) first,
+then to the OPDS catalogue; the issue itself is pulled. The `issue.ready`
+webhook carries the same `issue_url` (and `issue.web_url`). This also means SMTP being down never costs a
 reader their issue.
 
 **Webhooks are SSRF-guarded.** The URL is user-supplied; the same address check

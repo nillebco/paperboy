@@ -134,6 +134,8 @@ async def deliver(
 
 
 def issue_payload(issue, catalog_url: str) -> dict:
+    base = catalog_url.rstrip("/")
+    issue_url = f"{base}/{issue.id}"
     return {
         "event": ISSUE_READY,
         "delivered_at": int(time.time()),
@@ -143,8 +145,10 @@ def issue_payload(issue, catalog_url: str) -> dict:
             "article_count": issue.article_count,
             "word_count": issue.word_count,
             "created_at": int(issue.created_at),
-            "download_url": f"{catalog_url.rstrip('/')}/{issue.id}.epub",
+            "download_url": f"{issue_url}.epub",
+            "web_url": issue_url,
         },
+        "issue_url": issue_url,
         "catalog_url": catalog_url,
     }
 

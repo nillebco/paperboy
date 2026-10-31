@@ -10,6 +10,7 @@ from the app key, because a browser is the only thing that submits them.
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import logging
@@ -70,10 +71,19 @@ OTP_MAX_ATTEMPTS = 5
 # would mean fetching third-party content on the user's behalf and caching it,
 # which is the EPUB builder's job, not the browser's. Links still cannot run
 # anything, and there is no script of our own on the page.
-READER_CSP = (
-    "default-src 'none'; img-src https: http: data:; style-src 'unsafe-inline'; "
-    "base-uri 'none'; form-action 'self'"
-)
+def _reader_csp() -> str:
+    """Reader pages allow exactly one script: the scroll restorer, by hash."""
+    digest = hashlib.sha256(pages.READER_SCROLL_JS.encode("utf-8")).digest()
+    script = base64.b64encode(digest).decode()
+    return (
+        "default-src 'none'; img-src https: http: data:; "
+        "style-src 'unsafe-inline'; "
+        f"script-src 'sha256-{script}'; "
+        "base-uri 'none'; form-action 'self'"
+    )
+
+
+READER_CSP = _reader_csp()
 
 
 # --------------------------------------------------------------- validation
@@ -555,6 +565,7 @@ async def reader_index(
     article: str | None = None,
     view: str = "all",
     source: str | None = None,
+    issue: str | None = None,
     notice: str | None = None,
 ):
     """The mailbox: everything the catalogue can show, with one article open.
@@ -596,18 +607,35 @@ async def reader_index(
             }
         )
 
+    # An issue view is a fixed edition, not the live stream: keep its order and
+    # show items even if the feed has rolled over since (the queue's consumed
+    # links are gone from the stream; the issue still remembers them).
+    issue_obj = store.get_issue(secret, issue) if issue else None
+    entries = store.issue_entries(secret, issue) if issue_obj else []
+    if issue_obj and entries:
+        by_id = {item["id"]: item for item in items}
+        items = [
+            by_id.get(entry.article_id)
+            or _issue_item(entry, ratings, queued, read)
+            for entry in entries
+        ]
+    else:
+        issue = None
+
     archived_rows = store.list_archived(secret, limit=MAX_READER_ITEMS)
     archived_urls = store.archived_urls(secret, [item["url"] for item in items if item["url"]])
     for item in items:
         item["archived"] = bool(item["url"]) and item["url"] in archived_urls
-    visible = [item for item in items if not item["archived"]]
+    visible = items if issue else [item for item in items if not item["archived"]]
     names = {_source_key(item) for item in visible} | {
         _archived_key(row) for row in archived_rows
     }
     # Bluesky is one source, not one per author: the whole point of following
     # people is reading them together.
-    sources = sorted(names, key=lambda name: (name != "Bluesky", name.casefold()))
-    source = source or None
+    sources = [] if issue else sorted(
+        names, key=lambda name: (name != "Bluesky", name.casefold())
+    )
+    source = None if issue else (source or None)
     if source:
         visible = [item for item in visible if _source_key(item) == source]
         archived_rows = [row for row in archived_rows if _archived_key(row) == source]
@@ -669,6 +697,8 @@ async def reader_index(
             view=view,
             sources=sources,
             source=source,
+            issue=issue,
+            issue_title=issue_obj.title if issue_obj else None,
             selected=selected,
             body=body,
             notice=notice,
@@ -676,6 +706,26 @@ async def reader_index(
         ),
         csp=READER_CSP,
     )
+
+
+def _issue_item(entry, ratings: dict[str, int], queued: dict, read: set[str]) -> dict:
+    url = entry.url or ""
+    saved = queued.get(url)
+    return {
+        "id": entry.article_id,
+        "title": entry.title,
+        "source": entry.section,
+        "signal_source": entry.section,
+        "url": url,
+        "kind": "issue",
+        "saved": saved is not None,
+        "saved_id": saved.id if saved else None,
+        "rating": ratings.get(url, 0),
+        "minutes": 0,
+        "read": entry.article_id in read,
+        "selected": False,
+        "archived": False,
+    }
 
 
 def _source_key(item: dict) -> str:
@@ -751,12 +801,15 @@ def _read_href(
     article: str | None = None,
     notice: str | None = None,
     source: str | None = None,
+    issue: str | None = None,
 ) -> str:
     target = f"/{secret}/read?view={quote(view)}"
     if article:
         target += f"&article={quote(article, safe='')}"
     if source:
         target += f"&source={quote(source)}"
+    if issue:
+        target += f"&issue={quote(issue)}"
     if notice:
         target += f"&notice={quote(notice)}"
     return target
@@ -775,7 +828,18 @@ async def _find_reader_item(
             "source": getattr(article, "signal_source", section),
             "kind": kind,
         }
-    return None
+    # An issue keeps items the live stream no longer lists (a consumed saved
+    # link, a feed that rolled over). The action buttons still work on them.
+    entry = _store(request).find_issue_item(secret, article_id)
+    if entry is None:
+        return None
+    return {
+        "id": entry.article_id,
+        "title": entry.title,
+        "url": entry.url or "",
+        "source": entry.section,
+        "kind": "issue",
+    }
 
 
 @router.get("/{secret}/read/open")
@@ -809,6 +873,7 @@ async def reader_feedback(
     value: str = Form("like"),
     view: str = Form("all"),
     source: str = Form(""),
+    issue: str = Form(""),
 ):
     """Like / not for me, keyed by URL so the curator can rank next morning."""
     _resolve(secret, request)
@@ -829,7 +894,7 @@ async def reader_feedback(
         )
     else:
         store.clear_signal(secret, item["url"])
-    return RedirectResponse(_read_href(secret, view, article_id, source=source or None), status_code=303)
+    return RedirectResponse(_read_href(secret, view, article_id, source=source or None, issue=issue or None), status_code=303)
 
 
 @router.post("/{secret}/read/queue")
@@ -840,6 +905,7 @@ async def reader_queue(
     article_id: str = Form(""),
     view: str = Form("all"),
     source: str = Form(""),
+    issue: str = Form(""),
 ):
     """Add any browsable item to the curated next issue."""
     _resolve(secret, request)
@@ -852,7 +918,7 @@ async def reader_queue(
         candidate = _store(request).get_candidate(secret, article_id.split(":", 1)[1])
         content = candidate.content if candidate else None
     _store(request).save_url(secret, item["url"], item["title"], content=content)
-    return RedirectResponse(_read_href(secret, view, article_id, source=source or None), status_code=303)
+    return RedirectResponse(_read_href(secret, view, article_id, source=source or None, issue=issue or None), status_code=303)
 
 
 @router.post("/{secret}/read/archive")
@@ -863,6 +929,7 @@ async def reader_archive(
     article_id: str = Form(""),
     view: str = Form("all"),
     source: str = Form(""),
+    issue: str = Form(""),
 ):
     """Discard an item: hide it from the reader, tell the curator, unqueue it."""
     _resolve(secret, request)
@@ -900,6 +967,7 @@ async def reader_archive(
             target,
             notice="Archived. It is under the Archived tab if you want it back.",
             source=source or None,
+            issue=issue or None,
         ),
         status_code=303,
     )
@@ -913,6 +981,7 @@ async def reader_restore(
     article_id: str = Form(""),
     view: str = Form("archived"),
     source: str = Form(""),
+    issue: str = Form(""),
 ):
     """Bring an archived item back and clear the not-interested mark."""
     _resolve(secret, request)
@@ -926,7 +995,11 @@ async def reader_restore(
     target = "all" if view == "archived" else view
     return RedirectResponse(
         _read_href(
-            secret, target, notice="Restored to the reader.", source=source or None
+            secret,
+            target,
+            notice="Restored to the reader.",
+            source=source or None,
+            issue=issue or None,
         ),
         status_code=303,
     )
@@ -940,6 +1013,7 @@ async def reader_unqueue(
     article_id: str = Form(""),
     view: str = Form("all"),
     source: str = Form(""),
+    issue: str = Form(""),
 ):
     _resolve(secret, request)
     _require_csrf(secret, csrf)
@@ -952,7 +1026,7 @@ async def reader_unqueue(
     )
     if queued is not None:
         store.delete_saved(secret, queued.id)
-    return RedirectResponse(_read_href(secret, view, article_id, source=source or None), status_code=303)
+    return RedirectResponse(_read_href(secret, view, article_id, source=source or None, issue=issue or None), status_code=303)
 
 
 @router.post("/{secret}/read/mark-all")
@@ -1014,12 +1088,13 @@ async def reader_mark_unread(
     csrf: str = Form(""),
     view: str = Form("all"),
     source: str = Form(""),
+    issue: str = Form(""),
 ):
     _resolve(secret, request)
     _require_csrf(secret, csrf)
     _store(request).mark_unread(secret, article_id)
     return RedirectResponse(
-        _read_href(secret, view, source=source or None), status_code=303
+        _read_href(secret, view, source=source or None, issue=issue or None), status_code=303
     )
 
 

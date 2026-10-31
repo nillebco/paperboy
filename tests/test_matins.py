@@ -378,11 +378,30 @@ def test_notification_is_a_link_not_an_attachment():
         article_count = 12
         word_count = 6000
 
+    issue_url = "https://matins.example/abcd/issues/20261030-ab"
     subject = notify.issue_subject(Issue())
-    body = notify.issue_body(Issue(), "https://matins.example/abcd/")
+    body = notify.issue_body(Issue(), "https://matins.example/abcd/", issue_url)
     assert "12" in subject
+    assert issue_url in body
     assert "https://matins.example/abcd/" in body
     assert "attached" in body
+
+
+def test_issue_payload_links_to_the_issue_and_its_epub():
+    class Issue:
+        id = "20261030-ab"
+        title = "Matins — Friday 30 October 2026"
+        article_count = 3
+        word_count = 600
+        created_at = 1793000000
+
+    payload = webhooks.issue_payload(Issue(), "https://matins.example/abcd/issues/")
+    assert payload["issue_url"] == "https://matins.example/abcd/issues/20261030-ab"
+    assert payload["issue"]["web_url"] == payload["issue_url"]
+    assert (
+        payload["issue"]["download_url"]
+        == "https://matins.example/abcd/issues/20261030-ab.epub"
+    )
 
 
 # ------------------------------------------------------------------ the app
@@ -893,7 +912,8 @@ def test_reader_lists_items_and_opening_one_marks_it_read(client):
     assert opened.status_code == 200
     assert "Body text of the first story" in opened.text
     assert "Saved for later" in opened.text
-    assert "script" not in opened.text.lower()
+    # The only script is our scroll restorer; the article itself adds none.
+    assert opened.text.count("<script>") == 1
     assert "First story" not in client.get(f"/{secret}/read?view=unread").text
     # A read row is visually distinct: the CSS hangs off this class.
     assert 'class="row read"' in client.get(f"/{secret}/read?view=all").text
@@ -1092,6 +1112,46 @@ def test_a_cookie_does_not_follow_a_cross_site_redirect(monkeypatch):
         ("auth.lemonde.fr", "secret"),
         ("evil.example.net", None),
     ]
+
+
+def test_reader_scroll_restorer_is_allowed_by_the_csp(client):
+    import base64
+    import hashlib
+
+    from later_ink.matins import pages as matins_pages
+
+    secret = _signup_without_readwise(client)
+    page = client.get(f"/{secret}/read")
+    digest = base64.b64encode(
+        hashlib.sha256(matins_pages.READER_SCROLL_JS.encode("utf-8")).digest()
+    ).decode()
+
+    assert f"<script>{matins_pages.READER_SCROLL_JS}</script>" in page.text
+    assert f"script-src 'sha256-{digest}'" in page.headers["content-security-policy"]
+
+
+def test_an_issue_can_be_browsed_in_the_reader(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    client.post(f"/{secret}/save", json={"url": "https://example.com/chosen"})
+    csrf = _csrf(client, secret)
+    client.post(
+        f"/{secret}/issues/build",
+        data={"csrf": csrf},
+        follow_redirects=False,
+    )
+    [issue] = client.app.state.matins.list_issues(secret)
+
+    detail = client.get(f"/{secret}/issues/{issue.id}")
+    assert "See in reader" in detail.text
+    assert f"/read?issue={issue.id}" in detail.text
+
+    reader = client.get(f"/{secret}/read", params={"issue": issue.id})
+    assert "Issue ·" in reader.text
+    # The saved link was consumed by the issue and is gone from the live queue,
+    # but the edition still remembers it.
+    assert "Chosen" in reader.text
+    assert "First story" in reader.text
 
 
 def test_reader_filters_by_source(client):
