@@ -1130,6 +1130,42 @@ def test_reader_scroll_restorer_is_allowed_by_the_csp(client):
     assert f"script-src 'sha256-{digest}'" in page.headers["content-security-policy"]
 
 
+def test_crosspoint_gets_relative_issue_acquisition_links(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    client.post(f"/{secret}/save", json={"url": "https://example.com/chosen"})
+    client.post(
+        f"/{secret}/issues/build",
+        data={"csrf": _csrf(client, secret)},
+        follow_redirects=False,
+    )
+    [issue] = client.app.state.matins.list_issues(secret)
+
+    crosspoint = client.get(
+        f"/{secret}/issues/",
+        headers={
+            "Accept": "application/atom+xml",
+            "User-Agent": "CrossPoint-ESP32-1.0.19",
+        },
+    )
+    hrefs = re.findall(
+        r'rel="http://opds-spec.org/acquisition" href="([^"]+)"',
+        crosspoint.text,
+    )
+    assert hrefs == [f"{issue.id}.epub"]
+
+    koreader = client.get(
+        f"/{secret}/issues/",
+        headers={"Accept": "application/atom+xml", "User-Agent": "KOReader/2024"},
+    )
+    absolute = re.findall(
+        r'rel="http://opds-spec.org/acquisition" href="([^"]+)"',
+        koreader.text,
+    )
+    assert absolute and absolute[0].startswith("http")
+    assert absolute[0].endswith(f"/issues/{issue.id}.epub")
+
+
 def test_an_issue_can_be_browsed_in_the_reader(client):
     secret = _signup_without_readwise(client)
     _add_feed(client, secret)

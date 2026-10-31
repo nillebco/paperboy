@@ -147,6 +147,7 @@ def article_feed(
     start_href: str,
     next_cursor: str | None = None,
     origin: str = "",
+    relative_acquisition: bool = False,
 ) -> bytes:
     feed = _make_feed(feed_id, title, self_href, start_href, ACQ_TYPE, origin=origin)
 
@@ -172,11 +173,16 @@ def article_feed(
             summary.set("type", "text")
             summary.text = article.summary[:500]
 
-        _add_link(
-            entry,
-            "http://opds-spec.org/acquisition",
-            _abs(origin, f"{epub_base}/{article.id}.epub"),
-            EPUB_TYPE,
+        # CrossPoint (and INX, which shares its OPDS client) concatenates an
+        # href onto the feed URL instead of resolving it as an IRI, so an
+        # absolute link becomes /issues/https://host/issues/x.epub. A bare
+        # filename resolves correctly there and is valid for every other
+        # client.
+        href = (
+            f"{article.id}.epub"
+            if relative_acquisition
+            else _abs(origin, f"{epub_base}/{article.id}.epub")
         )
+        _add_link(entry, "http://opds-spec.org/acquisition", href, EPUB_TYPE)
 
     return _serialize(feed)

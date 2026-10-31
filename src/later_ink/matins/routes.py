@@ -1775,6 +1775,12 @@ def _html(body: str, *, status: int = 200, csp: str | None = None) -> HTMLRespon
     return response
 
 
+def _relative_opds_client(request) -> bool:
+    """CrossPoint/INX concatenate hrefs and need bare relative links."""
+    ua = request.headers.get("user-agent", "").casefold()
+    return "crosspoint" in ua or "xteink" in ua or ua.startswith("inx")
+
+
 def _feed_response(request, secret, articles, *, title, feed_id, epub_base):
     return Response(
         opds.article_feed(
@@ -1785,6 +1791,7 @@ def _feed_response(request, secret, articles, *, title, feed_id, epub_base):
             epub_base=f"/{secret}/{epub_base}",
             start_href=f"/{secret}/",
             origin=_origin(request),
+            relative_acquisition=_relative_opds_client(request),
         ),
         media_type=opds.ACQ_TYPE,
     )
