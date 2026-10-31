@@ -1185,7 +1185,7 @@ def _reader_pane(
     like = _button(
         f"{base}/read/feedback",
         csrf,
-        "♥ Liked" if rating > 0 else "♥ Like",
+        "♥ Liked" if rating > 0 else "♡ Like",
         style="tiny on" if rating > 0 else "tiny",
         fields={
             "article_id": selected["id"],

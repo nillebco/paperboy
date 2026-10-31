@@ -912,6 +912,12 @@ def test_reader_like_and_next_issue_are_stateful(client):
     article_id = _reader_article_id(client, secret, "First story")
     csrf = _csrf(client, secret)
 
+    # Unliked: the pane shows the same empty heart as the list row.
+    pane = client.get(
+        f"/{secret}/read?view=all&article={quote(article_id, safe='')}"
+    )
+    assert "♡ Like" in pane.text
+
     liked = client.post(
         f"/{secret}/read/feedback",
         data={"csrf": csrf, "article_id": article_id, "value": "like", "view": "liked"},
@@ -919,6 +925,10 @@ def test_reader_like_and_next_issue_are_stateful(client):
     )
     assert liked.status_code == 303
     assert "First story" in client.get(f"/{secret}/read?view=liked").text
+    pane = client.get(
+        f"/{secret}/read?view=all&article={quote(article_id, safe='')}"
+    )
+    assert "♥ Liked" in pane.text
     signals = client.get("/api/v1/signals", headers=_api(secret)).json()["signals"]
     assert [(s["url"], s["rating"]) for s in signals] == [
         ("https://example.com/first", "interesting")
