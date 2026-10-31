@@ -5,6 +5,7 @@ import zipfile
 from datetime import UTC, datetime
 from urllib.parse import quote, unquote
 
+import httpx
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
@@ -948,7 +949,7 @@ def test_a_blocked_article_falls_back_to_the_feed_summary(client, monkeypatch):
     # The second item has no content:encoded, so the connector must try the page.
     article_id = _reader_article_id(client, secret, "Second story")
 
-    async def blocked(_self, _url):
+    async def blocked(_self, _url, *, cookie=None):
         return (
             "<html><body><p>A required part of this site couldn't load. "
             "Please check your connection, disable any ad blockers, or try "
@@ -977,6 +978,85 @@ def test_reading_time_is_hidden_when_only_a_summary_is_known(client):
     assert re.search(
         r'Second story</a>\s*<span class="row-sub">Example Feed</span>', page.text
     )
+
+
+def test_a_subscriber_cookie_is_encrypted_and_editable(client, tmp_path):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    feed_id = client.app.state.matins.list_feeds(secret)[0].id
+    csrf = _csrf(client, secret)
+
+    saved = client.post(
+        f"/{secret}/feeds/{feed_id}/auth",
+        data={"csrf": csrf, "cookie": "lm_session=abc123"},
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    assert client.app.state.matins.get_feed(secret, feed_id).auth_cookie == "lm_session=abc123"
+    assert b"lm_session=abc123" not in (tmp_path / "app.db").read_bytes()
+    assert "A cookie is set" in client.get(f"/{secret}/feeds/{feed_id}").text
+
+    client.post(
+        f"/{secret}/feeds/{feed_id}/auth",
+        data={"csrf": csrf, "cookie": "-"},
+        follow_redirects=False,
+    )
+    assert client.app.state.matins.get_feed(secret, feed_id).auth_cookie is None
+
+
+def test_the_feed_cookie_reaches_the_article_fetch(client, monkeypatch):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    feed_id = client.app.state.matins.list_feeds(secret)[0].id
+    client.app.state.matins.set_feed_auth(secret, feed_id, "lm_session=abc123")
+    article_id = _reader_article_id(client, secret, "Second story")
+
+    seen: list[str | None] = []
+
+    async def fake(_self, _url, *, cookie=None):
+        seen.append(cookie)
+        return None
+
+    monkeypatch.setattr("later_ink.matins.rss.RssConnector._fetch_page", fake)
+    client.get(f"/{secret}/read", params={"view": "all", "article": article_id})
+
+    assert seen == ["lm_session=abc123"]
+
+
+def test_a_cookie_does_not_follow_a_cross_site_redirect(monkeypatch):
+    from later_ink import fetch
+
+    async def noop(_url):
+        return None
+
+    monkeypatch.setattr(fetch, "_validate", noop)
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.host, request.headers.get("cookie")))
+        if request.url.host == "www.lemonde.fr":
+            return httpx.Response(302, headers={"location": "https://auth.lemonde.fr/x"})
+        if request.url.host == "auth.lemonde.fr":
+            return httpx.Response(302, headers={"location": "https://evil.example.net/x"})
+        return httpx.Response(200, content=b"ok", headers={"content-type": "text/html"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    result = asyncio.run(
+        fetch.fetch_bytes(
+            client,
+            "https://www.lemonde.fr/a",
+            timeout=1,
+            max_bytes=100,
+            headers={"Cookie": "secret"},
+        )
+    )
+
+    assert result is not None
+    assert seen == [
+        ("www.lemonde.fr", "secret"),
+        ("auth.lemonde.fr", "secret"),
+        ("evil.example.net", None),
+    ]
 
 
 def test_reader_filters_by_source(client):

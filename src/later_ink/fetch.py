@@ -37,6 +37,34 @@ logger = logging.getLogger(__name__)
 MAX_REDIRECTS = 2
 
 
+# A tiny suffix set, enough for the domains this app is pointed at. This is a
+# cookie-leak guard, not a browser security boundary.
+_SECOND_LEVEL = {
+    "co.uk",
+    "org.uk",
+    "ac.uk",
+    "gov.uk",
+    "com.au",
+    "co.nz",
+    "com.br",
+    "co.jp",
+}
+
+
+def _same_site(host: str, other: str) -> bool:
+    """True when two hosts belong to the same registrable site (subdomains ok)."""
+    return _site(host) == _site(other) and bool(host and other)
+
+
+def _site(host: str) -> str:
+    parts = host.lower().strip(".").split(".")
+    if len(parts) < 2:
+        return host.lower().strip(".")
+    if ".".join(parts[-2:]) in _SECOND_LEVEL and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
 def _unmap(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
     """Reduce an IPv4-mapped IPv6 address to its IPv4 form.
 
@@ -82,6 +110,7 @@ async def fetch_bytes(
     timeout: float,
     max_bytes: int,
     allowed_types: frozenset[str] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> tuple[bytes, str] | None:
     """Fetch `url`, returning (body, media_type), or None if it can't be used.
 
@@ -89,6 +118,7 @@ async def fetch_bytes(
     body — is a None. Callers treat a missing image as cosmetic, so there is
     nothing useful to distinguish.
     """
+    credential_host = (urlsplit(url).hostname or "") if headers else ""
     for _ in range(MAX_REDIRECTS + 1):
         try:
             await _validate(url)
@@ -97,8 +127,13 @@ async def fetch_bytes(
             return None
 
         try:
+            # A credential meant for one publisher must not follow a redirect
+            # to another site. Same registrable domain (including subdomains)
+            # is the most we can infer without a public-suffix list.
+            host = urlsplit(url).hostname or ""
+            send = headers if headers and _same_site(host, credential_host) else None
             async with client.stream(
-                "GET", url, timeout=timeout, follow_redirects=False
+                "GET", url, headers=send, timeout=timeout, follow_redirects=False
             ) as resp:
                 if resp.is_redirect:
                     location = resp.headers.get("location")

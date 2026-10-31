@@ -34,6 +34,9 @@ class Feed:
     last_error: str | None = None
     item_count: int | None = None
     last_item_at: float | None = None
+    # Subscriber session cookie for paywalled publishers (Le Monde). Encrypted
+    # at rest and never rendered back into a page.
+    auth_cookie: str | None = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,7 @@ class MatinsStore:
             _ensure_column(conn, "feeds", "last_error", "TEXT")
             _ensure_column(conn, "feeds", "item_count", "INTEGER")
             _ensure_column(conn, "feeds", "last_item_at", "REAL")
+            _ensure_column(conn, "feeds", "auth_cookie", "TEXT")
             # The queue a user fills with the share sheet or POST /{secret}/save.
             # consumed_by records which issue took the item, so a link is never
             # printed twice even across restarts.
@@ -412,7 +416,7 @@ class MatinsStore:
                 "SELECT * FROM feeds WHERE secret = ? ORDER BY added_at",
                 (secret,),
             ).fetchall()
-        return [_feed(r) for r in rows]
+        return [_feed(r, self._fernet) for r in rows]
 
     def get_feed(self, secret: str, fid: str) -> Feed | None:
         with self._conn() as conn:
@@ -420,7 +424,17 @@ class MatinsStore:
                 "SELECT * FROM feeds WHERE secret = ? AND id = ?",
                 (secret, fid),
             ).fetchone()
-        return _feed(row) if row else None
+        return _feed(row, self._fernet) if row else None
+
+    def set_feed_auth(self, secret: str, fid: str, cookie: str | None) -> bool:
+        """Store (or clear) the subscriber cookie used to fetch full articles."""
+        blob = self._fernet.encrypt(cookie.encode()).decode() if cookie else None
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE feeds SET auth_cookie = ? WHERE secret = ? AND id = ?",
+                (blob, secret, fid),
+            )
+        return cur.rowcount > 0
 
     def rename_feed(self, secret: str, fid: str, title: str) -> None:
         with self._conn() as conn:
@@ -1284,7 +1298,15 @@ def _candidate(row: sqlite3.Row) -> CandidateItem:
     )
 
 
-def _feed(row: sqlite3.Row) -> Feed:
+def _feed(row: sqlite3.Row, fernet: Fernet) -> Feed:
+    cookie: str | None = None
+    if row["auth_cookie"]:
+        try:
+            cookie = fernet.decrypt(row["auth_cookie"].encode()).decode()
+        except InvalidToken:
+            # A changed app key loses the cookie, like the webhook secret. The
+            # feed keeps working anonymously until it is re-entered.
+            cookie = None
     return Feed(
         id=row["id"],
         url=row["url"],
@@ -1294,6 +1316,7 @@ def _feed(row: sqlite3.Row) -> Feed:
         last_error=row["last_error"],
         item_count=row["item_count"],
         last_item_at=row["last_item_at"],
+        auth_cookie=cookie,
     )
 
 

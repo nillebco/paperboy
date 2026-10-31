@@ -414,7 +414,7 @@ class RssConnector(Connector):
         if item.content_html and extract.word_count(item.content_html) >= 150:
             return article, item.content_html
 
-        page = await self._fetch_page(item.link)
+        page = await self._fetch_page(item.link, cookie=feed.auth_cookie)
         # A wall (paywall interstitial, consent shell, JS challenge) is not an
         # article: keep the feed's own lede rather than printing the error.
         if page and not extract.looks_blocked(page):
@@ -494,13 +494,14 @@ class RssConnector(Connector):
             self._store.rename_feed(self._secret, feed.id, parsed.title[:120])
         return parsed
 
-    async def _fetch_page(self, url: str) -> str | None:
+    async def _fetch_page(self, url: str, *, cookie: str | None = None) -> str | None:
         async with httpx.AsyncClient() as client:
             result = await fetch_bytes(
                 client,
                 url,
                 timeout=config.get_feed_fetch_timeout(),
                 max_bytes=config.get_article_max_bytes(),
+                headers={"Cookie": cookie} if cookie else None,
             )
         if result is None:
             return None

@@ -446,6 +446,35 @@ async def pause_feed(
     )
 
 
+@router.post("/{secret}/feeds/{feed_id}/auth")
+async def feed_auth(
+    secret: str,
+    feed_id: str,
+    request: Request,
+    csrf: str = Form(""),
+    cookie: str = Form(""),
+):
+    """Store the subscriber cookie used to fetch this feed's article pages."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    value = cookie.strip()
+    if value == "-":
+        value = ""
+    if len(value.encode()) > 8192:
+        return _back(secret, to=f"feeds/{feed_id}", error="That cookie is too long.")
+    if "\n" in value or "\r" in value:
+        return _back(
+            secret, to=f"feeds/{feed_id}", error="Paste the Cookie header on one line."
+        )
+    if not _store(request).set_feed_auth(secret, feed_id, value or None):
+        raise HTTPException(404, "No such feed")
+    return _back(
+        secret,
+        to=f"feeds/{feed_id}",
+        notice="Subscriber cookie saved." if value else "Subscriber cookie removed.",
+    )
+
+
 @router.post("/{secret}/feeds/{feed_id}/delete")
 async def remove_feed(secret: str, feed_id: str, request: Request, csrf: str = Form("")):
     _resolve(secret, request)
@@ -1588,6 +1617,7 @@ def _feed_row(feed) -> dict:
         "fetched_at": feed.last_fetched_at,
         "item_count": feed.item_count,
         "last_item_at": feed.last_item_at,
+        "auth_cookie_set": bool(feed.auth_cookie),
     }
 
 

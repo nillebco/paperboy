@@ -646,6 +646,23 @@ at most {max_per_feed} per feed.</p>
     {_confirm("Unsubscribe", "Stop following this feed. Issues already composed keep their articles.", f"{action}/delete", csrf, "Yes, unsubscribe")}
   </div>
 </div>
+
+<h2>Subscriber access</h2>
+<div class="card">
+  <p class="hint">For paywalled publishers: paste the <code>Cookie</code> request header from a
+  logged-in browser tab. It is stored encrypted and never shown again; it is used only
+  when fetching this feed's article pages, and only on the same site after redirects.</p>
+  <form method="post" action="{action}/auth">
+    {_csrf(csrf)}
+    <label for="cookie">Cookie</label>
+    <input type="password" id="cookie" name="cookie" autocomplete="off"
+      placeholder="{escape('A cookie is set — paste a new one to replace it' if feed['auth_cookie_set'] else 'lm_session=...; other=...')}">
+    <div class="actions"><button class="btn" type="submit">Save cookie</button></div>
+  </form>
+  <div class="actions">
+    {_button(f"{action}/auth", csrf, "Remove", style="tiny", fields={"cookie": "-"}) if feed["auth_cookie_set"] else ""}
+  </div>
+</div>
 """
     return _shell(secret, "feeds", feed["title"], body, notice=notice, error=error)
 
