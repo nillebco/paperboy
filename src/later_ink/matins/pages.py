@@ -165,7 +165,14 @@ details.confirm[open] { display: block; flex-basis: 100%; }
   gap: 1.2rem; align-items: start; margin-top: .8rem; }
 .reader-list { max-height: calc(100vh - 10rem); overflow-y: auto; padding: .2rem .3rem; }
 .reader-list .row { padding: .5rem .45rem; border-radius: 8px; }
-.reader-list .row.selected { background: var(--soft); }
+.reader-list .row.selected { background: var(--soft); box-shadow: inset 3px 0 0 var(--fg); }
+/* Mailbox convention: unread is bold and bulleted, read recedes. */
+.reader-list .row:not(.read) .row-title { font-weight: 650; }
+.reader-list .row:not(.read) .row-title::before {
+  content: "\25CF"; font-size: .5em; vertical-align: .28em; margin-right: .45em;
+}
+.reader-list .row.read .row-main { opacity: .6; }
+.reader-list .row.read .row-title { font-weight: 400; }
 .row-actions { display: flex; gap: .3rem; margin-left: auto; flex-wrap: wrap; }
 .row-actions form { margin: 0; }
 .row-actions .btn { padding: .15rem .45rem; font-size: .78rem; line-height: 1.4; }

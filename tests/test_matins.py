@@ -881,6 +881,9 @@ def test_reader_lists_items_and_opening_one_marks_it_read(client):
     assert "Saved for later" in opened.text
     assert "script" not in opened.text.lower()
     assert "First story" not in client.get(f"/{secret}/read?view=unread").text
+    # A read row is visually distinct: the CSS hangs off this class.
+    assert 'class="row read"' in client.get(f"/{secret}/read?view=all").text
+    assert 'class="row read"' not in page.text
 
     client.post(
         f"/{secret}/read/{quote(article_id, safe=':-_')}/unread",
