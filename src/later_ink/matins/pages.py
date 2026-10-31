@@ -161,11 +161,12 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .article a { text-decoration: underline; }
 .tabs { display: flex; gap: 1rem; margin: .8rem 0 0; font-size: .92rem; flex-wrap: wrap; }
 .tabs a[aria-current] { font-weight: 700; text-decoration: none; }
-.source-filter { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
-  margin: .7rem 0 0; }
-.source-filter label { font-size: .85rem; color: var(--muted); }
-.source-filter select { font: inherit; padding: .4em .6em; border: 1px solid var(--line);
-  border-radius: 7px; background: var(--card); color: inherit; max-width: 22rem; }
+.source-filter { display: flex; align-items: baseline; gap: .35rem .9rem;
+  flex-wrap: wrap; margin: .55rem 0 0; font-size: .9rem; }
+.source-filter .label { font-size: .82rem; color: var(--muted); }
+.source-filter a { color: var(--muted); text-decoration: none; }
+.source-filter a:hover { color: var(--fg); }
+.source-filter a[aria-current] { color: var(--fg); font-weight: 650; }
 /* Both panes share the viewport and scroll independently: a mailbox, not a
    page with one box that happens to scroll. */
 .reader-split { display: grid; grid-template-columns: minmax(0, 26rem) minmax(0, 1fr);
@@ -1233,26 +1234,21 @@ def reader_page(
         + f">{label} ({counts.get(key, 0)})</a>"
         for key, label in _READER_VIEWS
     )
-    options = "".join(
-        f'<option value="{escape(name)}"{" selected" if name == source else ""}>'
-        f"{escape(name)}</option>"
+    all_link = (
+        f'<a href="{_reader_href(secret, view)}"'
+        + (' aria-current="page"' if not source else "")
+        + ">All</a>"
+    )
+    source_links = "".join(
+        f'<a href="{_reader_href(secret, view, source=name)}"'
+        + (' aria-current="page"' if name == source else "")
+        + f">{escape(name)}</a>"
         for name in sources
     )
-    clear = (
-        f'<a class="meta" href="{_reader_href(secret, view)}">Clear</a>'
-        if source
-        else ""
+    filter_form = (
+        f'<div class="source-filter"><span class="label">Source</span>'
+        f"{all_link}{source_links}</div>"
     )
-    filter_form = f"""<form class="source-filter" method="get" action="{base}/read">
-  <input type="hidden" name="view" value="{escape(view)}">
-  <label for="source-filter">Source</label>
-  <select id="source-filter" name="source">
-    <option value="">All sources</option>
-    {options}
-  </select>
-  <button class="btn tiny" type="submit">Filter</button>
-  {clear}
-</form>"""
     empty = (
         "Nothing from this source here."
         if source

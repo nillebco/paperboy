@@ -122,6 +122,9 @@ class ArchivedArticle:
     title: str
     source: str
     archived_at: float
+    # Original source kind ("candidate", "rss", "later"), so the source filter
+    # can still tell a discarded Bluesky post from a discarded feed article.
+    kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -337,6 +340,7 @@ class MatinsStore:
                 )
                 """
             )
+            _ensure_column(conn, "archived_articles", "kind", "TEXT")
             # Like / not for me. Keyed by URL, not by connector id: the curator
             # ranks next morning's feeds and has no catalogue ids to work with.
             conn.execute(
@@ -714,15 +718,17 @@ class MatinsStore:
         article_id: str | None = None,
         title: str = "",
         source: str = "",
+        kind: str | None = None,
     ) -> None:
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO archived_articles"
-                " (id, secret, url, article_id, title, source, archived_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " (id, secret, url, article_id, title, source, kind, archived_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT (secret, url) DO UPDATE SET"
                 " article_id = COALESCE(excluded.article_id, archived_articles.article_id),"
                 " title = excluded.title, source = excluded.source,"
+                " kind = COALESCE(excluded.kind, archived_articles.kind),"
                 " archived_at = excluded.archived_at",
                 (
                     _archive_id(url),
@@ -731,6 +737,7 @@ class MatinsStore:
                     article_id,
                     title,
                     source,
+                    kind,
                     time.time(),
                 ),
             )
@@ -1187,6 +1194,7 @@ def _archived(row: sqlite3.Row) -> ArchivedArticle:
         title=row["title"],
         source=row["source"],
         archived_at=row["archived_at"],
+        kind=row["kind"],
     )
 
 

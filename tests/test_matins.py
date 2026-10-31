@@ -949,16 +949,48 @@ def test_reader_filters_by_source(client):
         },
     )
 
-    bluesky = client.get(
-        f"/{secret}/read", params={"source": "Bluesky · @alice.example"}
-    )
+    bluesky = client.get(f"/{secret}/read", params={"source": "Bluesky"})
     assert "A Bluesky post" in bluesky.text
     assert "First story" not in bluesky.text
-    assert 'name="source"' in bluesky.text
+    assert 'class="source-filter"' in bluesky.text
+    # Authors are not separate filter entries; Bluesky is one source.
+    assert bluesky.text.count(">Bluesky</a>") == 1
+    assert "@alice.example</a>" not in bluesky.text
 
     feed = client.get(f"/{secret}/read", params={"source": "Example Feed"})
     assert "First story" in feed.text
     assert "A Bluesky post" not in feed.text
+
+
+def test_archived_bluesky_posts_stay_under_the_bluesky_source(client):
+    secret = _signup_without_readwise(client)
+    client.post(
+        "/api/v1/candidates",
+        headers=_api(secret),
+        json={
+            "items": [
+                {
+                    "id": "b1",
+                    "url": "https://bsky.app/profile/alice.example/post/3k1",
+                    "title": "A Bluesky post",
+                    "source": "@alice.example",
+                    "content": "<p>Post body</p>",
+                }
+            ]
+        },
+    )
+    csrf = _csrf(client, secret)
+    client.post(
+        f"/{secret}/read/archive",
+        data={"csrf": csrf, "article_id": "cand:b1", "view": "all"},
+        follow_redirects=False,
+    )
+
+    archived = client.get(
+        f"/{secret}/read", params={"view": "archived", "source": "Bluesky"}
+    )
+    assert "A Bluesky post" in archived.text
+    assert "Bluesky · @alice.example" in archived.text
 
 
 def test_reader_archive_hides_signals_unqueues_and_restores(client):

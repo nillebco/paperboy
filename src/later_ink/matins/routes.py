@@ -565,14 +565,16 @@ async def reader_index(
     for item in items:
         item["archived"] = bool(item["url"]) and item["url"] in archived_urls
     visible = [item for item in items if not item["archived"]]
-    sources = sorted(
-        {item["source"] for item in visible}
-        | {row.source for row in archived_rows if row.source}
-    )
+    names = {_source_key(item) for item in visible} | {
+        _archived_key(row) for row in archived_rows
+    }
+    # Bluesky is one source, not one per author: the whole point of following
+    # people is reading them together.
+    sources = sorted(names, key=lambda name: (name != "Bluesky", name.casefold()))
     source = source or None
     if source:
-        visible = [item for item in visible if item["source"] == source]
-        archived_rows = [row for row in archived_rows if row.source == source]
+        visible = [item for item in visible if _source_key(item) == source]
+        archived_rows = [row for row in archived_rows if _archived_key(row) == source]
 
     counts = {
         "all": len(visible),
@@ -628,11 +630,22 @@ async def reader_index(
     )
 
 
+def _source_key(item: dict) -> str:
+    return "Bluesky" if item.get("kind") == "candidate" else item["source"]
+
+
+def _archived_key(row) -> str:
+    return "Bluesky" if row.kind == "candidate" else (row.source or "Archived")
+
+
 def _archived_item(row) -> dict:
+    display_source = row.source or "Archived"
+    if row.kind == "candidate" and row.source:
+        display_source = f"Bluesky · {row.source}"
     return {
         "id": row.id,
         "title": row.title or row.url,
-        "source": row.source or "Archived",
+        "source": display_source,
         "url": row.url,
         "kind": "archived",
         "saved": False,
@@ -786,6 +799,7 @@ async def reader_archive(
         article_id=item["id"],
         title=item["title"],
         source=item["source"],
+        kind=item["kind"],
     )
     store.set_signal(
         secret,
