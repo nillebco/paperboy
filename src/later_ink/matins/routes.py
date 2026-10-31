@@ -25,7 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from .. import config as app_config
 from .. import opds
 from ..connectors.base import Article, ArticleUnavailable, UpstreamError
-from . import catalogues, config, notify, pages, rss, webhooks
+from . import catalogues, config, extract, notify, pages, rss, webhooks
 from .issues import IssueLimits, IssueService, limits_for, local_day, next_run
 from .reader import to_page_html
 
@@ -555,7 +555,11 @@ async def reader_index(
                 "saved": saved is not None,
                 "saved_id": saved.id if saved else None,
                 "rating": ratings.get(url, 0),
-                "minutes": max(1, round((getattr(source_article, "word_count", None) or 400) / 250)),
+                # A feed summary's length says nothing about the article. Until
+                # the body is fetched, only a credible count gets an estimate.
+                "minutes": _reading_minutes(
+                    getattr(source_article, "word_count", None) or 0
+                ),
                 "read": item_id in read,
                 "selected": False,
             }
@@ -605,6 +609,8 @@ async def reader_index(
         if body is None and error is None:
             error = "Could not render that article."
         if body is not None:
+            if words := extract.word_count(body):
+                selected["minutes"] = _reading_minutes(words)
             store.mark_read(secret, selected["id"])
             selected["read"] = True
             if selected["url"]:
@@ -667,6 +673,14 @@ def _archived_item(row) -> dict:
         "selected": False,
         "archived": True,
     }
+
+
+def _reading_minutes(words: int) -> int:
+    """Minutes at 250 wpm, or 0 when the count is too small to be the article.
+
+    A 40-word RSS summary is not a 1-minute article; showing "1 minute" on every
+    row was a lie the feed made easy."""
+    return max(1, round(words / 250)) if words >= MIN_KNOWN_WORDS else 0
 
 
 def _filter_reader(items: list[dict], view: str) -> list[dict]:
@@ -955,7 +969,7 @@ async def reader_article(secret: str, article_id: str, request: Request):
             author=article.author,
             source_url=article.url,
             body=body,
-            minutes=max(1, round((article.word_count or 400) / 250)),
+            minutes=_reading_minutes(extract.word_count(body)),
         ),
         csp=READER_CSP,
     )

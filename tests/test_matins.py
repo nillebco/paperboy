@@ -963,6 +963,22 @@ def test_a_blocked_article_falls_back_to_the_feed_summary(client, monkeypatch):
     assert "required part of this site" not in page.text
 
 
+def test_reading_time_is_hidden_when_only_a_summary_is_known(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+
+    page = client.get(f"/{secret}/read")
+
+    # First story ships content:encoded; Second story only a two-word summary.
+    assert re.search(
+        r'First story</a>\s*<span class="row-sub">Example Feed · \d+ minute',
+        page.text,
+    )
+    assert re.search(
+        r'Second story</a>\s*<span class="row-sub">Example Feed</span>', page.text
+    )
+
+
 def test_reader_filters_by_source(client):
     secret = _signup_without_readwise(client)
     _add_feed(client, secret)

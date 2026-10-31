@@ -1130,10 +1130,11 @@ def _reader_row(
     )
     selected = " selected" if item.get("selected") else ""
     read = " read" if item["read"] else ""
+    timing = f" · {_minutes(item['minutes'] * 250)}" if item["minutes"] else ""
     return f"""<div class="row{selected}{read}">
   <div class="row-main">
     <a class="row-title" href="{_reader_href(secret, view, item["id"], source)}">{escape(item["title"])}</a>
-    <span class="row-sub">{escape(item["source"])} · {_minutes(item["minutes"] * 250)}</span>
+    <span class="row-sub">{escape(item["source"])}{timing}</span>
   </div>
   <div class="row-actions">{like}{queue}{archive}</div>
 </div>"""
@@ -1202,9 +1203,10 @@ def _reader_pane(
         style="tiny",
         fields={"view": view, "source": source or ""},
     )
+    timing = f" · {_minutes(selected['minutes'] * 250)}" if selected["minutes"] else ""
     return f"""<div class="card reader-pane">
 <h1>{escape(selected["title"])}</h1>
-<p class="meta" style="margin-top:-.4rem">{escape(selected["source"])} · {_minutes(selected["minutes"] * 250)}</p>
+<p class="meta" style="margin-top:-.4rem">{escape(selected["source"])}{timing}</p>
 <div class="article-toolbar">{like}{dislike}{queue}{archive}{unread}{original}</div>
 <div class="article">{body}</div>
 </div>"""
@@ -1305,9 +1307,16 @@ def reader_article_page(
 ) -> str:
     """One article, rendered inside the app instead of on the publisher's page."""
     base = f"/{escape(secret)}"
-    meta = [f"about {minutes} minute" + ("" if minutes == 1 else "s")]
+    meta = []
+    if minutes:
+        meta.append(f"about {minutes} minute" + ("" if minutes == 1 else "s"))
     if author:
         meta.insert(0, escape(author))
+    meta_line = (
+        f'<p class="meta" style="margin-bottom:1.4rem">{" · ".join(meta)}</p>'
+        if meta
+        else ""
+    )
     original = (
         f'<a class="btn tiny" href="{base}/read/open?article='
         f'{quote(article_id, safe="")}" target="_blank" '
@@ -1331,7 +1340,7 @@ def reader_article_page(
         f"""
 <p class="meta"><a href="{base}/read">&larr; Back to the reader</a></p>
 <h1>{escape(title)}</h1>
-<p class="meta" style="margin-bottom:1.4rem">{" · ".join(meta)}</p>
+{meta_line}
 <div class="article">{body}</div>
 <div class="actions">
   {original}
