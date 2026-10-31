@@ -555,16 +555,29 @@ async def reader_index(
             }
         )
 
+    archived_urls = store.archived_urls(secret, [item["url"] for item in items if item["url"]])
+    for item in items:
+        item["archived"] = bool(item["url"]) and item["url"] in archived_urls
+    visible = [item for item in items if not item["archived"]]
+    archived_count = len(store.list_archived(secret, limit=1000))
     counts = {
-        "all": len(items),
-        "unread": sum(1 for item in items if not item["read"]),
-        "liked": sum(1 for item in items if item["rating"] > 0),
-        "queued": sum(1 for item in items if item["saved"]),
+        "all": len(visible),
+        "unread": sum(1 for item in visible if not item["read"]),
+        "liked": sum(1 for item in visible if item["rating"] > 0),
+        "queued": sum(1 for item in visible if item["saved"]),
+        "archived": archived_count,
     }
     view = view if view in counts else "all"
-    shown = _filter_reader(items, view)
+    if view == "archived":
+        shown = [_archived_item(row) for row in store.list_archived(secret, limit=MAX_READER_ITEMS)]
+    else:
+        shown = _filter_reader(visible, view)
 
-    selected = next((item for item in items if item["id"] == article), None)
+    selected = (
+        next((item for item in visible if item["id"] == article), None)
+        if view != "archived"
+        else None
+    )
     body: str | None = None
     error: str | None = None
     if selected is not None:
@@ -596,6 +609,23 @@ async def reader_index(
         ),
         csp=READER_CSP,
     )
+
+
+def _archived_item(row) -> dict:
+    return {
+        "id": row.id,
+        "title": row.title or row.url,
+        "source": row.source or "Archived",
+        "url": row.url,
+        "kind": "archived",
+        "saved": False,
+        "saved_id": None,
+        "rating": 0,
+        "minutes": 1,
+        "read": True,
+        "selected": False,
+        "archived": True,
+    }
 
 
 def _filter_reader(items: list[dict], view: str) -> list[dict]:
@@ -703,6 +733,67 @@ async def reader_queue(
         content = candidate.content if candidate else None
     _store(request).save_url(secret, item["url"], item["title"], content=content)
     return RedirectResponse(_read_href(secret, view, article_id), status_code=303)
+
+
+@router.post("/{secret}/read/archive")
+async def reader_archive(
+    secret: str,
+    request: Request,
+    csrf: str = Form(""),
+    article_id: str = Form(""),
+    view: str = Form("all"),
+):
+    """Discard an item: hide it from the reader, tell the curator, unqueue it."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    item = await _find_reader_item(request, secret, article_id)
+    if item is None or not item["url"]:
+        raise HTTPException(404, "No such article")
+    store = _store(request)
+    store.archive_article(
+        secret,
+        item["url"],
+        article_id=item["id"],
+        title=item["title"],
+        source=item["source"],
+    )
+    store.set_signal(
+        secret,
+        item["url"],
+        -1,
+        article_id=item["id"],
+        title=item["title"],
+        source=item["source"],
+    )
+    queued = next(
+        (saved for saved in store.list_saved(secret) if saved.url == item["url"]), None
+    )
+    if queued is not None:
+        store.delete_saved(secret, queued.id)
+    # Do not select it: the row just left this view.
+    target = "all" if view == "archived" else view
+    return RedirectResponse(_read_href(secret, target), status_code=303)
+
+
+@router.post("/{secret}/read/restore")
+async def reader_restore(
+    secret: str,
+    request: Request,
+    csrf: str = Form(""),
+    article_id: str = Form(""),
+    view: str = Form("archived"),
+):
+    """Bring an archived item back and clear the not-interested mark."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    store = _store(request)
+    archived = store.get_archived(secret, article_id)
+    if archived is None:
+        raise HTTPException(404, "No such archived article")
+    store.unarchive_article(secret, archived.url)
+    store.clear_signal(secret, archived.url)
+    target = "all" if view == "archived" else view
+    return RedirectResponse(_read_href(secret, target), status_code=303)
 
 
 @router.post("/{secret}/read/unqueue")

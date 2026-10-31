@@ -929,6 +929,45 @@ def test_reader_like_and_next_issue_are_stateful(client):
     assert "First story" not in client.get(f"/{secret}/read?view=queued").text
 
 
+def test_reader_archive_hides_signals_unqueues_and_restores(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    article_id = _reader_article_id(client, secret, "First story")
+    csrf = _csrf(client, secret)
+
+    client.post(
+        f"/{secret}/read/queue",
+        data={"csrf": csrf, "article_id": article_id, "view": "all"},
+        follow_redirects=False,
+    )
+    assert client.app.state.matins.list_saved(secret)
+
+    archived = client.post(
+        f"/{secret}/read/archive",
+        data={"csrf": csrf, "article_id": article_id, "view": "all"},
+        follow_redirects=False,
+    )
+    assert archived.status_code == 303
+    assert "First story" not in client.get(f"/{secret}/read?view=all").text
+    assert "First story" in client.get(f"/{secret}/read?view=archived").text
+    assert client.app.state.matins.list_saved(secret) == []
+    signals = client.get("/api/v1/signals", headers=_api(secret)).json()["signals"]
+    assert [(s["url"], s["rating"]) for s in signals] == [
+        ("https://example.com/first", "not_interested")
+    ]
+
+    [row] = client.app.state.matins.list_archived(secret)
+    restored = client.post(
+        f"/{secret}/read/restore",
+        data={"csrf": csrf, "article_id": row.id, "view": "archived"},
+        follow_redirects=False,
+    )
+    assert restored.status_code == 303
+    assert "First story" in client.get(f"/{secret}/read?view=all").text
+    assert "First story" not in client.get(f"/{secret}/read?view=archived").text
+    assert client.get("/api/v1/signals", headers=_api(secret)).json()["signals"] == []
+
+
 def test_a_curated_catalogue_prints_only_the_queue(client):
     secret = _signup_without_readwise(client)
     _add_feed(client, secret)

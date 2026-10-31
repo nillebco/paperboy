@@ -113,6 +113,18 @@ class CandidateItem:
 
 
 @dataclass(frozen=True)
+class ArchivedArticle:
+    """A discarded item. Kept by URL so a later fetch does not resurrect it."""
+
+    id: str
+    url: str
+    article_id: str | None
+    title: str
+    source: str
+    archived_at: float
+
+
+@dataclass(frozen=True)
 class ArticleSignal:
     """One like/dislike, keyed by URL so an external curator can use it too."""
 
@@ -307,6 +319,23 @@ class MatinsStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS candidates_by_user"
                 " ON candidates (secret, added_at)"
+            )
+            # Discarded from the reader. A separate table from signals because
+            # "do not show me this" is not the same statement as "not for me" —
+            # though archiving also records the latter for the curator.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS archived_articles (
+                    id TEXT NOT NULL,
+                    secret TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    article_id TEXT,
+                    title TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    archived_at REAL NOT NULL,
+                    PRIMARY KEY (secret, url)
+                )
+                """
             )
             # Like / not for me. Keyed by URL, not by connector id: the curator
             # ranks next morning's feeds and has no catalogue ids to work with.
@@ -675,6 +704,76 @@ class MatinsStore:
             ).fetchone()
         return _candidate(row) if row else None
 
+    # ---------------------------------------------------------- archived
+
+    def archive_article(
+        self,
+        secret: str,
+        url: str,
+        *,
+        article_id: str | None = None,
+        title: str = "",
+        source: str = "",
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO archived_articles"
+                " (id, secret, url, article_id, title, source, archived_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (secret, url) DO UPDATE SET"
+                " article_id = COALESCE(excluded.article_id, archived_articles.article_id),"
+                " title = excluded.title, source = excluded.source,"
+                " archived_at = excluded.archived_at",
+                (
+                    _archive_id(url),
+                    secret,
+                    url,
+                    article_id,
+                    title,
+                    source,
+                    time.time(),
+                ),
+            )
+
+    def unarchive_article(self, secret: str, url: str) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM archived_articles WHERE secret = ? AND url = ?",
+                (secret, url),
+            )
+        return cur.rowcount > 0
+
+    def get_archived(self, secret: str, archive_id: str) -> ArchivedArticle | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM archived_articles WHERE secret = ? AND id = ?",
+                (secret, archive_id),
+            ).fetchone()
+        return _archived(row) if row else None
+
+    def list_archived(self, secret: str, limit: int = 400) -> list[ArchivedArticle]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM archived_articles WHERE secret = ?"
+                " ORDER BY archived_at DESC LIMIT ?",
+                (secret, max(1, min(limit, 1000))),
+            ).fetchall()
+        return [_archived(row) for row in rows]
+
+    def archived_urls(self, secret: str, urls: list[str]) -> set[str]:
+        found: set[str] = set()
+        for i in range(0, len(urls), 500):
+            chunk = urls[i : i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            with self._conn() as conn:
+                rows = conn.execute(
+                    f"SELECT url FROM archived_articles WHERE secret = ?"
+                    f" AND url IN ({placeholders})",
+                    (secret, *chunk),
+                ).fetchall()
+            found.update(r["url"] for r in rows)
+        return found
+
     # ----------------------------------------------------------- signals
 
     def set_signal(
@@ -875,6 +974,7 @@ class MatinsStore:
             conn.execute("DELETE FROM issue_skips WHERE secret = ?", (secret,))
             conn.execute("DELETE FROM candidates WHERE secret = ?", (secret,))
             conn.execute("DELETE FROM article_signals WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM archived_articles WHERE secret = ?", (secret,))
 
     def rename_secret(self, old: str, new: str) -> None:
         """Move everything to a new secret when the catalogue URL is rotated.
@@ -1071,7 +1171,23 @@ _SECRET_TABLES = (
     "issue_skips",
     "candidates",
     "article_signals",
+    "archived_articles",
 )
+
+
+def _archive_id(url: str) -> str:
+    return "arch:" + hashlib.sha1(url.encode()).hexdigest()[:16]
+
+
+def _archived(row: sqlite3.Row) -> ArchivedArticle:
+    return ArchivedArticle(
+        id=row["id"],
+        url=row["url"],
+        article_id=row["article_id"],
+        title=row["title"],
+        source=row["source"],
+        archived_at=row["archived_at"],
+    )
 
 
 def _candidate(row: sqlite3.Row) -> CandidateItem:

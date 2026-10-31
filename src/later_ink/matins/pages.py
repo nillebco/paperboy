@@ -161,9 +161,16 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .article a { text-decoration: underline; }
 .tabs { display: flex; gap: 1rem; margin: .8rem 0 0; font-size: .92rem; flex-wrap: wrap; }
 .tabs a[aria-current] { font-weight: 700; text-decoration: none; }
+/* Both panes share the viewport and scroll independently: a mailbox, not a
+   page with one box that happens to scroll. */
 .reader-split { display: grid; grid-template-columns: minmax(0, 26rem) minmax(0, 1fr);
   gap: 1.2rem; align-items: start; margin-top: .8rem; }
-.reader-list { max-height: calc(100vh - 10rem); overflow-y: auto; padding: .2rem .3rem; }
+.reader-list, .reader-pane-col {
+  max-height: calc(100vh - 15rem); max-height: calc(100dvh - 15rem);
+  overflow-y: auto; overscroll-behavior: contain;
+}
+.reader-list { padding: .2rem .3rem; }
+.reader-pane-col { padding-right: .2rem; }
 .reader-list .row { padding: .5rem .45rem; border-radius: 8px; }
 .reader-list .row.selected { background: var(--soft); box-shadow: inset 3px 0 0 var(--fg); }
 /* Mailbox convention: unread is bold and bulleted, read recedes. */
@@ -173,6 +180,8 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 }
 .reader-list .row.read .row-main { opacity: .6; }
 .reader-list .row.read .row-title { font-weight: 400; }
+.reader-list .row.archived .row-main { opacity: .55; }
+.reader-list .row.archived .row-title { font-weight: 400; }
 .row-actions { display: flex; gap: .3rem; margin-left: auto; flex-wrap: wrap; }
 .row-actions form { margin: 0; }
 .row-actions .btn { padding: .15rem .45rem; font-size: .78rem; line-height: 1.4; }
@@ -183,7 +192,7 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .reader-pane .article { max-width: 42rem; }
 @media (max-width: 820px) {
   .reader-split { grid-template-columns: 1fr; }
-  .reader-list { max-height: none; }
+  .reader-list, .reader-pane-col { max-height: none; overflow: visible; }
 }
 """
 
@@ -1051,6 +1060,7 @@ _READER_VIEWS = (
     ("unread", "Unread"),
     ("liked", "Liked"),
     ("queued", "Next issue"),
+    ("archived", "Archived"),
 )
 
 
@@ -1062,7 +1072,22 @@ def _reader_href(secret: str, view: str, article: str | None = None) -> str:
 
 
 def _reader_row(secret: str, csrf: str, item: dict, view: str) -> str:
-    """One list row: open it, like it, put it in (or take it out of) the issue."""
+    """One list row: open it, like it, queue it, or discard it."""
+    if item.get("archived"):
+        restore = _button(
+            f"/{escape(secret)}/read/restore",
+            csrf,
+            "Restore",
+            style="tiny",
+            fields={"article_id": item["id"], "view": "archived"},
+        )
+        return f"""<div class="row archived">
+  <div class="row-main">
+    <span class="row-title">{escape(item["title"])}</span>
+    <span class="row-sub">{escape(item["source"])} · archived</span>
+  </div>
+  <div class="row-actions">{restore}</div>
+</div>"""
     liked = item["rating"] > 0
     queued = item["saved"]
     like = _button(
@@ -1083,6 +1108,13 @@ def _reader_row(secret: str, csrf: str, item: dict, view: str) -> str:
         style="tiny on" if queued else "tiny",
         fields={"article_id": item["id"], "view": view},
     )
+    archive = _button(
+        f"/{escape(secret)}/read/archive",
+        csrf,
+        "Archive",
+        style="tiny",
+        fields={"article_id": item["id"], "view": view},
+    )
     selected = " selected" if item.get("selected") else ""
     read = " read" if item["read"] else ""
     return f"""<div class="row{selected}{read}">
@@ -1090,7 +1122,7 @@ def _reader_row(secret: str, csrf: str, item: dict, view: str) -> str:
     <a class="row-title" href="{_reader_href(secret, view, item["id"])}">{escape(item["title"])}</a>
     <span class="row-sub">{escape(item["source"])} · {_minutes(item["minutes"] * 250)}</span>
   </div>
-  <div class="row-actions">{like}{queue}</div>
+  <div class="row-actions">{like}{queue}{archive}</div>
 </div>"""
 
 
@@ -1130,6 +1162,13 @@ def _reader_pane(
             "view": view,
         },
     )
+    archive = _button(
+        f"{base}/read/archive",
+        csrf,
+        "Archive",
+        style="tiny",
+        fields={"article_id": selected["id"], "view": view},
+    )
     unread = _button(
         f"{base}/read/{quote(selected['id'], safe=':-_')}/unread",
         csrf,
@@ -1140,7 +1179,7 @@ def _reader_pane(
     return f"""<div class="card reader-pane">
 <h1>{escape(selected["title"])}</h1>
 <p class="meta" style="margin-top:-.4rem">{escape(selected["source"])} · {_minutes(selected["minutes"] * 250)}</p>
-<div class="article-toolbar">{like}{dislike}{queue}{unread}{original}</div>
+<div class="article-toolbar">{like}{dislike}{queue}{archive}{unread}{original}</div>
 <div class="article">{body}</div>
 </div>"""
 
@@ -1182,14 +1221,14 @@ def reader_page(
 <div class="page-head">
   <h1>Reader</h1>
   <p class="meta count" style="margin:.5rem 0 0">{counts.get("unread", 0)} unread ·
-  {counts.get("queued", 0)} in the next issue</p>
+  {counts.get("queued", 0)} in the next issue · {counts.get("archived", 0)} archived</p>
 </div>
 <p class="lede" style="margin-bottom:0">Everything your sources publish. Like what
 is interesting; add what you want to read next.</p>
 <div class="tabs">{tabs}</div>
 <div class="reader-split">
   <div class="card reader-list">{rows}</div>
-  <div>{pane}</div>
+  <div class="reader-pane-col">{pane}</div>
 </div>
 """
     return _shell(secret, "read", "Reader", body_html, error=error, wide=True)
