@@ -9,6 +9,7 @@ returns article bodies. An agent's job is to put things in and ask what is
 waiting — reading happens on the device, which is the product.
 """
 
+import hashlib
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
@@ -95,6 +96,115 @@ async def delete_feed(feed_id: str, request: Request):
     if not _store(request).delete_feed(secret, feed_id):
         raise HTTPException(404, "No such feed")
     return None
+
+
+# ---------------------------------------------------------------- candidates
+
+
+@router.post("/candidates", status_code=201)
+async def add_candidates(request: Request):
+    """Offer items the reader should show but the composer must not print.
+
+    Bluesky is the first user: a post cannot be fetched by URL, so the curator
+    sends its text. The item becomes printable only when queued (with that text).
+    """
+    secret = _secret(request)
+    body = await _json(request)
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise HTTPException(400, "items must be a non-empty list")
+    if len(raw_items) > 200:
+        raise HTTPException(400, "at most 200 candidates per request")
+
+    cleaned = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise HTTPException(400, "every candidate must be an object")
+        url = _url(raw.get("url"))
+        content = raw.get("content")
+        if content is not None and not isinstance(content, str):
+            raise HTTPException(400, "content must be a string")
+        if content is not None and len(content.encode()) > MAX_CONTENT_BYTES:
+            raise HTTPException(413, f"content is limited to {MAX_CONTENT_BYTES} bytes")
+        published = raw.get("published")
+        if not isinstance(published, (int, float)) or isinstance(published, bool):
+            published = None
+        cleaned.append(
+            {
+                "id": str(raw.get("id") or "").strip()
+                or hashlib.sha1(url.encode()).hexdigest()[:16],
+                "url": url,
+                "title": str(raw.get("title") or "")[:300],
+                "source": str(raw.get("source") or "")[:120],
+                "summary": str(raw.get("summary") or "")[:600],
+                "content": content,
+                "published": float(published) if published is not None else None,
+            }
+        )
+    added = _store(request).upsert_candidates(secret, cleaned)
+    return {"added": added}
+
+
+@router.get("/candidates")
+async def list_candidates(request: Request, limit: int = 100):
+    secret = _secret(request)
+    return {
+        "candidates": [
+            {
+                "id": item.id,
+                "url": item.url,
+                "title": item.title,
+                "source": item.source,
+                "published": item.published,
+            }
+            for item in _store(request).list_candidates(
+                secret, limit=max(1, min(limit, 500))
+            )
+        ]
+    }
+
+
+# ------------------------------------------------------------------- signals
+
+
+@router.get("/signals")
+async def list_signals(request: Request, limit: int = 500):
+    """What the reader liked and disliked. The curator ranks next morning with it."""
+    secret = _secret(request)
+    return {
+        "signals": [
+            {
+                "url": signal.url,
+                "title": signal.title,
+                "source": signal.source,
+                "rating": "interesting" if signal.rating > 0 else "not_interested",
+                "updated_at": int(signal.updated_at),
+            }
+            for signal in _store(request).list_signals(
+                secret, limit=max(1, min(limit, 2000))
+            )
+        ]
+    }
+
+
+@router.post("/signals", status_code=201)
+async def set_signal(request: Request):
+    secret = _secret(request)
+    body = await _json(request)
+    url = _url(body.get("url"))
+    rating = _rating(body.get("rating"))
+    store = _store(request)
+    if rating == 0:
+        store.clear_signal(secret, url)
+    else:
+        store.set_signal(
+            secret,
+            url,
+            rating,
+            title=str(body.get("title") or "")[:300],
+            source=str(body.get("source") or "")[:120],
+        )
+    return {"url": url, "rating": _rating_name(rating)}
 
 
 # -------------------------------------------------------------------- items
@@ -257,6 +367,27 @@ def _only(value: str | None) -> str | None:
     if value != "queue":
         raise HTTPException(400, "only must be 'queue' when given")
     return value
+
+
+def _rating(value) -> int:
+    if isinstance(value, bool):
+        return 1 if value else -1
+    if isinstance(value, (int, float)):
+        return 1 if value > 0 else -1 if value < 0 else 0
+    text = str(value or "").strip().casefold()
+    if text in ("interesting", "like", "liked", "up", "yes", "more"):
+        return 1
+    if text in ("not_interested", "not-interested", "dislike", "down", "no", "less"):
+        return -1
+    return 0
+
+
+def _rating_name(rating: int) -> str:
+    if rating > 0:
+        return "interesting"
+    if rating < 0:
+        return "not_interested"
+    return "none"
 
 
 async def _json(request: Request) -> dict:

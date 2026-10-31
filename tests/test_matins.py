@@ -3,6 +3,7 @@ import io
 import re
 import zipfile
 from datetime import UTC, datetime
+from urllib.parse import quote, unquote
 
 import pytest
 from cryptography.fernet import Fernet
@@ -382,6 +383,9 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("ALLOW_FREE_SIGNUP", "1")
     monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("MATINS_SCHEDULER", "0")
+    # The fixture's feed has fixed dates; a wide window keeps freshness checks
+    # from turning the suite red as the wall clock moves past them.
+    monkeypatch.setenv("ISSUE_WINDOW_HOURS", "720")
     monkeypatch.setenv("BASE_URL", "https://matins.example")
     monkeypatch.delenv("READWISE_TOKEN", raising=False)
     clear_cache()
@@ -846,6 +850,16 @@ def test_a_catalogue_saved_with_an_email_can_be_found_by_code(client):
 # ------------------------------------------------------------------- reader
 
 
+def _reader_article_id(client, secret: str, title: str) -> str:
+    page = client.get(f"/{secret}/read")
+    match = re.search(
+        rf'href="/{re.escape(secret)}/read\?view=all&article=([^"]+)"[^>]*>{re.escape(title)}',
+        page.text,
+    )
+    assert match, page.text
+    return unquote(match.group(1))
+
+
 def test_reader_lists_items_and_opening_one_marks_it_read(client):
     secret = _signup_without_readwise(client)
     _add_feed(client, secret)
@@ -855,25 +869,130 @@ def test_reader_lists_items_and_opening_one_marks_it_read(client):
     assert page.status_code == 200
     assert "First story" in page.text
     assert "Saved for later" in page.text
-    # The list is newest-first, so pick the item by title rather than position.
-    match = re.search(
-        rf'href="/{re.escape(secret)}/read/([^"]+)"[^>]*>First story', page.text
-    )
-    assert match, page.text
-    article_id = match.group(1)
+    article_id = _reader_article_id(client, secret, "First story")
     assert article_id.startswith("feeds:")
-    opened = client.get(f"/{secret}/read/{article_id}")
+
+    # The article opens beside the list, not on its own page.
+    opened = client.get(
+        f"/{secret}/read?view=all&article={quote(article_id, safe='')}"
+    )
     assert opened.status_code == 200
     assert "Body text of the first story" in opened.text
+    assert "Saved for later" in opened.text
     assert "script" not in opened.text.lower()
+    assert "First story" not in client.get(f"/{secret}/read?view=unread").text
 
-    after = client.get(f"/{secret}/read")
-    assert f"/read/{article_id}" not in after.text
-    everything = client.get(f"/{secret}/read?all=1")
-    assert f"/read/{article_id}" in everything.text
+    client.post(
+        f"/{secret}/read/{quote(article_id, safe=':-_')}/unread",
+        data={"csrf": _csrf(client, secret)},
+    )
+    assert "First story" in client.get(f"/{secret}/read?view=unread").text
 
-    client.post(f"/{secret}/read/{article_id}/unread", data={"csrf": _csrf(client, secret)})
-    assert f"/read/{article_id}" in client.get(f"/{secret}/read").text
+
+def test_reader_like_and_next_issue_are_stateful(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    article_id = _reader_article_id(client, secret, "First story")
+    csrf = _csrf(client, secret)
+
+    liked = client.post(
+        f"/{secret}/read/feedback",
+        data={"csrf": csrf, "article_id": article_id, "value": "like", "view": "liked"},
+        follow_redirects=False,
+    )
+    assert liked.status_code == 303
+    assert "First story" in client.get(f"/{secret}/read?view=liked").text
+    signals = client.get("/api/v1/signals", headers=_api(secret)).json()["signals"]
+    assert [(s["url"], s["rating"]) for s in signals] == [
+        ("https://example.com/first", "interesting")
+    ]
+
+    queued = client.post(
+        f"/{secret}/read/queue",
+        data={"csrf": csrf, "article_id": article_id, "view": "queued"},
+        follow_redirects=False,
+    )
+    assert queued.status_code == 303
+    assert "First story" in client.get(f"/{secret}/read?view=queued").text
+    assert "https://example.com/first" in [
+        saved.url for saved in client.app.state.matins.list_saved(secret)
+    ]
+
+    client.post(
+        f"/{secret}/read/unqueue",
+        data={"csrf": csrf, "article_id": article_id, "view": "queued"},
+        follow_redirects=False,
+    )
+    assert "First story" not in client.get(f"/{secret}/read?view=queued").text
+
+
+def test_a_curated_catalogue_prints_only_the_queue(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    client.post(f"/{secret}/save", json={"url": "https://example.com/chosen"})
+
+    page = client.get(f"/{secret}/settings")
+    assert 'name="auto_select"' in page.text
+    client.post(
+        f"/{secret}/settings",
+        data={"csrf": _csrf(client, secret), "auto_select": "0"},
+        follow_redirects=False,
+    )
+
+    preview = client.get(f"/{secret}/issues/preview")
+    assert "https://example.com/chosen" in preview.text or "chosen" in preview.text.lower()
+    assert "First story" not in preview.text
+
+    composed = client.post(
+        f"/{secret}/issues/build",
+        data={"csrf": _csrf(client, secret)},
+        follow_redirects=False,
+    )
+    assert composed.status_code == 303
+    issues = client.app.state.matins.list_issues(secret)
+    assert len(issues) == 1
+    assert issues[0].article_count == 1
+
+
+def test_candidates_are_browsable_and_queue_with_their_text(client):
+    secret = _signup_without_readwise(client)
+    created = client.post(
+        "/api/v1/candidates",
+        headers=_api(secret),
+        json={
+            "items": [
+                {
+                    "id": "b1",
+                    "url": "https://bsky.app/profile/alice.example/post/3k1",
+                    "title": "A Bluesky post",
+                    "source": "@alice.example",
+                    "summary": "Short text",
+                    "content": "<p>Post body</p>",
+                    "published": datetime(2026, 10, 30, 8, 0, tzinfo=UTC).timestamp(),
+                }
+            ]
+        },
+    )
+    assert created.status_code == 201
+    assert created.json()["added"] == 1
+
+    page = client.get(f"/{secret}/read")
+    assert "A Bluesky post" in page.text
+    assert "Bluesky · @alice.example" in page.text
+
+    csrf = _csrf(client, secret)
+    client.post(
+        f"/{secret}/read/queue",
+        data={"csrf": csrf, "article_id": "cand:b1", "view": "queued"},
+        follow_redirects=False,
+    )
+    saved = [
+        item
+        for item in client.app.state.matins.list_saved(secret)
+        if item.url == "https://bsky.app/profile/alice.example/post/3k1"
+    ]
+    assert saved
+    assert saved[0].content == "<p>Post body</p>"
 
 
 def test_reader_article_html_is_sanitised():

@@ -115,9 +115,15 @@ SQLite, same file as the users table (WAL), disjoint tables:
 - `issue_items (issue_id, secret, article_id, title, url, section)` — membership
   and the dedupe set.
 - `delivery (secret, webhook_url, webhook_secret, email, schedule, timezone,
-  enabled, max_articles, max_per_feed, max_words, window_hours)` — the webhook
-  secret is Fernet-encrypted with the app key; a NULL limit means the instance
-  default.
+  enabled, auto_select, max_articles, max_per_feed, max_words, window_hours)` —
+  the webhook secret is Fernet-encrypted with the app key; a NULL limit means the
+  instance default. `auto_select=0` is the curated mode: an issue is the queue
+  alone, and feeds are for browsing.
+- `candidates (id, secret, url, title, source, summary, content, published)` —
+  browsable items the composer must not print (Bluesky). Queuing one copies its
+  `content`, because the URL cannot be fetched.
+- `article_signals (secret, url, title, source, rating)` — likes (+1) and
+  not-for-me (−1), keyed by URL so a curator can consume them.
 - `issue_skips (secret, article_id, title, section, url, skipped_at)` — articles
   taken out of the next issue.
 
@@ -148,6 +154,8 @@ pages use the same service layer, so nothing here has powers the UI lacks.
 | GET | `/api/v1/issues` | composed issues and download paths |
 | GET | `/api/v1/issues/preview` | exactly what the next issue would contain (`only=queue` for a curated preview) |
 | POST | `/api/v1/issues?force=0\|1` | compose and deliver now (409 if today's exists); `only=queue` composes the queue alone |
+| GET/POST | `/api/v1/signals` | likes / not-for-me, keyed by URL |
+| GET/POST | `/api/v1/candidates` | browsable-but-not-printed items (Bluesky posts) |
 
 ```bash
 S=your-four-word-secret

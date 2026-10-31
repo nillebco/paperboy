@@ -70,7 +70,11 @@ async def tick(app, now: datetime | None = None) -> int:
 
         try:
             issue = await service.build(
-                secret=delivery.secret, reader=reader, local_day=day, now=now
+                secret=delivery.secret,
+                reader=reader,
+                local_day=day,
+                now=now,
+                only=None if delivery.auto_select else "queue",
             )
         except Exception:
             logger.exception("issue build failed for %s", _mask(delivery.secret))

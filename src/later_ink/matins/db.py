@@ -74,6 +74,8 @@ class Delivery:
     max_per_feed: int | None = None
     max_words: int | None = None
     window_hours: int | None = None
+    # Automatic: compose from feeds + queue. Curated: print only the queue.
+    auto_select: bool = True
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,36 @@ class SkippedArticle:
     title: str
     section: str
     url: str | None
+
+
+@dataclass(frozen=True)
+class CandidateItem:
+    """An item an external curator offers for browsing but not for printing.
+
+    Bluesky posts are the first use: they cannot be fetched by URL, so their text
+    arrives with them. They are visible in the reader and enter an issue only
+    when the user (or the curator) queues them."""
+
+    id: str
+    url: str
+    title: str
+    source: str
+    summary: str
+    content: str | None
+    published: float | None
+    added_at: float
+
+
+@dataclass(frozen=True)
+class ArticleSignal:
+    """One like/dislike, keyed by URL so an external curator can use it too."""
+
+    url: str
+    article_id: str | None
+    title: str
+    source: str
+    rating: int
+    updated_at: float
 
 
 def feed_id(secret: str, url: str) -> str:
@@ -237,6 +269,7 @@ class MatinsStore:
             )
             for column in ("max_articles", "max_per_feed", "max_words", "window_hours"):
                 _ensure_column(conn, "delivery", column, "INTEGER")
+            _ensure_column(conn, "delivery", "auto_select", "INTEGER NOT NULL DEFAULT 1")
             # Articles the user took out of the next issue. Kept with their title
             # so the list can offer "put it back" without refetching the feed.
             conn.execute(
@@ -249,6 +282,46 @@ class MatinsStore:
                     url TEXT,
                     skipped_at REAL NOT NULL,
                     PRIMARY KEY (secret, article_id)
+                )
+                """
+            )
+            # Browsable but not automatically printable. A curator pushes them
+            # (Bluesky today); the reader lists them next to the feeds.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS candidates (
+                    id TEXT NOT NULL,
+                    secret TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
+                    content TEXT,
+                    published REAL,
+                    added_at REAL NOT NULL,
+                    PRIMARY KEY (secret, id),
+                    UNIQUE (secret, url)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS candidates_by_user"
+                " ON candidates (secret, added_at)"
+            )
+            # Like / not for me. Keyed by URL, not by connector id: the curator
+            # ranks next morning's feeds and has no catalogue ids to work with.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS article_signals (
+                    secret TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    article_id TEXT,
+                    title TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    rating INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (secret, url)
                 )
                 """
             )
@@ -542,6 +615,143 @@ class MatinsStore:
                 [(issue_id, secret, i) for i in ids],
             )
 
+    # -------------------------------------------------------- candidates
+
+    def upsert_candidates(self, secret: str, items: list[dict]) -> int:
+        """Store items a curator wants visible in the reader.
+
+        Re-pushing a post updates its text (an edit or a re-fetch) without
+        duplicating it. The table is pruned to the newest 500 and 14 days so a
+        curator that runs daily cannot grow it without bound.
+        """
+        now = time.time()
+        with self._conn() as conn:
+            for item in items:
+                conn.execute(
+                    "INSERT INTO candidates"
+                    " (id, secret, url, title, source, summary, content, published, added_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT (secret, url) DO UPDATE SET"
+                    " id = excluded.id, title = excluded.title, source = excluded.source,"
+                    " summary = excluded.summary, content = excluded.content,"
+                    " published = excluded.published",
+                    (
+                        str(item["id"]),
+                        secret,
+                        str(item["url"]),
+                        str(item.get("title") or ""),
+                        str(item.get("source") or ""),
+                        str(item.get("summary") or ""),
+                        item.get("content"),
+                        item.get("published"),
+                        now,
+                    ),
+                )
+            conn.execute(
+                "DELETE FROM candidates WHERE secret = ? AND added_at < ?",
+                (secret, now - 14 * 24 * 3600),
+            )
+            conn.execute(
+                "DELETE FROM candidates WHERE secret = ? AND id NOT IN"
+                " (SELECT id FROM candidates WHERE secret = ?"
+                "  ORDER BY added_at DESC LIMIT 500)",
+                (secret, secret),
+            )
+        return len(items)
+
+    def list_candidates(self, secret: str, limit: int = 200) -> list[CandidateItem]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM candidates WHERE secret = ?"
+                " ORDER BY COALESCE(published, added_at) DESC LIMIT ?",
+                (secret, max(1, min(limit, 500))),
+            ).fetchall()
+        return [_candidate(row) for row in rows]
+
+    def get_candidate(self, secret: str, cid: str) -> CandidateItem | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM candidates WHERE secret = ? AND id = ?", (secret, cid)
+            ).fetchone()
+        return _candidate(row) if row else None
+
+    # ----------------------------------------------------------- signals
+
+    def set_signal(
+        self,
+        secret: str,
+        url: str,
+        rating: int,
+        *,
+        article_id: str | None = None,
+        title: str = "",
+        source: str = "",
+    ) -> None:
+        if rating == 0:
+            self.clear_signal(secret, url)
+            return
+        now = time.time()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO article_signals"
+                " (secret, url, article_id, title, source, rating, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (secret, url) DO UPDATE SET"
+                " article_id = COALESCE(excluded.article_id, article_signals.article_id),"
+                " title = excluded.title, source = excluded.source,"
+                " rating = excluded.rating, updated_at = excluded.updated_at",
+                (
+                    secret,
+                    url,
+                    article_id,
+                    title,
+                    source,
+                    1 if rating > 0 else -1,
+                    now,
+                    now,
+                ),
+            )
+
+    def clear_signal(self, secret: str, url: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM article_signals WHERE secret = ? AND url = ?",
+                (secret, url),
+            )
+
+    def signals_for(self, secret: str, urls: list[str]) -> dict[str, int]:
+        ratings: dict[str, int] = {}
+        for i in range(0, len(urls), 500):
+            chunk = urls[i : i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            with self._conn() as conn:
+                rows = conn.execute(
+                    f"SELECT url, rating FROM article_signals WHERE secret = ?"
+                    f" AND url IN ({placeholders})",
+                    (secret, *chunk),
+                ).fetchall()
+            ratings.update({r["url"]: r["rating"] for r in rows})
+        return ratings
+
+    def list_signals(self, secret: str, limit: int = 500) -> list[ArticleSignal]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM article_signals WHERE secret = ?"
+                " ORDER BY updated_at DESC LIMIT ?",
+                (secret, max(1, min(limit, 2000))),
+            ).fetchall()
+        return [
+            ArticleSignal(
+                url=r["url"],
+                article_id=r["article_id"],
+                title=r["title"],
+                source=r["source"],
+                rating=r["rating"],
+                updated_at=r["updated_at"],
+            )
+            for r in rows
+        ]
+
     # -------------------------------------------------------------- issues
 
     def new_issue_id(self) -> str:
@@ -663,6 +873,8 @@ class MatinsStore:
             conn.execute("DELETE FROM reads WHERE secret = ?", (secret,))
             conn.execute("DELETE FROM emails WHERE secret = ?", (secret,))
             conn.execute("DELETE FROM issue_skips WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM candidates WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM article_signals WHERE secret = ?", (secret,))
 
     def rename_secret(self, old: str, new: str) -> None:
         """Move everything to a new secret when the catalogue URL is rotated.
@@ -798,6 +1010,13 @@ class MatinsStore:
                 "UPDATE delivery SET enabled = ? WHERE secret = ?", (int(enabled), secret)
             )
 
+    def set_auto_select(self, secret: str, enabled: bool) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE delivery SET auto_select = ? WHERE secret = ?",
+                (int(enabled), secret),
+            )
+
     def set_issue_limits(
         self,
         secret: str,
@@ -850,7 +1069,22 @@ _SECRET_TABLES = (
     "reads",
     "delivery",
     "issue_skips",
+    "candidates",
+    "article_signals",
 )
+
+
+def _candidate(row: sqlite3.Row) -> CandidateItem:
+    return CandidateItem(
+        id=row["id"],
+        url=row["url"],
+        title=row["title"],
+        source=row["source"],
+        summary=row["summary"],
+        content=row["content"],
+        published=row["published"],
+        added_at=row["added_at"],
+    )
 
 
 def _feed(row: sqlite3.Row) -> Feed:
@@ -901,6 +1135,7 @@ def _delivery(row: sqlite3.Row, fernet: Fernet) -> Delivery:
         max_per_feed=row["max_per_feed"],
         max_words=row["max_words"],
         window_hours=row["window_hours"],
+        auto_select=bool(row["auto_select"]),
     )
 
 

@@ -15,6 +15,7 @@ import hmac
 import logging
 import secrets as pysecrets
 from datetime import UTC, datetime
+from html import escape as html_escape
 from types import SimpleNamespace
 from urllib.parse import quote, urlsplit
 
@@ -515,37 +516,213 @@ async def save(secret: str, request: Request):
 
 
 @router.get("/{secret}/read", response_class=HTMLResponse)
-async def reader_index(secret: str, request: Request, all: int = 0):
-    """The unread list: everything the sources currently publish, newest first.
+async def reader_index(
+    secret: str, request: Request, article: str | None = None, view: str = "all"
+):
+    """The mailbox: everything the catalogue can show, with one article open.
 
-    This is the part the OPDS catalogue cannot do — an e-reader browse is
-    folder-at-a-time, and "what is new across everything" is a question only a
-    server can answer cheaply."""
+    The issue is curated; this list is not. Feeds, the saved queue and curator
+    candidates (Bluesky) all appear here, and the two buttons on each row are the
+    only way an item moves from "all the news" into "the next issue"."""
     _resolve(secret, request)
+    store = _store(request)
+    reader = await _reader(request, secret)
     stream = await _reader_items(request, secret)
-    read = _store(request).read_ids(secret, [entry[0] for entry in stream])
-    items = [
-        {
-            "id": item_id,
-            "title": article.title,
-            "source": section,
-            "saved": source == "later",
-            "minutes": max(1, round((article.word_count or 400) / 250)),
-            "read": item_id in read,
-        }
-        for item_id, article, section, source in stream
-    ]
-    shown = items if all else [item for item in items if not item["read"]]
+    read = store.read_ids(secret, [entry[0] for entry in stream])
+    urls = [getattr(entry[1], "url", "") or "" for entry in stream]
+    ratings = store.signals_for(secret, [url for url in urls if url])
+    queued = {item.url: item for item in store.list_saved(secret)}
+
+    items: list[dict] = []
+    for item_id, source_article, section, kind in stream:
+        url = getattr(source_article, "url", "") or ""
+        saved = queued.get(url)
+        items.append(
+            {
+                "id": item_id,
+                "title": source_article.title,
+                "source": section,
+                "url": url,
+                "kind": kind,
+                "saved": saved is not None,
+                "saved_id": saved.id if saved else None,
+                "rating": ratings.get(url, 0),
+                "minutes": max(1, round((getattr(source_article, "word_count", None) or 400) / 250)),
+                "read": item_id in read,
+                "selected": False,
+            }
+        )
+
+    counts = {
+        "all": len(items),
+        "unread": sum(1 for item in items if not item["read"]),
+        "liked": sum(1 for item in items if item["rating"] > 0),
+        "queued": sum(1 for item in items if item["saved"]),
+    }
+    view = view if view in counts else "all"
+    shown = _filter_reader(items, view)
+
+    selected = next((item for item in items if item["id"] == article), None)
+    body: str | None = None
+    error: str | None = None
+    if selected is not None:
+        try:
+            body = await _reader_body(request, secret, reader, selected)
+        except (ArticleUnavailable, UpstreamError, KeyError) as e:
+            error = getattr(e, "message", None) or "Could not load that article."
+        if body is None and error is None:
+            error = "Could not render that article."
+        if body is not None:
+            store.mark_read(secret, selected["id"])
+            selected["read"] = True
+            # Keep it in the list even when the current filter would hide it:
+            # a click must not make the row vanish under the pointer.
+            if selected not in shown:
+                shown = [selected, *shown[: MAX_READER_ITEMS - 1]]
+        selected["selected"] = True
+
     return _html(
         pages.reader_page(
             secret=secret,
             csrf=_csrf_token(secret),
             items=shown[:MAX_READER_ITEMS],
-            total=len(items),
-            unread=len([item for item in items if not item["read"]]),
-            show_all=bool(all),
-        )
+            counts=counts,
+            view=view,
+            selected=selected,
+            body=body,
+            error=error,
+        ),
+        csp=READER_CSP,
     )
+
+
+def _filter_reader(items: list[dict], view: str) -> list[dict]:
+    if view == "unread":
+        return [item for item in items if not item["read"]]
+    if view == "liked":
+        return [item for item in items if item["rating"] > 0]
+    if view == "queued":
+        return [item for item in items if item["saved"]]
+    return items
+
+
+async def _reader_body(request, secret: str, reader, item: dict) -> str | None:
+    if item["kind"] == "candidate":
+        candidate = _store(request).get_candidate(secret, item["id"].split(":", 1)[1])
+        if candidate is None:
+            return None
+        return _candidate_html(candidate.content or candidate.summary)
+    _article, raw = await reader.get_article_html(item["id"])
+    return to_page_html(raw)
+
+
+def _candidate_html(content: str) -> str:
+    """A candidate arrives as HTML from the curator; plain text is a fallback."""
+    if "<" in content:
+        return content
+    return "".join(
+        f"<p>{html_escape(paragraph)}</p>"
+        for paragraph in content.split("\n\n")
+        if paragraph.strip()
+    )
+
+
+def _read_href(secret: str, view: str, article: str | None = None) -> str:
+    target = f"/{secret}/read?view={quote(view)}"
+    if article:
+        target += f"&article={quote(article, safe='')}"
+    return target
+
+
+async def _find_reader_item(
+    request, secret: str, article_id: str
+) -> dict | None:
+    for item_id, article, section, kind in await _reader_items(request, secret):
+        if item_id != article_id:
+            continue
+        return {
+            "id": item_id,
+            "title": article.title,
+            "url": getattr(article, "url", "") or "",
+            "source": getattr(article, "signal_source", section),
+            "kind": kind,
+        }
+    return None
+
+
+@router.post("/{secret}/read/feedback")
+async def reader_feedback(
+    secret: str,
+    request: Request,
+    csrf: str = Form(""),
+    article_id: str = Form(""),
+    value: str = Form("like"),
+    view: str = Form("all"),
+):
+    """Like / not for me, keyed by URL so the curator can rank next morning."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    item = await _find_reader_item(request, secret, article_id)
+    if item is None or not item["url"]:
+        raise HTTPException(404, "No such article")
+    store = _store(request)
+    rating = {"like": 1, "dislike": -1}.get(value, 0)
+    if rating:
+        store.set_signal(
+            secret,
+            item["url"],
+            rating,
+            article_id=item["id"],
+            title=item["title"],
+            source=item["source"],
+        )
+    else:
+        store.clear_signal(secret, item["url"])
+    return RedirectResponse(_read_href(secret, view, article_id), status_code=303)
+
+
+@router.post("/{secret}/read/queue")
+async def reader_queue(
+    secret: str,
+    request: Request,
+    csrf: str = Form(""),
+    article_id: str = Form(""),
+    view: str = Form("all"),
+):
+    """Add any browsable item to the curated next issue."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    item = await _find_reader_item(request, secret, article_id)
+    if item is None or not item["url"]:
+        raise HTTPException(404, "No such article")
+    content = None
+    if item["kind"] == "candidate":
+        candidate = _store(request).get_candidate(secret, article_id.split(":", 1)[1])
+        content = candidate.content if candidate else None
+    _store(request).save_url(secret, item["url"], item["title"], content=content)
+    return RedirectResponse(_read_href(secret, view, article_id), status_code=303)
+
+
+@router.post("/{secret}/read/unqueue")
+async def reader_unqueue(
+    secret: str,
+    request: Request,
+    csrf: str = Form(""),
+    article_id: str = Form(""),
+    view: str = Form("all"),
+):
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    item = await _find_reader_item(request, secret, article_id)
+    if item is None or not item["url"]:
+        raise HTTPException(404, "No such article")
+    store = _store(request)
+    queued = next(
+        (saved for saved in store.list_saved(secret) if saved.url == item["url"]), None
+    )
+    if queued is not None:
+        store.delete_saved(secret, queued.id)
+    return RedirectResponse(_read_href(secret, view, article_id), status_code=303)
 
 
 @router.post("/{secret}/read/mark-all")
@@ -635,8 +812,34 @@ async def _reader_items(request: Request, secret: str) -> list[tuple[str, object
                 (reader.decorate_id("rss", a.id), a, section, "rss") for a in articles
             )
 
+    # Curator candidates (Bluesky): browsable here, printable only when queued.
+    for candidate in _store(request).list_candidates(secret, limit=MAX_READER_ITEMS):
+        stamp = candidate.published or candidate.added_at
+        article = SimpleNamespace(
+            title=candidate.title or candidate.url,
+            url=candidate.url,
+            word_count=max(1, len((candidate.content or candidate.summary).split())),
+            content_date=datetime.fromtimestamp(stamp, UTC).replace(tzinfo=None),
+            signal_source=candidate.source,
+        )
+        section = (
+            f"Bluesky · {candidate.source}" if candidate.source else "Bluesky"
+        )
+        items.append((f"cand:{candidate.id}", article, section, "candidate"))
+
     items.sort(key=lambda item: item[1].content_date or datetime.min, reverse=True)
-    return items
+    # One row per URL. A queued feed article exists twice (the feed's copy and
+    # the queue's), and the queue copy carries the save time as its date, so it
+    # sorts first. Prefer the source copy: the row keeps its real origin, the
+    # feed's article id stays stable across a like/queue click, and "queued" is
+    # still shown from the saved table.
+    unique: dict[str, tuple[str, object, str, str]] = {}
+    for entry in items:
+        key = getattr(entry[1], "url", "") or entry[0]
+        current = unique.get(key)
+        if current is None or (current[3] == "later" and entry[3] != "later"):
+            unique[key] = entry
+    return list(unique.values())
 
 
 # --------------------------------------------------------------- settings
@@ -673,17 +876,20 @@ async def settings_post(
     max_per_feed: str = Form(""),
     max_words: str = Form(""),
     window_hours: str = Form(""),
+    auto_select: str = Form("1"),
 ):
     """Schedule, limits and notifications. Sources have their own page."""
     _resolve(secret, request)
     _require_csrf(secret, csrf)
 
+    curated = auto_select == "0"
     overrides = {
         "email": email,
         "webhook_url": webhook_url,
         "schedule": schedule,
         "timezone": timezone,
         "enabled": bool(enabled),
+        "auto_select": not curated,
         "limits": {
             "max_articles": max_articles,
             "max_per_feed": max_per_feed,
@@ -754,6 +960,7 @@ async def settings_post(
         enabled=bool(enabled),
     )
     _store(request).set_issue_limits(secret, **limits)
+    _store(request).set_auto_select(secret, not curated)
     return RedirectResponse(f"/{secret}/settings?saved=1", status_code=303)
 
 
@@ -814,7 +1021,8 @@ async def issues_preview(
     _resolve(secret, request)
     store = _store(request)
     reader = await _reader(request, secret)
-    candidates = await _service(request).plan(secret, reader)
+    only = _issue_only(store, secret)
+    candidates = await _service(request).plan(secret, reader, only=only)
     limits = limits_for(store.get_delivery(secret))
     return _html(
         pages.preview_page(
@@ -843,6 +1051,7 @@ async def issues_preview(
             max_words=limits.max_words,
             schedule_label=_schedule_label(request, secret),
             has_feeds=bool(store.list_feeds(secret)),
+            curated=only == "queue",
             notice=notice,
             error=error,
         )
@@ -1034,9 +1243,20 @@ async def _reader(request: Request, secret: str):
         raise HTTPException(404, "Unknown catalogue") from None
 
 
+def _issue_only(store, secret: str) -> str | None:
+    """Queue-only when the catalogue is curated; None keeps the automatic plan."""
+    delivery = store.get_delivery(secret)
+    if delivery is None or delivery.auto_select:
+        return None
+    return "queue"
+
+
 async def _build(request: Request, secret: str, day: str):
     return await _service(request).build(
-        secret=secret, reader=await _reader(request, secret), local_day=day
+        secret=secret,
+        reader=await _reader(request, secret),
+        local_day=day,
+        only=_issue_only(_store(request), secret),
     )
 
 
@@ -1051,7 +1271,12 @@ async def _compose(app, secret: str):
     delivery = app.state.matins.get_delivery(secret)
     day = local_day(delivery.timezone if delivery else config.get_default_timezone())
     reader = await app.state.tenant_reader(secret)
-    issue = await app.state.issues.build(secret=secret, reader=reader, local_day=day)
+    issue = await app.state.issues.build(
+        secret=secret,
+        reader=reader,
+        local_day=day,
+        only=_issue_only(app.state.matins, secret),
+    )
     if issue is not None:
         await app.state.issues.deliver(secret, issue)
     return issue
@@ -1261,6 +1486,7 @@ def _render_settings(
         "schedule": delivery.schedule if delivery else config.get_default_schedule(),
         "timezone": delivery.timezone if delivery else config.get_default_timezone(),
         "enabled": bool(delivery.enabled) if delivery else True,
+        "auto_select": delivery.auto_select if delivery else True,
         "limits": {
             key: getattr(delivery, key, None) if delivery else None for key in LIMIT_BOUNDS
         },
@@ -1276,6 +1502,7 @@ def _render_settings(
         schedule=values["schedule"],
         timezone=values["timezone"],
         enabled=values["enabled"],
+        auto_select=values["auto_select"],
         webhook_secret_set=bool(delivery and delivery.webhook_secret),
         limits=values["limits"],
         defaults={key: getattr(defaults, key) for key in LIMIT_BOUNDS},

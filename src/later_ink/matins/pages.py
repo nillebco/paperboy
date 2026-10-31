@@ -158,8 +158,24 @@ details.confirm[open] { display: block; flex-basis: 100%; }
   color: var(--muted); }
 .article pre { overflow-x: auto; font-size: .85rem; }
 .article a { text-decoration: underline; }
-.tabs { display: flex; gap: 1rem; margin: .8rem 0 0; font-size: .92rem; }
+.tabs { display: flex; gap: 1rem; margin: .8rem 0 0; font-size: .92rem; flex-wrap: wrap; }
 .tabs a[aria-current] { font-weight: 700; text-decoration: none; }
+.reader-split { display: grid; grid-template-columns: minmax(0, 22rem) minmax(0, 1fr);
+  gap: 1.2rem; align-items: start; margin-top: .8rem; }
+.reader-list { max-height: calc(100vh - 10rem); overflow-y: auto; padding: .2rem .3rem; }
+.reader-list .row { padding: .5rem .45rem; border-radius: 8px; }
+.reader-list .row.selected { background: var(--soft); }
+.row-actions { display: flex; gap: .3rem; margin-left: auto; flex-wrap: wrap; }
+.row-actions form { margin: 0; }
+.row-actions .btn { padding: .15rem .45rem; font-size: .78rem; line-height: 1.4; }
+.btn.on { background: var(--soft); border-color: var(--ink); font-weight: 700; }
+.article-toolbar { display: flex; gap: .4rem; flex-wrap: wrap; margin: 0 0 1rem; }
+.article-toolbar form { margin: 0; }
+.reader-pane .card h1 { margin-top: 0; }
+@media (max-width: 820px) {
+  .reader-split { grid-template-columns: 1fr; }
+  .reader-list { max-height: none; }
+}
 """
 
 _NAV = (
@@ -621,6 +637,7 @@ def preview_page(
     max_words: int,
     schedule_label: str | None,
     has_feeds: bool,
+    curated: bool = False,
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
@@ -636,7 +653,7 @@ def preview_page(
 </div>"""
 
     skipped_block = ""
-    if skipped:
+    if skipped and not curated:
         rows = "".join(
             f"""<div class="row">
   <div class="row-main"><span class="row-title">{escape(item["title"])}</span>
@@ -656,6 +673,17 @@ def preview_page(
 <p class="lede">{when}</p>"""
 
     if not candidates:
+        if curated:
+            body = f"""{header}
+<div class="card">
+  <p>Nothing curated yet.</p>
+  <p class="meta">This catalogue prints only what you add. Open the Reader, read
+  around, and use <strong>+ Next</strong> (or the curator's picks) to fill the issue.</p>
+  <div class="actions"><a class="btn primary" href="{base}/read">Open the Reader</a></div>
+</div>
+{add_link}
+"""
+            return _shell(secret, "next", "Next issue", body, notice=notice, error=error)
         target = (
             f'<a class="btn" href="{base}/feeds">Manage feeds</a>'
             if has_feeds
@@ -711,6 +739,16 @@ def preview_page(
 </div>"""
         blocks += f'<h2>{escape(section)}</h2><div class="card">{rows}</div>'
 
+    limits_hint = (
+        "Only the articles you added are printed; feeds are for browsing in the Reader."
+        if curated
+        else (
+            f"Limits: {max_per_feed} per feed, {max_words:,} words, items from the "
+            f'last {_plural(window_hours, "hour")} — '
+            f'<a href="{base}/settings#limits">change</a>. '
+            "Skip an article and the next in line takes its place."
+        )
+    )
     body = f"""{header}
 <div class="card lead">
   <div class="stats" style="margin-top:0">
@@ -720,9 +758,8 @@ def preview_page(
   <div class="actions">
     {_button(f"{base}/issues/build", csrf, "Compose this issue", style="primary")}
   </div>
-  <p class="hint">Limits: {max_per_feed} per feed, {max_words:,} words, items from the
-  last {_plural(window_hours, "hour")} — <a href="{base}/settings#limits">change</a>.
-  Skip an article and the next in line takes its place. Reading time is known once composed.</p>
+  <p class="hint">{limits_hint}
+  Reading time is known once composed.</p>
 </div>
 
 {blocks}
@@ -863,6 +900,7 @@ def settings_page(
     schedule: str,
     timezone: str,
     enabled: bool,
+    auto_select: bool,
     webhook_secret_set: bool,
     limits: dict,
     defaults: dict,
@@ -916,9 +954,15 @@ def settings_page(
 
   <h2 id="limits">What goes in an issue</h2>
   <div class="card">
+    <label for="issue-mode" style="margin-top:0">Issue sources</label>
+    <select id="issue-mode" name="auto_select">
+      <option value="1" {"selected" if auto_select else ""}>Automatic — newest from the feeds, plus the queue</option>
+      <option value="0" {"selected" if not auto_select else ""}>Curated — only what I add (the next-issue queue)</option>
+    </select>
+    <p class="hint">Curated keeps the feeds for browsing in the Reader; an issue is
+    only what you or the curator put in the queue.</p>
     <div class="grid2">{limit_fields}</div>
-    <p class="hint">Blank uses the default shown. Newest first, your saved links before
-    any feed, nothing printed twice.</p>
+    <p class="hint">Blank uses the default shown. Nothing is printed twice.</p>
   </div>
 
   <h2 id="account">Account and notifications</h2>
@@ -989,49 +1033,153 @@ def settings_page(
 # --------------------------------------------------------------- reader
 
 
+_READER_VIEWS = (
+    ("all", "All"),
+    ("unread", "Unread"),
+    ("liked", "Liked"),
+    ("queued", "Next issue"),
+)
+
+
+def _reader_href(secret: str, view: str, article: str | None = None) -> str:
+    base = f"/{escape(secret)}/read?view={quote(view)}"
+    if article:
+        base += f"&article={quote(article, safe='')}"
+    return base
+
+
+def _reader_row(secret: str, csrf: str, item: dict, view: str) -> str:
+    """One list row: open it, like it, put it in (or take it out of) the issue."""
+    liked = item["rating"] > 0
+    queued = item["saved"]
+    like = _button(
+        f"/{escape(secret)}/read/feedback",
+        csrf,
+        "♥" if liked else "♡",
+        style="tiny on" if liked else "tiny",
+        fields={
+            "article_id": item["id"],
+            "value": "clear" if liked else "like",
+            "view": view,
+        },
+    )
+    queue = _button(
+        f"/{escape(secret)}/read/{'unqueue' if queued else 'queue'}",
+        csrf,
+        "✓ Next" if queued else "+ Next",
+        style="tiny on" if queued else "tiny",
+        fields={"article_id": item["id"], "view": view},
+    )
+    selected = " selected" if item.get("selected") else ""
+    read = " read" if item["read"] else ""
+    return f"""<div class="row{selected}{read}">
+  <div class="row-main">
+    <a class="row-title" href="{_reader_href(secret, view, item["id"])}">{escape(item["title"])}</a>
+    <span class="row-sub">{escape(item["source"])} · {_minutes(item["minutes"] * 250)}</span>
+  </div>
+  <div class="row-actions">{like}{queue}</div>
+</div>"""
+
+
+def _reader_pane(
+    *, secret: str, csrf: str, view: str, selected: dict, body: str
+) -> str:
+    base = f"/{escape(secret)}"
+    rating = selected["rating"]
+    original = (
+        f'<a class="btn tiny" href="{escape(selected["url"])}" target="_blank" '
+        'rel="noopener noreferrer">Open original</a>'
+        if selected["url"]
+        else ""
+    )
+    queue = _button(
+        f"{base}/read/{'unqueue' if selected['saved'] else 'queue'}",
+        csrf,
+        "✓ In next issue" if selected["saved"] else "+ Add to next issue",
+        style="tiny on" if selected["saved"] else "tiny",
+        fields={"article_id": selected["id"], "view": view},
+    )
+    like = _button(
+        f"{base}/read/feedback",
+        csrf,
+        "♥ Liked" if rating > 0 else "♥ Like",
+        style="tiny on" if rating > 0 else "tiny",
+        fields={"article_id": selected["id"], "value": "clear" if rating > 0 else "like", "view": view},
+    )
+    dislike = _button(
+        f"{base}/read/feedback",
+        csrf,
+        "Not for me",
+        style="tiny on" if rating < 0 else "tiny",
+        fields={
+            "article_id": selected["id"],
+            "value": "clear" if rating < 0 else "dislike",
+            "view": view,
+        },
+    )
+    unread = _button(
+        f"{base}/read/{quote(selected['id'], safe=':-_')}/unread",
+        csrf,
+        "Mark unread",
+        style="tiny",
+        fields={},
+    )
+    return f"""<div class="card reader-pane">
+<h1>{escape(selected["title"])}</h1>
+<p class="meta" style="margin-top:-.4rem">{escape(selected["source"])} · {_minutes(selected["minutes"] * 250)}</p>
+<div class="article-toolbar">{like}{dislike}{queue}{unread}{original}</div>
+<div class="article">{body}</div>
+</div>"""
+
+
 def reader_page(
     *,
     secret: str,
     csrf: str,
     items: list[dict],
-    total: int,
-    unread: int,
-    show_all: bool,
+    counts: dict[str, int],
+    view: str,
+    selected: dict | None = None,
+    body: str | None = None,
+    error: str | None = None,
 ) -> str:
-    """Unread list across every source, newest first."""
+    """The mailbox: all the news on the left, the chosen article on the right.
+
+    No JavaScript: a click is a navigation that re-renders both panes, so the
+    list can carry real forms whose state the server owns."""
     base = f"/{escape(secret)}"
-    rows = "".join(
-        f"""<div class="row">
-  <div class="row-main">
-    <a class="row-title" href="{base}/read/{escape(item["id"])}">{escape(item["title"])}</a>
-    <span class="row-sub">{escape(item["source"])} · about {_minutes(item["minutes"] * 250)}</span>
-  </div>
-</div>"""
-        for item in items
-    ) or (
-        f'<p class="meta">Nothing unread. <a href="{base}/read?all=1">Show everything</a>.</p>'
-        if not show_all
-        else f'<p class="meta">Nothing yet. <a href="{base}/feeds">Add a feed</a> or save a link.</p>'
+    tabs = "".join(
+        f'<a href="{base}/read?view={key}"'
+        + (' aria-current="page"' if key == view else "")
+        + f">{label} ({counts.get(key, 0)})</a>"
+        for key, label in _READER_VIEWS
     )
-    mark_all = (
-        f'<div class="actions">{_button(f"{base}/read/mark-all", csrf, "Mark everything as read", style="tiny")}</div>'
-        if unread
-        else ""
+    rows = "".join(_reader_row(secret, csrf, item, view) for item in items) or (
+        f'<p class="meta">Nothing here. <a href="{base}/feeds">Add a feed</a>'
+        " or save a link.</p>"
     )
-    body = f"""
+    if selected and body is not None:
+        pane = _reader_pane(secret=secret, csrf=csrf, view=view, selected=selected, body=body)
+    else:
+        pane = (
+            '<div class="card reader-pane"><p class="meta">'
+            "Pick an article from the list to read it here.</p></div>"
+        )
+    body_html = f"""
 <div class="page-head">
   <h1>Reader</h1>
-  <p class="meta count" style="margin:.5rem 0 0">{unread} unread of {total}</p>
+  <p class="meta count" style="margin:.5rem 0 0">{counts.get("unread", 0)} unread ·
+  {counts.get("queued", 0)} in the next issue</p>
 </div>
-<p class="lede" style="margin-bottom:0">Everything your sources publish, without composing an issue.</p>
-<div class="tabs">
-  <a href="{base}/read" {'aria-current="page"' if not show_all else ""}>Unread</a>
-  <a href="{base}/read?all=1" {'aria-current="page"' if show_all else ""}>All</a>
+<p class="lede" style="margin-bottom:0">Everything your sources publish. Like what
+is interesting; add what you want to read next.</p>
+<div class="tabs">{tabs}</div>
+<div class="reader-split">
+  <div class="card reader-list">{rows}</div>
+  <div>{pane}</div>
 </div>
-<div class="card">{rows}</div>
-{mark_all}
 """
-    return _shell(secret, "read", "Reader", body)
+    return _shell(secret, "read", "Reader", body_html, error=error)
 
 
 def reader_article_page(
