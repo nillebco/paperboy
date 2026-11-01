@@ -330,7 +330,38 @@ _CLOCK_JS = (
     "{hour:'2-digit',minute:'2-digit'});}t();setInterval(t,15000);}());"
 )
 
+# "Copy this address" for pages that show a private URL. Progressive
+# enhancement: the URL stays selectable text, so without script the reader can
+# still select and copy it by hand.
+_COPY_JS = (
+    "(function(){"
+    "function say(b,t){var o=b.getAttribute('data-label')||b.textContent;"
+    "b.setAttribute('data-label',o);b.textContent=t;"
+    "clearTimeout(b._t);b._t=setTimeout(function(){b.textContent=o;},1600);}"
+    "function legacy(text){var a=document.createElement('textarea');"
+    "a.value=text;a.setAttribute('readonly','');"
+    "a.style.position='fixed';a.style.top='-1000px';"
+    "document.body.appendChild(a);a.select();var ok=false;"
+    "try{ok=document.execCommand('copy');}catch(e){ok=false;}"
+    "document.body.removeChild(a);return ok;}"
+    "function copy(text){"
+    "if(navigator.clipboard&&navigator.clipboard.writeText){"
+    "return navigator.clipboard.writeText(text).then("
+    "function(){return true;},function(){return legacy(text);});}"
+    "return Promise.resolve(legacy(text));}"
+    "document.addEventListener('click',function(ev){"
+    "var b=ev.target&&ev.target.closest?ev.target.closest('[data-copy]'):null;"
+    "if(!b)return;ev.preventDefault();"
+    "var el=document.querySelector(b.getAttribute('data-copy'));if(!el)return;"
+    "var text=(el.value!=null&&el.tagName==='INPUT')?el.value:el.textContent.trim();"
+    "copy(text).then(function(ok){say(b,ok?'Copied':'Select and copy');});"
+    "});}());"
+)
+
 _INLINE_SCRIPTS = (_THEME_HEAD_JS, _THEME_TOGGLE_JS, _CLOCK_JS)
+# Every script any page may emit, including the ones only the Matins pages put
+# on a page themselves (the copy-address button). The CSP hashes all of them.
+_CSP_SCRIPTS = (*_INLINE_SCRIPTS, _COPY_JS)
 
 _THEME_HEAD_SCRIPT = f"<script>{_THEME_HEAD_JS}</script>"
 _THEME_TOGGLE_SCRIPT = f"<script>{_THEME_TOGGLE_JS}</script>"
@@ -354,7 +385,7 @@ def _script_hash(js: str) -> str:
 CSP = "; ".join(
     (
         "default-src 'none'",
-        "script-src " + " ".join(_script_hash(js) for js in _INLINE_SCRIPTS),
+        "script-src " + " ".join(_script_hash(js) for js in _CSP_SCRIPTS),
         "style-src 'unsafe-inline'",
         "img-src 'self' data:",
         "font-src 'self'",

@@ -15,6 +15,8 @@ from time import time
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, available_timezones
 
+from ..pages import _COPY_JS as COPY_JS
+
 REPO_URL = "https://github.com/nillebco/paperboy"
 
 _STYLE = """
@@ -308,6 +310,20 @@ def _button(
     )
 
 
+def _copy_script() -> str:
+    """The one script that copies an address; hashed into the page CSP."""
+    return f"<script>{COPY_JS}</script>"
+
+
+def _copy_button(target: str, label: str = "Copy address", *, style: str = "") -> str:
+    """Copy the text of `target` (a CSS id) without a form or a round trip."""
+    classes = f"btn {style}".strip()
+    return (
+        f'<button class="{classes}" type="button" data-copy="#{escape(target)}">'
+        f"{escape(label)}</button>"
+    )
+
+
 def _confirm(label: str, warning: str, action: str, csrf: str, confirm_label: str) -> str:
     """A destructive action that takes two deliberate clicks, without script."""
     return f"""<details class="confirm">
@@ -390,6 +406,7 @@ def _checklist(*, secret: str, feeds: int, issues: int) -> str:
 def dashboard_page(
     *,
     secret: str,
+    base_url: str,
     csrf: str,
     feeds: list[dict],
     saved_count: int,
@@ -404,6 +421,7 @@ def dashboard_page(
 ) -> str:
     """The catalogue's home page: what to read now and what comes next."""
     base = f"/{escape(secret)}"
+    catalog_url = f"{escape(base_url)}{base}/"
     failing = [feed for feed in feeds if feed["error"]]
     latest = issues[0] if issues else None
 
@@ -465,6 +483,20 @@ def dashboard_page(
   <div class="actions"><a class="btn" href="{base}/settings#account">Add an email</a></div>
 </div>""")
 
+    blocks.append(f"""<div class="card">
+  <p class="eyebrow">On your e-reader</p>
+  <p class="small">Add this address in KOReader, CrossPoint or INX. No username or
+  password: the address is the key, so keep it private.</p>
+  <span class="url url-block" id="catalog-url">{catalog_url}</span>
+  <div class="actions">
+    {_copy_button("catalog-url")}
+    <a class="btn" href="{base}/settings#reader">Setup steps</a>
+  </div>
+  <p class="hint" style="margin-bottom:0">Just the issues:
+  <span class="url" id="issues-url">{catalog_url}issues/</span>
+  {_copy_button("issues-url", "Copy", style="tiny")}</p>
+</div>""")
+
     blocks.append(f"""<h2>Add to the next issue</h2>
 <div class="card">
   <label for="save-url" style="margin-top:0">Save an article</label>
@@ -484,7 +516,14 @@ def dashboard_page(
         f'<p class="meta" style="margin-top:2rem">{account}'
         f'<a href="{base}/settings#reader">Connect an e-reader</a></p>'
     )
-    return _shell(secret, "home", "Matins", "\n".join(blocks), notice=notice, error=error)
+    return _shell(
+        secret,
+        "home",
+        "Matins",
+        "\n".join(blocks) + _copy_script(),
+        notice=notice,
+        error=error,
+    )
 
 
 # ---------------------------------------------------------------- feeds
@@ -1075,13 +1114,16 @@ def settings_page(
 <div class="card">
   <p class="small">Add this address to KOReader, CrossPoint or any OPDS reader. No username
   or password: the address is the key, so keep it private.</p>
-  <span class="url url-block">{catalog_url}</span>
+  <span class="url url-block" id="catalog-url">{catalog_url}</span>
+  <div class="actions">{_copy_button("catalog-url")}</div>
   <ol class="steps">
     <li>In KOReader: search icon &rarr; <strong>OPDS catalog</strong> &rarr; <strong>+</strong>.</li>
     <li>Paste the address above and save.</li>
     <li>Open <strong>Issues</strong> for each morning's paper.</li>
   </ol>
-  <p class="hint">Just the issues: <code style="user-select:all">{catalog_url}issues/</code></p>
+  <p class="hint">Just the issues:
+  <code id="issues-url" style="user-select:all">{catalog_url}issues/</code>
+  {_copy_button("issues-url", "Copy", style="tiny")}</p>
 </div>
 
 <h2 id="access">Access</h2>
@@ -1106,7 +1148,14 @@ def settings_page(
   </div></div>
 </div>
 """
-    return _shell(secret, "settings", "Settings", body, notice=notice, error=error)
+    return _shell(
+        secret,
+        "settings",
+        "Settings",
+        body + _copy_script(),
+        notice=notice,
+        error=error,
+    )
 
 
 # --------------------------------------------------------------- reader

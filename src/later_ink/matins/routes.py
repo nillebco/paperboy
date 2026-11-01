@@ -1647,6 +1647,7 @@ async def dashboard(
     delivery = store.get_delivery(secret)
     return pages.dashboard_page(
         secret=secret,
+        base_url=app_config.get_base_url(),
         csrf=_csrf_token(secret),
         feeds=_feed_rows(request, secret),
         saved_count=len(store.list_saved(secret)),

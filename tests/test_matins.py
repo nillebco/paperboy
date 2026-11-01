@@ -751,6 +751,31 @@ def test_scheduler_is_due_after_scheduled_time():
 # ------------------------------------------------------------------ sign-in
 
 
+def test_dashboard_offers_the_catalogue_address_to_copy(client):
+    secret = _signup_without_readwise(client)
+    page = client.get(f"/{secret}/", headers={"accept": "text/html"})
+
+    base = "https://matins.example"
+    # Both addresses are plain text (selectable without script) and each has a
+    # copy button aimed at it.
+    assert f'id="catalog-url">{base}/{secret}/</span>' in page.text
+    assert f'id="issues-url">{base}/{secret}/issues/</span>' in page.text
+    assert 'data-copy="#catalog-url">Copy address</button>' in page.text
+    assert 'data-copy="#issues-url">Copy</button>' in page.text
+
+    # The button is inert without its script, and the script is allowed by hash.
+    from later_ink import pages as shared_pages
+    from later_ink.matins import pages as matins_pages
+
+    assert f"<script>{matins_pages.COPY_JS}</script>" in page.text
+    csp = page.headers["content-security-policy"]
+    assert shared_pages._script_hash(matins_pages.COPY_JS) in csp
+
+    settings = client.get(f"/{secret}/settings").text
+    assert 'data-copy="#catalog-url">Copy address</button>' in settings
+    assert f"<script>{matins_pages.COPY_JS}</script>" in settings
+
+
 def test_dashboard_prompts_for_an_email_until_one_is_linked(client):
     secret = _signup_without_readwise(client)
     before = client.get(f"/{secret}/", headers={"accept": "text/html"})
@@ -1969,3 +1994,4 @@ def test_api_queue_only_issue_is_exactly_what_an_agent_queued(client):
     bad = client.get("/api/v1/issues/preview?only=feeds", headers=_api(secret))
     assert bad.status_code == 400
     assert client.post("/api/v1/issues?only=nope", headers=_api(secret)).status_code == 400
+
