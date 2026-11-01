@@ -1588,6 +1588,19 @@ def landing_page(
 </div>
 <p class="small">Calm by design: fixed limits per issue, nothing printed twice, and no attachment
 in your inbox, just a short note when it's ready.</p>
+
+<h2>Self-host it</h2>
+<div class="card lead">
+  <p class="headline">Don't like me? Clone me.</p>
+  <p class="small">Matins is free software (MIT) and meant to be yours: one container,
+  one SQLite file, no account to create and no vendor in the middle. Your feeds,
+  your queue, your issues and the catalogue address stay on your own machine — a
+  Raspberry Pi is enough. Point your e-reader at it and nothing leaves the house.</p>
+  <div class="actions">
+    <a class="btn primary" href="{REPO_URL}">Clone on GitHub</a>
+    <a class="btn" href="{REPO_URL}#self-host-quickstart">Self-host quickstart</a>
+  </div>
+</div>
 """,
         head=head,
     )

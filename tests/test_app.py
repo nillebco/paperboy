@@ -60,6 +60,10 @@ def test_landing(client):
     assert resp.status_code == 200
     assert "OPDS" in resp.text
     assert "Matins" in resp.text
+    # The self-host pitch: the joke, the licence, and a way to the source.
+    assert "Don't like me? Clone me." in resp.text
+    assert "self-host" in resp.text.lower()
+    assert 'href="https://github.com/nillebco/paperboy"' in resp.text
 
 
 def test_landing_social_preview_tags(client, monkeypatch):
