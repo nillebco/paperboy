@@ -1150,19 +1150,25 @@ async def _reader_items(request: Request, secret: str) -> list[tuple[str, object
         )
         items.append((f"cand:{candidate.id}", article, section, "candidate"))
 
-    items.sort(key=lambda item: item[1].content_date or datetime.min, reverse=True)
     # One row per URL. A queued feed article exists twice (the feed's copy and
-    # the queue's), and the queue copy carries the save time as its date, so it
-    # sorts first. Prefer the source copy: the row keeps its real origin, the
-    # feed's article id stays stable across a like/queue click, and "queued" is
-    # still shown from the saved table.
+    # the queue's), and the queue copy carries the save time as its date.
+    # Prefer the source copy: the row keeps its real origin, the feed's article
+    # id stays stable across a like/queue click, and "queued" is still shown
+    # from the saved table.
     unique: dict[str, tuple[str, object, str, str]] = {}
     for entry in items:
         key = getattr(entry[1], "url", "") or entry[0]
         current = unique.get(key)
         if current is None or (current[3] == "later" and entry[3] != "later"):
             unique[key] = entry
-    return list(unique.values())
+    # Sort *after* collapsing: queueing must not move a row. Dating the dedupe
+    # before the sort would pin every newly queued article to the top of the
+    # list, because its queue copy is dated "now".
+    return sorted(
+        unique.values(),
+        key=lambda item: item[1].content_date or datetime.min,
+        reverse=True,
+    )
 
 
 # --------------------------------------------------------------- settings

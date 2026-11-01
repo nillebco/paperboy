@@ -188,6 +188,16 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .reader-list .row.read .row-title { font-weight: 400; }
 .reader-list .row.archived .row-main { opacity: .55; }
 .reader-list .row.archived .row-title { font-weight: 400; }
+/* Queued for the next issue: marked in place. The list never re-sorts on a
+   queue click, so the mark (tint, left bar, badge) is what says "included". */
+.reader-list .row.queued { background: var(--soft); box-shadow: inset 3px 0 0 var(--muted); }
+.reader-list .row.queued.selected { box-shadow: inset 3px 0 0 var(--fg); }
+.reader-list .row.queued.read .row-main { opacity: .8; }
+.row-badge {
+  display: inline-block; margin-left: .45em; padding: 0 .45em;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--card);
+  font-size: .72rem; font-weight: 600; color: var(--fg); white-space: nowrap;
+}
 .row-actions { display: flex; gap: .3rem; margin-left: auto; flex-wrap: wrap; }
 .row-actions form { margin: 0; }
 .row-actions .btn { padding: .15rem .45rem; font-size: .78rem; line-height: 1.4; }
@@ -1216,11 +1226,13 @@ def _reader_row(
     )
     selected = " selected" if item.get("selected") else ""
     read = " read" if item["read"] else ""
+    queued = " queued" if item["saved"] else ""
+    badge = '<span class="row-badge">Next issue</span>' if item["saved"] else ""
     timing = f" · {_minutes(item['minutes'] * 250)}" if item["minutes"] else ""
-    return f"""<div class="row{selected}{read}">
+    return f"""<div class="row{selected}{read}{queued}">
   <div class="row-main">
     <a class="row-title" href="{_reader_href(secret, view, item["id"], source, issue)}">{escape(item["title"])}</a>
-    <span class="row-sub">{escape(item["source"])}{timing}</span>
+    <span class="row-sub">{escape(item["source"])}{timing}{badge}</span>
   </div>
   <div class="row-actions">{like}{queue}{archive}</div>
 </div>"""

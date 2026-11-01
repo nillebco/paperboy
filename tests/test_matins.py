@@ -892,6 +892,42 @@ def _reader_article_id(client, secret: str, title: str) -> str:
     return unquote(match.group(1))
 
 
+def test_queueing_does_not_move_a_row_in_the_list(client):
+    """The next issue is a mark, not a sort order: the queue copy is dated
+    "now", so sorting before collapsing duplicates lifted a row to the top."""
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+
+    def titles() -> list[str]:
+        page = client.get(f"/{secret}/read?view=all").text
+        return re.findall(r'class="row-title"[^>]*>([^<]+)</a>', page)
+
+    before = titles()
+    assert before == ["Second story", "First story"]
+
+    article_id = _reader_article_id(client, secret, "First story")
+    client.post(
+        f"/{secret}/read/queue",
+        data={
+            "csrf": _csrf(client, secret),
+            "article_id": article_id,
+            "view": "all",
+        },
+        follow_redirects=False,
+    )
+
+    assert titles() == before
+    queued = client.get(f"/{secret}/read?view=all").text
+    # The queued row says so in place: tinted class plus a badge.
+    assert re.search(
+        r'class="row queued">\s*<div class="row-main">\s*'
+        r'<a class="row-title"[^>]*>First story</a>\s*'
+        r'<span class="row-sub">Example Feed · \d+ minute'
+        r'<span class="row-badge">Next issue</span></span>',
+        queued,
+    )
+
+
 def test_reader_lists_items_and_opening_one_marks_it_read(client):
     secret = _signup_without_readwise(client)
     _add_feed(client, secret)
