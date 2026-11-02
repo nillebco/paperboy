@@ -4,9 +4,10 @@ The catalogue secret is the credential, presented as a bearer token so it does
 not end up in access logs the way the OPDS paths do. Everything here is the same
 service the pages call: nothing in this module decides what an issue contains.
 
-Deliberate omissions: no endpoint writes a composed issue's contents, and none
-returns article bodies. An agent's job is to put things in and ask what is
-waiting — reading happens on the device, which is the product.
+Deliberate omissions: no endpoint writes a composed issue's contents, and only
+`/items/long` returns article text, so an agent can write a recap. An agent's job
+is to put things in and ask what is waiting — reading happens on the device,
+which is the product.
 """
 
 import hashlib
@@ -15,15 +16,18 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from ..connectors.base import UpstreamError
-from . import config, routes, rss
-from .issues import local_day
+from ..connectors.base import ArticleUnavailable, UpstreamError
+from . import config, extract, routes, rss
+from .issues import limits_for, local_day
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1")
 
 MAX_CONTENT_BYTES = 512 * 1024
+MAX_LEDE_CHARS = 2000
+MAX_RECAP_CHARS = 2000
+MAX_RECAP_SOURCE_WORDS = 15000
 
 
 # --------------------------------------------------------------------- auth
@@ -243,15 +247,16 @@ async def set_signal(request: Request):
 async def list_items(request: Request, status: str = "unread", limit: int = 50):
     """The queue, and what the reader has already seen.
 
-    `status` is `unread`, `read` or `all`. Only the saved queue is listed:
+    `status` is `unread`, `read`, `queued` or `all`. `queued` is what will still
+    print, read or not. Only the saved queue is listed:
     feed items are fetched from their source and are not ours to enumerate
     cheaply, so an agent that wants those should ask for the issue preview.
     """
-    if status not in ("unread", "read", "all"):
-        raise HTTPException(400, "status must be unread, read or all")
+    if status not in ("unread", "read", "queued", "all"):
+        raise HTTPException(400, "status must be unread, read, queued or all")
     secret = _secret(request)
     store = _store(request)
-    saved = store.list_saved(secret, include_consumed=status != "unread")
+    saved = store.list_saved(secret, include_consumed=status in ("read", "all"))
     ids = [f"saved:{item.id}" for item in saved]
     read = store.read_ids(secret, ids)
     rows = []
@@ -269,6 +274,7 @@ async def list_items(request: Request, status: str = "unread", limit: int = 50):
                 "added_at": int(item.added_at),
                 "read": is_read,
                 "has_content": bool(item.content),
+                "origin": item.origin,
             }
         )
     return {"items": rows[: max(1, min(limit, 200))]}
@@ -294,10 +300,61 @@ async def add_item(request: Request):
         if len(content.encode()) > MAX_CONTENT_BYTES:
             raise HTTPException(413, f"content is limited to {MAX_CONTENT_BYTES} bytes")
         content = content.strip() or None
-    queued = _store(request).save_url(secret, url, title, content=content)
+    origin = body.get("origin", "user")
+    if origin not in ("user", "curator"):
+        raise HTTPException(400, "origin must be user or curator")
+    lede = body.get("lede")
+    lede = str(lede)[:MAX_LEDE_CHARS] if lede else None
+    queued = _store(request).save_url(secret, url, title, content=content, origin=origin, lede=lede)
     return JSONResponse(
         {"queued": queued, "url": url}, status_code=201 if queued else 200
     )
+
+
+@router.get("/items/long")
+async def long_items(request: Request):
+    """Queued articles the next issue would print that are long enough to need a
+    recap and have none. An agent writes them, then PUTs them back."""
+    secret = _secret(request)
+    store = _store(request)
+    reader = await routes._reader(request, secret)
+    queue = reader.sources["later"]
+    articles, _ = await queue.list_articles("inbox")
+    recapped = {item.id for item in store.list_saved(secret) if item.recap}
+    threshold = config.get_recap_min_words()
+    rows = []
+    for article in articles[: limits_for(store.get_delivery(secret)).max_saved]:
+        if int(article.id) in recapped:
+            continue
+        try:
+            _, html = await queue.get_article_html(article.id)
+        except (ArticleUnavailable, UpstreamError):
+            continue
+        text = extract.visible_text(html)
+        words = text.split()
+        if len(words) >= threshold:
+            rows.append(
+                {
+                    "id": int(article.id),
+                    "url": article.url,
+                    "title": article.title,
+                    "words": len(words),
+                    "text": " ".join(words[:MAX_RECAP_SOURCE_WORDS]),
+                }
+            )
+    return {"items": rows, "min_words": threshold}
+
+
+@router.put("/items/{item_id}/recap", status_code=204)
+async def set_recap(item_id: int, request: Request):
+    body = await _json(request)
+    recap = body.get("recap")
+    if not isinstance(recap, str) or not recap.strip():
+        raise HTTPException(400, "recap must be text")
+    if len(recap) > MAX_RECAP_CHARS:
+        raise HTTPException(413, f"recap is limited to {MAX_RECAP_CHARS} characters")
+    if not _store(request).set_saved_recap(_secret(request), item_id, recap.strip()):
+        raise HTTPException(404, "No such item")
 
 
 @router.delete("/items/{item_id}", status_code=204)

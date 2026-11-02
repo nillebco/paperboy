@@ -56,6 +56,7 @@ class IssueLimits:
     max_per_feed: int
     max_words: int
     window_hours: int
+    max_saved: int
 
 
 def limits_for(delivery) -> IssueLimits:
@@ -64,6 +65,7 @@ def limits_for(delivery) -> IssueLimits:
         max_per_feed=getattr(delivery, "max_per_feed", None) or config.get_issue_max_per_feed(),
         max_words=getattr(delivery, "max_words", None) or config.get_issue_max_words(),
         window_hours=getattr(delivery, "window_hours", None) or config.get_issue_window_hours(),
+        max_saved=getattr(delivery, "max_saved", None) or config.get_issue_max_saved(),
     )
 
 
@@ -98,15 +100,22 @@ class IssueService:
         only: str | None = None,
     ) -> Issue | None:
         now = now or datetime.now(UTC)
-        candidates = await self.plan(secret, reader, now, only=only)
+        limits = limits_for(self.store.get_delivery(secret))
+        # The whole queue, not the capped view: a link that cannot be fetched must
+        # not cost a slot, so the cap is applied to what actually prints.
+        candidates = await self.plan(secret, reader, now, only=only, whole_queue=True)
         logger.info("issue for %s on %s: %d candidates", _mask(secret), local_day, len(candidates))
         if not candidates:
             return None
 
         items: list[IssueItem] = []
         printed: list[Candidate] = []
+        saved_printed = 0
+        words_left = limits.max_words
         for candidate in candidates:
             source_name, article, section = candidate.source, candidate.article, candidate.section
+            if source_name == "later" and saved_printed >= limits.max_saved:
+                continue
             try:
                 _article, html = await reader.get_article_html(
                     reader.decorate_id(source_name, article.id)
@@ -116,6 +125,14 @@ class IssueService:
                 # is the only chance the user gets today.
                 logger.info("skipping %r for %s: %s", article.title, local_day, e)
                 continue
+            # Feeds rarely say how long an article is, so the word budget can only
+            # be honest once the text is here. What does not fit waits in the queue.
+            words = _words(html)
+            if items and words > words_left:
+                logger.info("%r does not fit in %s's word budget", article.title, local_day)
+                continue
+            words_left -= words
+            saved_printed += source_name == "later"
             items.append(
                 IssueItem(
                     title=article.title,
@@ -124,7 +141,7 @@ class IssueService:
                     author=article.author,
                     source_url=article.url,
                     image_url=article.image_url,
-                    word_count=_words(html),
+                    word_count=words,
                 )
             )
             printed.append(candidate)
@@ -237,6 +254,7 @@ class IssueService:
         reader,
         now: datetime | None = None,
         only: str | None = None,
+        whole_queue: bool = False,
     ) -> list[Candidate]:
         """What the next issue would contain, without fetching anything.
 
@@ -267,9 +285,9 @@ class IssueService:
                 saved, _ = await queue.list_articles("inbox")
             except (UpstreamError, KeyError):
                 saved = []
-            for article in saved[: config.get_issue_max_saved()]:
+            for article in saved if whole_queue else saved[: limits.max_saved]:
                 cost = article.word_count or DEFAULT_ITEM_WORDS
-                if selected and budget - cost < 0:
+                if not whole_queue and selected and budget - cost < 0:
                     break
                 selected.append(Candidate("later", article, SAVED_SECTION))
                 budget -= cost

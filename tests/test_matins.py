@@ -1526,7 +1526,7 @@ def test_every_page_shares_the_navigation(client):
     for path in ("", "feeds", f"feeds/{feed.id}", "issues/preview", "issues/", "settings", "read"):
         page = client.get(f"/{secret}/{path}", headers=HTML)
         assert page.status_code == 200, path
-        for target in ("issues/preview", "feeds", "issues/", "read", "settings"):
+        for target in ("issues/", "read", "settings"):
             assert f'href="/{secret}/{target}"' in page.text, (path, target)
         assert page.text.count("aria-current=page") == 1, path
 
@@ -1669,7 +1669,7 @@ def test_feed_failures_are_recorded_and_shown(client, monkeypatch):
     feed = client.app.state.matins.list_feeds(secret)[0]
     assert feed.last_error == "Could not fetch that feed"
     assert "Failing" in client.get(f"/{secret}/feeds").text
-    assert "1 feed failing" in client.get(f"/{secret}/", headers=HTML).text
+    assert "1 feed failing" in client.get(f"/{secret}/issues/", headers=HTML).text
 
 
 def test_a_site_address_subscribes_to_the_feed_it_advertises(client, monkeypatch):
@@ -1741,7 +1741,7 @@ def test_issue_page_lists_contents_and_deleting_releases_the_articles(client):
     page = client.get(f"/{secret}/issues/{issue.id}", headers=HTML)
     assert "First story" in page.text
     assert f"/{issue.id}.epub" in page.text
-    home = client.get(f"/{secret}/", headers=HTML).text
+    home = client.get(f"/{secret}/issues/", headers=HTML).text
     assert f"/issues/{issue.id}.epub" in home
 
     from pathlib import Path
@@ -1995,3 +1995,198 @@ def test_api_queue_only_issue_is_exactly_what_an_agent_queued(client):
     assert bad.status_code == 400
     assert client.post("/api/v1/issues?only=nope", headers=_api(secret)).status_code == 400
 
+
+
+# ------------------------------------------------- queue priority and quality
+
+
+def _prose(words: int = 300) -> str:
+    return "<html><body><article><h1>T</h1>" + "".join(
+        f"<p>{'word ' * 60}sentence, with enough text to count as a paragraph.</p>"
+        for _ in range(words // 60)
+    ) + "</article></body></html>"
+
+
+def _serve_pages(monkeypatch, pages=None):
+    async def fake(url):
+        return (pages or {}).get(url, _prose())
+
+    monkeypatch.setattr("later_ink.matins.queue._fetch_page", fake)
+
+
+def test_user_picks_print_before_curator_picks_and_are_never_crowded_out(client, monkeypatch):
+    _serve_pages(monkeypatch)
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.ensure_delivery(secret, schedule="07:00", timezone="UTC", email=None)
+    store.set_issue_limits(
+        secret, max_articles=None, max_per_feed=None, max_words=None, window_hours=None, max_saved=3
+    )
+    for n in range(2):
+        store.save_url(secret, f"https://u.example/{n}", f"User {n}")
+    for n in range(4):
+        store.save_url(secret, f"https://c.example/{n}", f"Curator {n}", origin="curator")
+
+    client.post(f"/{secret}/issues/build", data={"csrf": _csrf(client, secret)})
+    left = {item.url for item in store.list_saved(secret)}
+    assert not {f"https://u.example/{n}" for n in range(2)} & left
+    # Newest curator pick took the one slot left; three wait.
+    assert "https://c.example/3" not in left
+    assert len(left) == 3
+
+
+def test_a_failed_fetch_does_not_cost_a_slot(client, monkeypatch):
+    async def fake(url):
+        return None if "dead" in url else _prose()
+
+    monkeypatch.setattr("later_ink.matins.queue._fetch_page", fake)
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.ensure_delivery(secret, schedule="07:00", timezone="UTC", email=None)
+    store.set_issue_limits(
+        secret, max_articles=None, max_per_feed=None, max_words=None, window_hours=None, max_saved=1
+    )
+    store.save_url(secret, "https://x.example/dead", "Dead")
+    store.save_url(secret, "https://x.example/alive", "Alive")
+    client.post(f"/{secret}/issues/build", data={"csrf": _csrf(client, secret)})
+    assert [item.title for item in store.list_saved(secret)] == ["Dead"]
+
+
+def test_the_real_word_count_decides_what_fits(client, monkeypatch):
+    _serve_pages(monkeypatch)
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.ensure_delivery(secret, schedule="07:00", timezone="UTC", email=None)
+    store.set_issue_limits(
+        secret, max_articles=None, max_per_feed=None, max_words=500, window_hours=None, max_saved=None
+    )
+    for n in range(3):
+        store.save_url(secret, f"https://x.example/{n}", f"N{n}")
+    client.post(f"/{secret}/issues/build", data={"csrf": _csrf(client, secret)})
+    assert store.list_issues(secret)[0].word_count <= 500 or store.list_issues(secret)[0].article_count == 1
+    assert store.list_saved(secret)
+
+
+def test_a_blocked_queue_item_prints_the_lede_not_the_wall(client, monkeypatch):
+    wall = (
+        "<html><body><h1>Client Challenge</h1><p>JavaScript is disabled in your browser. "
+        "A required part of this site couldn\u2019t load. " + "Please check your connection. " * 12 +
+        "</p></body></html>"
+    )
+    _serve_pages(monkeypatch, {"https://lemonde.example/a": wall, "https://lemonde.example/b": wall})
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.save_url(secret, "https://lemonde.example/a", "A", lede="The real lede.")
+    store.save_url(secret, "https://lemonde.example/b", "B")
+    reader = asyncio.run(main._tenant_connector(secret))
+    queue = reader.sources["later"]
+    items = {i.title: i for i in store.list_saved(secret)}
+
+    _, html = asyncio.run(queue.get_article_html(str(items["A"].id)))
+    assert "The real lede." in html and "required part" not in html
+
+    from later_ink.connectors.base import ArticleUnavailable
+
+    with pytest.raises(ArticleUnavailable):
+        asyncio.run(queue.get_article_html(str(items["B"].id)))
+
+
+def test_a_long_article_quoting_a_block_phrase_is_not_a_wall():
+    from later_ink.matins.extract import looks_blocked
+
+    assert not looks_blocked("<p>" + "word " * 500 + "access denied</p>")
+    assert looks_blocked("<p>Access denied</p>")
+
+
+def test_a_forum_page_prints_the_post_and_the_first_replies_only():
+    reply = "This is a considered reply with quite a few words in it, enough to count here. "
+    rows = "".join(
+        f'<table><tr><td class="default"><div class="comment"><div class="commtext">{reply}{n}</div></div></td></tr></table>'
+        for n in range(40)
+    )
+    raw = (
+        '<html><body><table><tr><td><div class="toptext">'
+        + "<p>Which television respects my privacy? " + "I would like one without tracking. " * 8 + "</p>"
+        + f"</div></td></tr></table>{rows}</body></html>"
+    )
+    html = html_to_content(raw, "https://forum.example/1")
+    assert "From the discussion" in html
+    assert html.count("<blockquote>") == 8
+    assert "32 more replies" in html
+    assert "<table" not in html
+
+
+def test_recaps_are_listed_for_long_items_and_printed_first(client, monkeypatch):
+    _serve_pages(monkeypatch, {"https://x.example/long": _prose(6000)})
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.save_url(secret, "https://x.example/short", "Short")
+    store.save_url(secret, "https://x.example/long", "Long")
+
+    listed = client.get("/api/v1/items/long", headers=_api(secret)).json()["items"]
+    assert [row["title"] for row in listed] == ["Long"]
+
+    item = listed[0]["id"]
+    assert client.put(
+        f"/api/v1/items/{item}/recap", json={"recap": "In <short>."}, headers=_api(secret)
+    ).status_code == 204
+    assert client.get("/api/v1/items/long", headers=_api(secret)).json()["items"] == []
+    reader = asyncio.run(main._tenant_connector(secret))
+    _, html = asyncio.run(reader.sources["later"].get_article_html(str(item)))
+    assert html.startswith("<blockquote><p><strong>Recap</strong>")
+    assert "In &lt;short&gt;." in html
+
+
+def test_api_marks_curator_picks_and_a_user_pick_outranks_them(client):
+    secret = _signup_without_readwise(client)
+    body = {"url": "https://x.example/a", "origin": "curator", "lede": "L"}
+    assert client.post("/api/v1/items", json=body, headers=_api(secret)).status_code == 201
+    store = client.app.state.matins
+    assert store.list_saved(secret)[0].origin == "curator"
+    store.save_url(secret, "https://x.example/a")
+    assert store.list_saved(secret)[0].origin == "user"
+    client.post("/api/v1/items", json=body, headers=_api(secret))
+    assert store.list_saved(secret)[0].origin == "user"
+    assert client.post(
+        "/api/v1/items", json={"url": "https://x.example/b", "origin": "x"}, headers=_api(secret)
+    ).status_code == 400
+
+
+def test_queued_status_includes_items_read_in_the_reader(client):
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.save_url(secret, "https://x.example/a", "A")
+    item = store.list_saved(secret)[0]
+    store.mark_read(secret, f"saved:{item.id}")
+    rows = client.get("/api/v1/items?status=queued", headers=_api(secret)).json()["items"]
+    assert [row["url"] for row in rows] == ["https://x.example/a"]
+
+
+def test_signed_in_home_goes_to_the_app(client):
+    secret = _signup_without_readwise(client)
+    client.get(f"/{secret}/", headers=HTML)
+    landing = client.get("/", headers=HTML, follow_redirects=False)
+    assert landing.status_code == 303 and landing.headers["location"] == f"/{secret}/"
+    assert "Clone me" in client.get("/?about=1", headers=HTML).text
+
+    _add_feed(client, secret)
+    home = client.get(f"/{secret}/", headers=HTML, follow_redirects=False)
+    assert home.headers["location"] == f"/{secret}/read"
+
+
+def test_settings_offer_the_shortcut_and_it_is_served(client):
+    secret = _signup_without_readwise(client)
+    page = client.get(f"/{secret}/settings", headers=HTML).text
+    assert 'data-copy="#send-address" href="/assets/send-to-matins.shortcut"' in page
+    file = client.get("/assets/send-to-matins.shortcut")
+    assert file.status_code == 200 and file.content[:4] == b"AEA1"
+
+
+def test_max_saved_is_a_setting(client):
+    secret = _signup_without_readwise(client)
+    client.post(
+        f"/{secret}/settings",
+        data={"csrf": _csrf(client, secret), "schedule": "07:00", "enabled": "1", "max_saved": "25"},
+        follow_redirects=False,
+    )
+    assert client.app.state.matins.get_delivery(secret).max_saved == 25

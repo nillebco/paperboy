@@ -494,6 +494,11 @@ async def landing(request: Request, background_tasks: BackgroundTasks):
             request.headers.get("referer"),
             ua[:300] if ua else None,
         )
+    # Someone already signed in wants their paper, not the pitch for it.
+    if _wants_html(request) and "about" not in request.query_params:
+        for secret in matins_catalogues.read(request):
+            if app.state.store.get_token(secret) is not None:
+                return RedirectResponse(f"/{secret}/", status_code=303)
     return matins_pages.landing_page(
         payment_link=config.get_stripe_payment_link(),
         free_signup=config.allow_free_signup(),
@@ -547,6 +552,17 @@ async def league_spartan_font():
         _FONT_PATH,
         media_type="font/ttf",
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@app.api_route("/assets/send-to-matins.shortcut", methods=["GET", "HEAD"])
+async def send_to_matins_shortcut():
+    # Signed once on a Mac (`shortcuts sign`, scripts/build_shortcut.py): iOS
+    # refuses unsigned files. It holds no secret; it asks for the address on import.
+    return FileResponse(
+        os.path.join(_ASSETS_DIR, "send-to-matins.shortcut"),
+        media_type="application/octet-stream",
+        filename="Send to Matins.shortcut",
     )
 
 
@@ -834,6 +850,12 @@ async def tenant_delete(secret: str, request: Request, csrf: str | None = Form(N
 async def tenant_root(secret: str, request: Request):
     _resolve_secret(secret, request)
     if _wants_html(request):
+        # The dashboard is onboarding. Once there is something to read, home is
+        # the Reader.
+        if matins_routes.has_content(request, secret):
+            response = RedirectResponse(f"/{secret}/read", status_code=303)
+            matins_catalogues.remember(secret, request, response)
+            return response
         response = HTMLResponse(
             await matins_routes.dashboard(
                 request,

@@ -50,6 +50,13 @@ class SavedItem:
     # the page, which is the only way to queue something unfetchable.
     content: str | None = None
     consumed_by: str | None = None
+    # "user" for anything a person picked, "curator" for an agent's picks. User
+    # picks print first; a curator's picks only fill what is left.
+    origin: str = "user"
+    # The feed's own summary: what prints when the page itself cannot be fetched.
+    lede: str | None = None
+    # Short summary printed above a very long article.
+    recap: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +83,7 @@ class Delivery:
     max_articles: int | None = None
     max_per_feed: int | None = None
     max_words: int | None = None
+    max_saved: int | None = None
     window_hours: int | None = None
     # Automatic: compose from feeds + queue. Curated: print only the queue.
     auto_select: bool = True
@@ -207,6 +215,9 @@ class MatinsStore:
                 "CREATE INDEX IF NOT EXISTS saved_pending ON saved (secret, consumed_by)"
             )
             _ensure_column(conn, "saved", "content", "TEXT")
+            _ensure_column(conn, "saved", "origin", "TEXT NOT NULL DEFAULT 'user'")
+            _ensure_column(conn, "saved", "lede", "TEXT")
+            _ensure_column(conn, "saved", "recap", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS issues (
@@ -298,7 +309,7 @@ class MatinsStore:
                 )
                 """
             )
-            for column in ("max_articles", "max_per_feed", "max_words", "window_hours"):
+            for column in ("max_articles", "max_per_feed", "max_words", "window_hours", "max_saved"):
                 _ensure_column(conn, "delivery", column, "INTEGER")
             _ensure_column(conn, "delivery", "auto_select", "INTEGER NOT NULL DEFAULT 1")
             # Articles the user took out of the next issue. Kept with their title
@@ -487,12 +498,21 @@ class MatinsStore:
     # -------------------------------------------------------- saved queue
 
     def save_url(
-        self, secret: str, url: str, title: str | None = None, content: str | None = None
+        self,
+        secret: str,
+        url: str,
+        title: str | None = None,
+        content: str | None = None,
+        *,
+        origin: str = "user",
+        lede: str | None = None,
     ) -> bool:
         """Queue a link. True if it was new, False if already queued.
 
         Re-saving a consumed link is allowed and re-queues it: the user's intent
-        is "put this back in", and silently ignoring that looks broken."""
+        is "put this back in", and silently ignoring that looks broken. A user
+        picking something the curator queued makes it theirs; the reverse never
+        demotes a user's pick."""
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT id, consumed_by FROM saved WHERE secret = ? AND url = ?",
@@ -500,18 +520,22 @@ class MatinsStore:
             ).fetchone()
             if row is None:
                 conn.execute(
-                    "INSERT INTO saved (secret, url, title, added_at, content)"
-                    " VALUES (?, ?, ?, ?, ?)",
-                    (secret, url, title, time.time(), content),
+                    "INSERT INTO saved (secret, url, title, added_at, content, origin, lede)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (secret, url, title, time.time(), content, origin, lede),
                 )
                 return True
             if row["consumed_by"] is not None:
                 conn.execute(
-                    "UPDATE saved SET consumed_by = NULL, added_at = ?, content = ?"
-                    " WHERE id = ?",
-                    (time.time(), content, row["id"]),
+                    "UPDATE saved SET consumed_by = NULL, added_at = ?, content = ?,"
+                    " origin = ?, lede = COALESCE(?, lede), recap = NULL WHERE id = ?",
+                    (time.time(), content, origin, lede, row["id"]),
                 )
                 return True
+            if origin == "user":
+                conn.execute("UPDATE saved SET origin = 'user' WHERE id = ?", (row["id"],))
+            if lede is not None:
+                conn.execute("UPDATE saved SET lede = ? WHERE id = ?", (lede, row["id"]))
             if content is not None:
                 # Re-saving a queued link with body text upgrades it: the agent
                 # may retry with more context than the first attempt had.
@@ -519,8 +543,19 @@ class MatinsStore:
                 return True
             return False
 
+    def set_saved_recap(self, secret: str, saved_id: int, recap: str | None) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE saved SET recap = ? WHERE secret = ? AND id = ?",
+                (recap, secret, saved_id),
+            )
+            return cur.rowcount > 0
+
     def list_saved(self, secret: str, include_consumed: bool = False) -> list[SavedItem]:
-        sql = "SELECT id, url, title, added_at, content, consumed_by FROM saved WHERE secret = ?"
+        sql = (
+            "SELECT id, url, title, added_at, content, consumed_by, origin, lede, recap"
+            " FROM saved WHERE secret = ?"
+        )
         if not include_consumed:
             sql += " AND consumed_by IS NULL"
         sql += " ORDER BY added_at"
@@ -534,6 +569,9 @@ class MatinsStore:
                 added_at=r["added_at"],
                 content=r["content"],
                 consumed_by=r["consumed_by"],
+                origin=r["origin"],
+                lede=r["lede"],
+                recap=r["recap"],
             )
             for r in rows
         ]
@@ -541,7 +579,7 @@ class MatinsStore:
     def get_saved(self, secret: str, saved_id: int) -> SavedItem | None:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT id, url, title, added_at, content FROM saved"
+                "SELECT id, url, title, added_at, content, origin, lede, recap FROM saved"
                 " WHERE secret = ? AND id = ?",
                 (secret, saved_id),
             ).fetchone()
@@ -553,6 +591,9 @@ class MatinsStore:
             title=row["title"],
             added_at=row["added_at"],
             content=row["content"],
+            origin=row["origin"],
+            lede=row["lede"],
+            recap=row["recap"],
         )
 
     # --------------------------------------------------------------- email
@@ -1248,12 +1289,13 @@ class MatinsStore:
         max_per_feed: int | None,
         max_words: int | None,
         window_hours: int | None,
+        max_saved: int | None = None,
     ) -> None:
         with self._conn() as conn:
             conn.execute(
                 "UPDATE delivery SET max_articles = ?, max_per_feed = ?, max_words = ?,"
-                " window_hours = ? WHERE secret = ?",
-                (max_articles, max_per_feed, max_words, window_hours, secret),
+                " window_hours = ?, max_saved = ? WHERE secret = ?",
+                (max_articles, max_per_feed, max_words, window_hours, max_saved, secret),
             )
 
     def get_delivery(self, secret: str) -> Delivery | None:
@@ -1385,6 +1427,7 @@ def _delivery(row: sqlite3.Row, fernet: Fernet) -> Delivery:
         max_per_feed=row["max_per_feed"],
         max_words=row["max_words"],
         window_hours=row["window_hours"],
+        max_saved=row["max_saved"],
         auto_select=bool(row["auto_select"]),
     )
 

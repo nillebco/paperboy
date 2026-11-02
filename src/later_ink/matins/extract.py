@@ -14,8 +14,10 @@ publish anyway.
 """
 
 import re
+from html import escape
 
 from lxml.html import HtmlElement, document_fromstring, tostring
+from readability import Document
 
 # Removed before scoring, not after: a page whose navigation is a third of its
 # text should not out-score the article for that reason.
@@ -53,6 +55,19 @@ _MIN_CANDIDATE_CHARS = 400
 # Below this, there is no article here — a paywall interstitial, a login page,
 # or a JS-only shell. The caller then keeps the feed's summary.
 _MIN_ARTICLE_CHARS = 200
+_MAX_WALL_WORDS = 400
+
+# A forum page is a short post above an endless thread: print the post and the
+# first few replies. Only a short body counts: a long article with comments below
+# is an article, and readability already leaves its comments out.
+_COMMENT_CLASS = re.compile(r"^(comment|commtext|comment[-_](body|content|text))$", re.I)
+_MIN_COMMENTS = 5
+_MAX_COMMENTS = 8
+_MIN_COMMENT_WORDS = 15
+_MAX_DISCUSSION_BODY_WORDS = 300
+# Readability sometimes keeps one paragraph of a page: below this share of what
+# the wider heuristic found, trust the heuristic.
+_MIN_READABLE_SHARE = 0.2
 
 _WS = re.compile(r"[ \t\r\f\v]+")
 _BLANK_LINES = re.compile(r"\n{3,}")
@@ -68,6 +83,7 @@ _BLOCK_MARKERS = (
     "javascript is disabled",
     "access denied",
     "just a moment...",
+    "enable javascript and cookies",
     "verify you are human",
     "unusual traffic",
 )
@@ -75,7 +91,10 @@ _BLOCK_MARKERS = (
 
 def looks_blocked(raw: str) -> bool:
     """True when a fetched page is a wall, not an article."""
-    text = visible_text(raw).casefold()
+    text = visible_text(raw).casefold().replace("\u2019", "'")
+    # A wall is short. A long article may well quote "access denied".
+    if len(text.split()) > _MAX_WALL_WORDS:
+        return False
     return any(marker in text for marker in _BLOCK_MARKERS)
 
 
@@ -113,6 +132,57 @@ def html_to_content(raw: str, base_url: str) -> str | None:
         # A malformed <base> should cost us absolute links, not the article.
         pass
 
+    readable = _readable(doc)
+    replies = _replies(doc)
+    if len(replies) >= _MIN_COMMENTS and word_count(readable or "<p></p>") <= _MAX_DISCUSSION_BODY_WORDS:
+        return (readable or "") + _discussion(replies)
+
+    heuristic = _heuristic(doc)
+    if readable and len(visible_text(readable)) >= _MIN_ARTICLE_CHARS:
+        if not heuristic or word_count(readable) >= _MIN_READABLE_SHARE * word_count(heuristic):
+            return readable
+    return heuristic
+
+
+def _readable(doc: HtmlElement) -> str | None:
+    """The article as Mozilla's Readability algorithm sees it: no share bars,
+    no navigation, and layout tables gone."""
+    try:
+        return Document(tostring(doc, encoding="unicode")).summary(html_partial=True)
+    except Exception:  # noqa: BLE001 - any failure here just means the fallback
+        return None
+
+
+def _replies(doc: HtmlElement) -> list[str]:
+    """Comment texts in page order, innermost element only, skipping one-liners."""
+    found = []
+    for el in doc.iter():
+        if not isinstance(el.tag, str):
+            continue
+        if not any(_COMMENT_CLASS.match(token) for token in (el.get("class") or "").split()):
+            continue
+        nested = any(
+            _COMMENT_CLASS.match(token)
+            for child in el.iterdescendants()
+            if isinstance(child.tag, str)
+            for token in (child.get("class") or "").split()
+        )
+        if not nested:
+            found.append(_WS.sub(" ", el.text_content()).strip())
+    return [text for text in found if len(text.split()) >= _MIN_COMMENT_WORDS]
+
+
+def _discussion(replies: list[str]) -> str:
+    quotes = "".join(
+        f"<blockquote><p>{escape(text)}</p></blockquote>" for text in replies[:_MAX_COMMENTS]
+    )
+    more = len(replies) - _MAX_COMMENTS
+    tail = f"<p><em>{more} more replies at the source.</em></p>" if more > 0 else ""
+    return f"<h3>From the discussion</h3>{quotes}{tail}"
+
+
+def _heuristic(doc: HtmlElement) -> str | None:
+    """Largest text container. Used when readability finds next to nothing."""
     _drop(doc)
 
     best: HtmlElement | None = None

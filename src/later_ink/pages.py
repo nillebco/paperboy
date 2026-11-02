@@ -354,7 +354,9 @@ _COPY_JS = (
     "if(!b)return;ev.preventDefault();"
     "var el=document.querySelector(b.getAttribute('data-copy'));if(!el)return;"
     "var text=(el.value!=null&&el.tagName==='INPUT')?el.value:el.textContent.trim();"
-    "copy(text).then(function(ok){say(b,ok?'Copied':'Select and copy');});"
+    "copy(text).then(function(ok){say(b,ok?'Copied':'Select and copy');"
+    # A link with data-copy copies, then goes where it points.
+    "if(b.tagName==='A'&&b.href)location.href=b.href;});"
     "});}());"
 )
 

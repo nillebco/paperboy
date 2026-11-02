@@ -215,13 +215,12 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 """
 
 _NAV = (
-    ("home", "Home", ""),
-    ("next", "Next issue", "issues/preview"),
-    ("feeds", "Feeds", "feeds"),
-    ("issues", "Issues", "issues/"),
     ("read", "Reader", "read"),
+    ("issues", "Issues", "issues/"),
     ("settings", "Settings", "settings"),
 )
+# Pages without a tab of their own light up the section they belong to.
+_NAV_SECTION = {"next": "issues", "feeds": "settings"}
 
 
 def _document(title: str, body: str, *, head: str = "") -> str:
@@ -263,6 +262,7 @@ def _shell(
     `wide` is for the Reader: a mailbox needs the screen width, while prose
     pages stay at the reading measure."""
     base = f"/{escape(secret)}/"
+    active = _NAV_SECTION.get(active, active)
     links = "".join(
         f'<a href="{base}{path}"{" aria-current=page" if key == active else ""}>{label}</a>'
         for key, label, path in _NAV
@@ -912,9 +912,13 @@ itself as soon as the EPUB is ready.</p>
 def issues_page(
     *,
     secret: str,
+    csrf: str,
     issues: list[dict],
     timezone: str,
     retention: int,
+    schedule_label: str | None,
+    queued: int,
+    failing: list[str],
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
@@ -934,12 +938,34 @@ def issues_page(
     else:
         listing = f"""<div class="card"><p>No issues yet.</p>
 <div class="actions"><a class="btn primary" href="{base}/issues/preview">Review the next issue</a></div></div>"""
-    keeps = f"The latest {retention} are kept. " if retention else ""
+    keeps = f"The latest {retention} are kept." if retention else ""
+    when = (
+        escape(schedule_label)
+        if schedule_label
+        else f'Automatic issues are off · <a href="{base}/settings#schedule">Change</a>'
+    )
+    trouble = ""
+    if failing:
+        names = ", ".join(escape(name) for name in failing[:3])
+        more = f" and {len(failing) - 3} more" if len(failing) > 3 else ""
+        trouble = (
+            f'<p class="flash err">{_plural(len(failing), "feed")} failing: {names}{more}. '
+            f'<a href="{base}/feeds">Check your feeds</a></p>'
+        )
     body = f"""
 <h1>Issues</h1>
-<p class="lede">{keeps}Your e-reader sees the same list under
-<a href="{base}/settings#reader">Issues in its catalogue</a>.</p>
+{trouble}
+<div class="card lead">
+  <p class="eyebrow">Next issue</p>
+  <p class="headline">{when}</p>
+  <p class="meta">{_plural(queued, "article")} queued</p>
+  <div class="actions">
+    <a class="btn" href="{base}/issues/preview">Review</a>
+    {_button(f"{base}/issues/build", csrf, "Compose now")}
+  </div>
+</div>
 {listing}
+<p class="hint">{keeps}</p>
 """
     return _shell(secret, "issues", "Issues", body, notice=notice, error=error)
 
@@ -1041,6 +1067,7 @@ def settings_page(
         _number(key, label, limits.get(key), defaults[key], *bounds[key])
         for key, label in (
             ("max_articles", "Articles per issue"),
+            ("max_saved", "Queued articles per issue"),
             ("max_per_feed", "Articles per feed"),
             ("max_words", "Words per issue"),
             ("window_hours", "Look back (hours)"),
@@ -1048,7 +1075,23 @@ def settings_page(
     )
     body = f"""
 <h1>Settings</h1>
-<p class="lede">How and when your paper is made.</p>
+
+<div class="card">
+  <div class="row"><div class="row-main">
+    <a class="row-title" href="{base}/feeds">Feeds</a>
+    <span class="row-sub">What you can browse in the Reader.</span>
+  </div></div>
+</div>
+
+<h2 id="send-to">Send to Matins</h2>
+<div class="card">
+  <p class="small">Adds a share-sheet action on iPhone and iPad: share any link to your next
+  issue. The button copies your address; paste it when Shortcuts asks.</p>
+  <span class="url url-block" id="send-address">{catalog_url}</span>
+  <div class="actions">
+    <a class="btn primary" data-copy="#send-address" href="/assets/send-to-matins.shortcut">Add the Shortcut</a>
+  </div>
+</div>
 
 <form method="post" action="{base}/settings" id="settings">
   {_csrf(csrf)}
@@ -1083,7 +1126,8 @@ def settings_page(
     <p class="hint">Blank uses the default shown. Nothing is printed twice.</p>
   </div>
 
-  <h2 id="account">Account and notifications</h2>
+  <details id="account"{" open" if not email else ""}>
+  <summary><h2 style="display:inline">Account and notifications</h2></summary>
   <div class="card">
     <label for="email" style="margin-top:0">Email</label>
     <input type="email" id="email" name="email" value="{escape(email)}" placeholder="you@example.com">
@@ -1104,6 +1148,7 @@ def settings_page(
       {'<button class="btn tiny" type="submit" form="test-webhook">Send a test webhook</button>' if webhook_url else ""}
     </div>
   </div>
+  </details>
 
   <div class="actions"><button class="btn primary" type="submit">Save settings</button></div>
 </form>
@@ -1126,7 +1171,8 @@ def settings_page(
   {_copy_button("issues-url", "Copy", style="tiny")}</p>
 </div>
 
-<h2 id="access">Access</h2>
+<details id="access">
+<summary><h2 style="display:inline">Access</h2></summary>
 <div class="card">
   <div class="row"><div class="row-main">
     <span class="row-title">Get a new address</span>
@@ -1147,6 +1193,8 @@ def settings_page(
     {_confirm("Delete", "This cannot be undone.", f"{base}/delete", csrf, "Yes, delete everything")}
   </div></div>
 </div>
+</details>
+<p class="hint"><a href="/?about=1">About Matins</a></p>
 """
     return _shell(
         secret,

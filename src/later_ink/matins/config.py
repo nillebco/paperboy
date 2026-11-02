@@ -52,6 +52,11 @@ def get_issue_max_words() -> int:
     return _int("ISSUE_MAX_WORDS", 12000, minimum=500)
 
 
+def get_recap_min_words() -> int:
+    """Only an article this long gets a recap above it."""
+    return _int("ISSUE_RECAP_MIN_WORDS", 4000, minimum=500)
+
+
 def get_issue_max_saved() -> int:
     return _int("ISSUE_MAX_SAVED", 10, minimum=0)
 

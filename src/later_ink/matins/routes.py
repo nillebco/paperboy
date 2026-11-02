@@ -61,6 +61,7 @@ LIMIT_BOUNDS = {
     "max_per_feed": (1, 50),
     "max_words": (500, 200_000),
     "window_hours": (1, 720),
+    "max_saved": (1, 100),
 }
 
 # Sign-in codes: six digits, ten minutes, five tries, one send a minute.
@@ -917,7 +918,9 @@ async def reader_queue(
     if item["kind"] == "candidate":
         candidate = _store(request).get_candidate(secret, article_id.split(":", 1)[1])
         content = candidate.content if candidate else None
-    _store(request).save_url(secret, item["url"], item["title"], content=content)
+    reader = await _reader(request, secret)
+    lede = await reader.sources["later"].lede_for(item["url"])
+    _store(request).save_url(secret, item["url"], item["title"], content=content, lede=lede)
     return RedirectResponse(_read_href(secret, view, article_id, source=source or None, issue=issue or None), status_code=303)
 
 
@@ -1205,6 +1208,7 @@ async def settings_post(
     max_per_feed: str = Form(""),
     max_words: str = Form(""),
     window_hours: str = Form(""),
+    max_saved: str = Form(""),
     auto_select: str = Form("1"),
 ):
     """Schedule, limits and notifications. Sources have their own page."""
@@ -1224,6 +1228,7 @@ async def settings_post(
             "max_per_feed": max_per_feed,
             "max_words": max_words,
             "window_hours": window_hours,
+            "max_saved": max_saved,
         },
     }
     schedule = _normalize_schedule(schedule) or config.get_default_schedule()
@@ -1450,9 +1455,13 @@ async def issues_feed(secret: str, request: Request):
         return _html(
             pages.issues_page(
                 secret=secret,
+                csrf=_csrf_token(secret),
                 issues=[_issue_row(issue) for issue in issues],
                 timezone=_timezone(request, secret),
                 retention=config.get_issue_retention(),
+                schedule_label=_schedule_label(request, secret),
+                queued=len(_store(request).list_saved(secret)),
+                failing=[f["title"] for f in _feed_rows(request, secret) if f["error"]],
                 notice=request.query_params.get("notice"),
                 error=request.query_params.get("error"),
             )
@@ -1632,6 +1641,12 @@ def _composed(secret: str):
         to=f"issues/{issue.id}",
         notice=f"Composed, with {_count(issue.article_count, 'article')}.",
     )
+
+
+def has_content(request: Request, secret: str) -> bool:
+    """Past onboarding: this catalogue has something to read."""
+    store = _store(request)
+    return bool(store.list_feeds(secret) or _service(request).issues_for(secret))
 
 
 async def dashboard(

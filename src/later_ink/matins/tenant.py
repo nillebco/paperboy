@@ -161,9 +161,10 @@ def build_tenant_reader(
     secret: str, readwise_token: str | None, store: MatinsStore
 ) -> TenantReader:
     """Sources for one user. Readwise appears only when a token was stored."""
+    feeds = RssConnector(store, secret)
     sources: dict[str, Connector] = {
-        "later": QueueConnector(store, secret),
-        "rss": RssConnector(store, secret),
+        "later": QueueConnector(store, secret, find_lede=feeds.lede_for),
+        "rss": feeds,
     }
     if readwise_token:
         sources["readwise"] = ReadwiseConnector(

@@ -8,7 +8,9 @@ builder exactly like a feed does.
 """
 
 import re
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from html import escape
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -31,9 +33,15 @@ class QueueConnector(Connector):
     name = "later"
     description = "Saved for later"
 
-    def __init__(self, store: MatinsStore, secret: str):
+    def __init__(
+        self,
+        store: MatinsStore,
+        secret: str,
+        find_lede: Callable[[str], Awaitable[str | None]] | None = None,
+    ):
         self._store = store
         self._secret = secret
+        self._find_lede = find_lede
 
     async def list_folders(self) -> list[Folder]:
         pending = len(self._store.list_saved(self._secret))
@@ -50,9 +58,17 @@ class QueueConnector(Connector):
     ) -> tuple[list[Article], str | None]:
         if folder_id != INBOX:
             raise UpstreamError("Unknown folder", 404)
-        # Newest first: a saved link is most interesting right after saving it.
-        items = list(reversed(self._store.list_saved(self._secret)))
-        return [_article(item) for item in items], None
+        # What a person picked leads, oldest first, so a pick can never be pushed
+        # out by newer ones. The curator's picks follow, newest first: it queues
+        # its worst pick first, so the best one prints first.
+        saved = self._store.list_saved(self._secret)
+        picked = [item for item in saved if item.origin != "curator"]
+        curated = [item for item in reversed(saved) if item.origin == "curator"]
+        return [_article(item) for item in picked + curated], None
+
+    async def lede_for(self, url: str) -> str | None:
+        """The summary a subscribed feed carries for this link, if any."""
+        return await self._find_lede(url) if self._find_lede else None
 
     async def get_article_html(self, article_id: str) -> tuple[Article, str]:
         try:
@@ -65,14 +81,28 @@ class QueueConnector(Connector):
         if item.content:
             # Supplied by the caller (API/agent): trust it as text, but it still
             # goes through the same sanitising EPUB path as fetched HTML.
-            return _article(item), item.content
+            return _article(item), _with_recap(item.recap, item.content)
         page = await _fetch_page(item.url)
-        content = extract.html_to_content(page, item.url) if page else None
+        # A wall (paywall, consent shell, JS challenge) is not an article.
+        blocked = page is not None and extract.looks_blocked(page)
+        content = extract.html_to_content(page, item.url) if page and not blocked else None
         if not content:
-            raise ArticleUnavailable(
-                "Could not extract that page; open it at the source", 422
-            )
-        return _article(item), content
+            lede = item.lede or await self.lede_for(item.url)
+            if not lede:
+                raise ArticleUnavailable(
+                    "Could not extract that page; open it at the source", 422
+                )
+            content = f"<p>{escape(extract.visible_text(lede))}</p>"
+        return _article(item), _with_recap(item.recap, content)
+
+
+def _with_recap(recap: str | None, html: str) -> str:
+    if not recap:
+        return html
+    paragraphs = "".join(
+        f"<p>{escape(line.strip())}</p>" for line in recap.splitlines() if line.strip()
+    )
+    return f"<blockquote><p><strong>Recap</strong></p>{paragraphs}</blockquote><hr/>{html}"
 
 
 def _article(item: SavedItem) -> Article:

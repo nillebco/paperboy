@@ -494,6 +494,18 @@ class RssConnector(Connector):
             self._store.rename_feed(self._secret, feed.id, parsed.title[:120])
         return parsed
 
+    async def lede_for(self, url: str) -> str | None:
+        """The summary a subscribed feed carries for this article link."""
+        for feed in self._store.list_feeds(self._secret):
+            try:
+                parsed = await self._load(feed)
+            except UpstreamError:
+                continue
+            for item in parsed.items:
+                if item.link == url:
+                    return item.summary or item.content_html or None
+        return None
+
     async def _fetch_page(self, url: str, *, cookie: str | None = None) -> str | None:
         async with httpx.AsyncClient() as client:
             result = await fetch_bytes(
