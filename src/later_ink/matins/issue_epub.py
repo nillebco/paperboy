@@ -53,6 +53,9 @@ class IssueItem:
     source_url: str | None = None
     image_url: str | None = None
     word_count: int = 0
+    # Shown instead of the issue date; empty when the source gives no date.
+    published: str = ""
+    show_dates: bool = False
 
 
 @dataclass
@@ -201,6 +204,9 @@ _ISSUE_CSS = (
 
 
 def _masthead(item: IssueItem, issue_date: datetime) -> str:
+    if item.show_dates:
+        parts = [part for part in (item.section, item.published) if part]
+        return f'<p class="matins-meta">{escape(" — ".join(parts))}</p>' if parts else ""
     section = f"{escape(item.section)} — " if item.section else ""
     return f'<p class="matins-meta">{section}{issue_date:%A %d %B %Y}</p>'
 

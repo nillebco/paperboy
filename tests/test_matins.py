@@ -947,7 +947,7 @@ def test_queueing_does_not_move_a_row_in_the_list(client):
     assert re.search(
         r'class="row queued">\s*<div class="row-main">\s*'
         r'<a class="row-title"[^>]*>First story</a>\s*'
-        r'<span class="row-sub">Example Feed · \d+ minute'
+        r'<span class="row-sub">Example Feed(?: · \d+ \w+ \d{4})? · \d+ minute'
         r'<span class="row-badge">Next issue</span></span>',
         queued,
     )
@@ -1063,11 +1063,11 @@ def test_reading_time_is_hidden_when_only_a_summary_is_known(client):
 
     # First story ships content:encoded; Second story only a two-word summary.
     assert re.search(
-        r'First story</a>\s*<span class="row-sub">Example Feed · \d+ minute',
+        r'First story</a>\s*<span class="row-sub">Example Feed(?: · \d+ \w+ \d{4})? · \d+ minute',
         page.text,
     )
     assert re.search(
-        r'Second story</a>\s*<span class="row-sub">Example Feed</span>', page.text
+        r'Second story</a>\s*<span class="row-sub">Example Feed(?: · \d+ \w+ \d{4})?</span>', page.text
     )
 
 
@@ -2200,3 +2200,43 @@ def test_a_selected_article_opens_as_a_closable_overlay(client):
     assert 'class="reader-pane-col open" role="dialog"' in page
     assert f'<a class="btn tiny" href="/{secret}/read' in page and "✕ Close" in page
     assert "reader-pane-col open" not in client.get(f"/{secret}/read", headers=HTML).text
+
+
+def test_publication_dates_show_only_when_the_source_states_one(client, monkeypatch):
+    from datetime import timedelta
+
+    from later_ink.matins.issues import published_label
+
+    assert published_label(None, "Europe/Paris") == ""
+    # 23:30 UTC is already the next day in Paris.
+    assert published_label(datetime(2026, 11, 1, 23, 30), "Europe/Paris") == "2 Nov 2026"
+
+    _serve_pages(monkeypatch)
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.ensure_delivery(secret, schedule="07:00", timezone="UTC", email=None)
+    stamp = (datetime(2026, 3, 4, 12, tzinfo=UTC)).timestamp()
+    store.save_url(secret, "https://x.example/dated", "Dated", published=stamp)
+    store.save_url(secret, "https://x.example/undated", "Undated")
+
+    rows = client.get(f"/{secret}/read", headers=HTML).text
+    assert "4 Mar 2026" in rows
+    today = datetime.now(UTC)
+    assert f"{today.day} {today:%b %Y}" not in rows
+    assert f"{(today - timedelta(days=0)):%d %b}" not in rows
+    assert " ago" not in rows
+
+    store.set_show_dates(secret, False)
+    assert "4 Mar 2026" not in client.get(f"/{secret}/read", headers=HTML).text
+
+
+def test_an_issue_prints_the_publication_date_not_a_stand_in():
+    from later_ink.matins.issue_epub import _masthead
+
+    when = datetime(2026, 11, 2)
+    dated = IssueItem(title="T", html="", section="Le Monde", published="1 Nov 2026", show_dates=True)
+    assert "Le Monde — 1 Nov 2026" in _masthead(dated, when)
+    bare = IssueItem(title="T", html="", section="Saved", show_dates=True)
+    assert "2026" not in _masthead(bare, when)
+    off = IssueItem(title="T", html="", section="Le Monde", published="1 Nov 2026")
+    assert "Monday 02 November 2026" in _masthead(off, when)

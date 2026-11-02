@@ -290,6 +290,7 @@ def make_article(feed: Feed, item: FeedItem) -> Article:
         category="article",
         image_url=item.image_url,
         content_date=item.published,
+        published=item.published,
     )
 
 
@@ -504,6 +505,18 @@ class RssConnector(Connector):
             for item in parsed.items:
                 if item.link == url:
                     return item.summary or item.content_html or None
+        return None
+
+    async def published_for(self, url: str) -> datetime | None:
+        """The publication date a subscribed feed carries for this link, if any."""
+        for feed in self._store.list_feeds(self._secret):
+            try:
+                parsed = await self._load(feed)
+            except UpstreamError:
+                continue
+            for item in parsed.items:
+                if item.link == url:
+                    return item.published
         return None
 
     async def _fetch_page(self, url: str, *, cookie: str | None = None) -> str | None:

@@ -57,6 +57,8 @@ class SavedItem:
     lede: str | None = None
     # Short summary printed above a very long article.
     recap: str | None = None
+    # Epoch seconds, from the feed. None when the source gives no date.
+    published: float | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ class Delivery:
     window_hours: int | None = None
     # Automatic: compose from feeds + queue. Curated: print only the queue.
     auto_select: bool = True
+    show_dates: bool = True
 
 
 @dataclass(frozen=True)
@@ -218,6 +221,7 @@ class MatinsStore:
             _ensure_column(conn, "saved", "origin", "TEXT NOT NULL DEFAULT 'user'")
             _ensure_column(conn, "saved", "lede", "TEXT")
             _ensure_column(conn, "saved", "recap", "TEXT")
+            _ensure_column(conn, "saved", "published", "REAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS issues (
@@ -312,6 +316,7 @@ class MatinsStore:
             for column in ("max_articles", "max_per_feed", "max_words", "window_hours", "max_saved"):
                 _ensure_column(conn, "delivery", column, "INTEGER")
             _ensure_column(conn, "delivery", "auto_select", "INTEGER NOT NULL DEFAULT 1")
+            _ensure_column(conn, "delivery", "show_dates", "INTEGER NOT NULL DEFAULT 1")
             # Articles the user took out of the next issue. Kept with their title
             # so the list can offer "put it back" without refetching the feed.
             conn.execute(
@@ -506,6 +511,7 @@ class MatinsStore:
         *,
         origin: str = "user",
         lede: str | None = None,
+        published: float | None = None,
     ) -> bool:
         """Queue a link. True if it was new, False if already queued.
 
@@ -520,22 +526,25 @@ class MatinsStore:
             ).fetchone()
             if row is None:
                 conn.execute(
-                    "INSERT INTO saved (secret, url, title, added_at, content, origin, lede)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (secret, url, title, time.time(), content, origin, lede),
+                    "INSERT INTO saved (secret, url, title, added_at, content, origin, lede, published)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (secret, url, title, time.time(), content, origin, lede, published),
                 )
                 return True
             if row["consumed_by"] is not None:
                 conn.execute(
                     "UPDATE saved SET consumed_by = NULL, added_at = ?, content = ?,"
-                    " origin = ?, lede = COALESCE(?, lede), recap = NULL WHERE id = ?",
-                    (time.time(), content, origin, lede, row["id"]),
+                    " origin = ?, lede = COALESCE(?, lede), recap = NULL,"
+                    " published = COALESCE(?, published) WHERE id = ?",
+                    (time.time(), content, origin, lede, published, row["id"]),
                 )
                 return True
             if origin == "user":
                 conn.execute("UPDATE saved SET origin = 'user' WHERE id = ?", (row["id"],))
             if lede is not None:
                 conn.execute("UPDATE saved SET lede = ? WHERE id = ?", (lede, row["id"]))
+            if published is not None:
+                conn.execute("UPDATE saved SET published = ? WHERE id = ?", (published, row["id"]))
             if content is not None:
                 # Re-saving a queued link with body text upgrades it: the agent
                 # may retry with more context than the first attempt had.
@@ -553,7 +562,7 @@ class MatinsStore:
 
     def list_saved(self, secret: str, include_consumed: bool = False) -> list[SavedItem]:
         sql = (
-            "SELECT id, url, title, added_at, content, consumed_by, origin, lede, recap"
+            "SELECT id, url, title, added_at, content, consumed_by, origin, lede, recap, published"
             " FROM saved WHERE secret = ?"
         )
         if not include_consumed:
@@ -572,6 +581,7 @@ class MatinsStore:
                 origin=r["origin"],
                 lede=r["lede"],
                 recap=r["recap"],
+                published=r["published"],
             )
             for r in rows
         ]
@@ -579,7 +589,7 @@ class MatinsStore:
     def get_saved(self, secret: str, saved_id: int) -> SavedItem | None:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT id, url, title, added_at, content, origin, lede, recap FROM saved"
+                "SELECT id, url, title, added_at, content, origin, lede, recap, published FROM saved"
                 " WHERE secret = ? AND id = ?",
                 (secret, saved_id),
             ).fetchone()
@@ -594,6 +604,7 @@ class MatinsStore:
             origin=row["origin"],
             lede=row["lede"],
             recap=row["recap"],
+            published=row["published"],
         )
 
     # --------------------------------------------------------------- email
@@ -1274,6 +1285,13 @@ class MatinsStore:
                 "UPDATE delivery SET enabled = ? WHERE secret = ?", (int(enabled), secret)
             )
 
+    def set_show_dates(self, secret: str, enabled: bool) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE delivery SET show_dates = ? WHERE secret = ?",
+                (int(enabled), secret),
+            )
+
     def set_auto_select(self, secret: str, enabled: bool) -> None:
         with self._conn() as conn:
             conn.execute(
@@ -1429,6 +1447,7 @@ def _delivery(row: sqlite3.Row, fernet: Fernet) -> Delivery:
         window_hours=row["window_hours"],
         max_saved=row["max_saved"],
         auto_select=bool(row["auto_select"]),
+        show_dates=bool(row["show_dates"]),
     )
 
 

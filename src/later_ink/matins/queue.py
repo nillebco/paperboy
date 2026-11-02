@@ -113,6 +113,11 @@ def _article(item: SavedItem) -> Article:
         url=item.url,
         updated=datetime.fromtimestamp(item.added_at, tz=UTC).replace(tzinfo=None),
         content_date=datetime.fromtimestamp(item.added_at, tz=UTC).replace(tzinfo=None),
+        published=(
+            datetime.fromtimestamp(item.published, tz=UTC).replace(tzinfo=None)
+            if item.published
+            else None
+        ),
         category="saved",
     )
 

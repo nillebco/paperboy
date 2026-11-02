@@ -27,7 +27,14 @@ from .. import config as app_config
 from .. import opds
 from ..connectors.base import Article, ArticleUnavailable, UpstreamError
 from . import catalogues, config, extract, notify, pages, rss, webhooks
-from .issues import IssueLimits, IssueService, limits_for, local_day, next_run
+from .issues import (
+    IssueLimits,
+    IssueService,
+    limits_for,
+    local_day,
+    next_run,
+    published_label,
+)
 from .reader import to_page_html
 
 logger = logging.getLogger(__name__)
@@ -578,6 +585,9 @@ async def reader_index(
     store = _store(request)
     reader = await _reader(request, secret)
     stream = await _reader_items(request, secret)
+    delivery = _store(request).get_delivery(secret)
+    show_dates = delivery.show_dates if delivery else True
+    timezone = _timezone(request, secret)
     read = store.read_ids(secret, [entry[0] for entry in stream])
     urls = [getattr(entry[1], "url", "") or "" for entry in stream]
     ratings = store.signals_for(secret, [url for url in urls if url])
@@ -602,6 +612,13 @@ async def reader_index(
                 # the body is fetched, only a credible count gets an estimate.
                 "minutes": _reading_minutes(
                     getattr(source_article, "word_count", None) or 0
+                ),
+                # What the publisher states, or nothing. Never the time it was
+                # queued or fetched.
+                "published": (
+                    published_label(getattr(source_article, "published", None), timezone)
+                    if show_dates
+                    else ""
                 ),
                 "read": item_id in read,
                 "selected": False,
@@ -915,12 +932,19 @@ async def reader_queue(
     if item is None or not item["url"]:
         raise HTTPException(404, "No such article")
     content = None
+    candidate = None
     if item["kind"] == "candidate":
         candidate = _store(request).get_candidate(secret, article_id.split(":", 1)[1])
         content = candidate.content if candidate else None
     reader = await _reader(request, secret)
     lede = await reader.sources["later"].lede_for(item["url"])
-    _store(request).save_url(secret, item["url"], item["title"], content=content, lede=lede)
+    published = candidate.published if item["kind"] == "candidate" and candidate else None
+    if published is None and item["kind"] != "candidate":
+        date = await reader.sources["rss"].published_for(item["url"])
+        published = date.replace(tzinfo=UTC).timestamp() if date else None
+    _store(request).save_url(
+        secret, item["url"], item["title"], content=content, lede=lede, published=published
+    )
     return RedirectResponse(_read_href(secret, view, article_id, source=source or None, issue=issue or None), status_code=303)
 
 
@@ -1147,6 +1171,11 @@ async def _reader_items(request: Request, secret: str) -> list[tuple[str, object
             word_count=max(1, len((candidate.content or candidate.summary).split())),
             content_date=datetime.fromtimestamp(stamp, UTC).replace(tzinfo=None),
             signal_source=candidate.source,
+            published=(
+                datetime.fromtimestamp(candidate.published, UTC).replace(tzinfo=None)
+                if candidate.published
+                else None
+            ),
         )
         section = (
             f"Bluesky · {candidate.source}" if candidate.source else "Bluesky"
@@ -1210,6 +1239,7 @@ async def settings_post(
     window_hours: str = Form(""),
     max_saved: str = Form(""),
     auto_select: str = Form("1"),
+    show_dates: str = Form(""),
 ):
     """Schedule, limits and notifications. Sources have their own page."""
     _resolve(secret, request)
@@ -1223,6 +1253,7 @@ async def settings_post(
         "timezone": timezone,
         "enabled": bool(enabled),
         "auto_select": not curated,
+        "show_dates": bool(show_dates),
         "limits": {
             "max_articles": max_articles,
             "max_per_feed": max_per_feed,
@@ -1295,6 +1326,7 @@ async def settings_post(
     )
     _store(request).set_issue_limits(secret, **limits)
     _store(request).set_auto_select(secret, not curated)
+    _store(request).set_show_dates(secret, bool(show_dates))
     return RedirectResponse(f"/{secret}/settings?saved=1", status_code=303)
 
 
@@ -1840,6 +1872,7 @@ def _render_settings(
         "timezone": delivery.timezone if delivery else config.get_default_timezone(),
         "enabled": bool(delivery.enabled) if delivery else True,
         "auto_select": delivery.auto_select if delivery else True,
+        "show_dates": delivery.show_dates if delivery else True,
         "limits": {
             key: getattr(delivery, key, None) if delivery else None for key in LIMIT_BOUNDS
         },
@@ -1856,6 +1889,7 @@ def _render_settings(
         timezone=values["timezone"],
         enabled=values["enabled"],
         auto_select=values["auto_select"],
+        show_dates=values["show_dates"],
         webhook_secret_set=bool(delivery and delivery.webhook_secret),
         limits=values["limits"],
         defaults={key: getattr(defaults, key) for key in LIMIT_BOUNDS},

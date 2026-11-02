@@ -1061,6 +1061,7 @@ def settings_page(
     timezone: str,
     enabled: bool,
     auto_select: bool,
+    show_dates: bool,
     webhook_secret_set: bool,
     limits: dict,
     defaults: dict,
@@ -1138,6 +1139,10 @@ def settings_page(
     </select>
     <p class="hint">Curated keeps the feeds for browsing in the Reader; an issue is
     only what you or the curator put in the queue.</p>
+    <label class="check">
+      <input type="checkbox" name="show_dates" value="1" {"checked" if show_dates else ""}>
+      <span>Show publication dates in the Reader and in issues</span>
+    </label>
     <div class="grid2">{limit_fields}</div>
     <p class="hint">Blank uses the default shown. Nothing is printed twice.</p>
   </div>
@@ -1342,10 +1347,11 @@ def _reader_row(
     queued = " queued" if item["saved"] else ""
     badge = '<span class="row-badge">Next issue</span>' if item["saved"] else ""
     timing = f" · {_minutes(item['minutes'] * 250)}" if item["minutes"] else ""
+    date = f" · {escape(item['published'])}" if item.get("published") else ""
     return f"""<div class="row{selected}{read}{queued}">
   <div class="row-main">
     <a class="row-title" href="{_reader_href(secret, view, item["id"], source, issue)}">{escape(item["title"])}</a>
-    <span class="row-sub">{escape(item["source"])}{timing}{badge}</span>
+    <span class="row-sub">{escape(item["source"])}{date}{timing}{badge}</span>
   </div>
   <div class="row-actions">{like}{queue}{archive}</div>
 </div>"""
@@ -1418,9 +1424,10 @@ def _reader_pane(
         fields={"view": view, "source": source or "", "issue": issue or ""},
     )
     timing = f" · {_minutes(selected['minutes'] * 250)}" if selected["minutes"] else ""
+    date = f" · {escape(selected['published'])}" if selected.get("published") else ""
     return f"""<div class="card reader-pane">
 <h1>{escape(selected["title"])}</h1>
-<p class="meta" style="margin-top:-.4rem">{escape(selected["source"])}{timing}</p>
+<p class="meta" style="margin-top:-.4rem">{escape(selected["source"])}{date}{timing}</p>
 <div class="article-toolbar">{like}{dislike}{queue}{archive}{unread}{original}</div>
 <div class="article">{body}</div>
 </div>"""

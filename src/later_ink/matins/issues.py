@@ -128,6 +128,7 @@ class IssueService:
             # Feeds rarely say how long an article is, so the word budget can only
             # be honest once the text is here. What does not fit waits in the queue.
             words = _words(html)
+            delivery = self.store.get_delivery(secret)
             if items and words > words_left:
                 logger.info("%r does not fit in %s's word budget", article.title, local_day)
                 continue
@@ -142,6 +143,11 @@ class IssueService:
                     source_url=article.url,
                     image_url=article.image_url,
                     word_count=words,
+                    published=published_label(
+                        getattr(article, "published", None),
+                        delivery.timezone if delivery else config.get_default_timezone(),
+                    ),
+                    show_dates=delivery.show_dates if delivery else True,
                 )
             )
             printed.append(candidate)
@@ -372,6 +378,18 @@ class IssueService:
 
     def _base_url(self) -> str:
         return app_config.get_base_url()
+
+
+def published_label(published: datetime | None, tz_name: str) -> str:
+    """A publication date in the reader's timezone, or nothing: never a stand-in."""
+    if published is None:
+        return ""
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = UTC
+    moment = published.replace(tzinfo=UTC).astimezone(tz)
+    return f"{moment.day} {moment:%b %Y}"
 
 
 def local_day(tz_name: str, now: datetime | None = None) -> str:

@@ -53,6 +53,9 @@ class Article:
     # reader's progress. Distinct from `updated` above, which defaults to
     # now() and is not usable for that.
     content_date: datetime | None = None
+    # When the publisher says it appeared, naive UTC. None when it does not say;
+    # nothing may stand in for it, or a reader sees a date that was never published.
+    published: datetime | None = None
 
 
 # Bound the client-side search scan for connectors without a native full-text

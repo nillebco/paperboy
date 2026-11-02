@@ -305,7 +305,12 @@ async def add_item(request: Request):
         raise HTTPException(400, "origin must be user or curator")
     lede = body.get("lede")
     lede = str(lede)[:MAX_LEDE_CHARS] if lede else None
-    queued = _store(request).save_url(secret, url, title, content=content, origin=origin, lede=lede)
+    published = body.get("published")
+    if published is not None and (isinstance(published, bool) or not isinstance(published, int | float)):
+        raise HTTPException(400, "published must be epoch seconds")
+    queued = _store(request).save_url(
+        secret, url, title, content=content, origin=origin, lede=lede, published=published
+    )
     return JSONResponse(
         {"queued": queued, "url": url}, status_code=201 if queued else 200
     )
