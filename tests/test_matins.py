@@ -2190,3 +2190,13 @@ def test_max_saved_is_a_setting(client):
         follow_redirects=False,
     )
     assert client.app.state.matins.get_delivery(secret).max_saved == 25
+
+
+def test_a_selected_article_opens_as_a_closable_overlay(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    article = _reader_article_id(client, secret, "First story")
+    page = client.get(f"/{secret}/read", params={"article": article, "view": "all"}, headers=HTML).text
+    assert 'class="reader-pane-col open" role="dialog"' in page
+    assert f'<a class="btn tiny" href="/{secret}/read' in page and "✕ Close" in page
+    assert "reader-pane-col open" not in client.get(f"/{secret}/read", headers=HTML).text

@@ -208,9 +208,25 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .article-toolbar form { margin: 0; }
 .reader-pane .card h1 { margin-top: 0; }
 .reader-pane .article { max-width: 42rem; }
+.reader-close { display: none; }
 @media (max-width: 820px) {
   .reader-split { grid-template-columns: 1fr; }
   .reader-list, .reader-pane-col { max-height: none; overflow: visible; }
+  /* A phone has no room beside the list: the article covers it, and closing
+     returns to the same spot. Plain links and CSS, like the rest of the reader. */
+  .reader-pane-col { display: none; }
+  .reader-pane-col.open {
+    display: block; position: fixed; inset: 0; z-index: 50; max-height: none;
+    overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+    background: var(--bg); padding: 0 0 env(safe-area-inset-bottom);
+  }
+  .reader-pane-col.open .reader-pane { border: 0; border-radius: 0; box-shadow: none; margin: 0; }
+  .reader-close {
+    display: flex; justify-content: flex-end; position: sticky; top: 0; z-index: 1;
+    background: var(--bg); border-bottom: 1px solid var(--line);
+    padding: calc(.5rem + env(safe-area-inset-top)) 1rem .5rem;
+  }
+  body:has(.reader-pane-col.open) { overflow: hidden; }
 }
 """
 
@@ -1489,6 +1505,16 @@ def reader_page(
             '<div class="card reader-pane"><p class="meta">'
             "Pick an article from the list to read it here.</p></div>"
         )
+    if selected and body is not None:
+        close = _reader_href(secret, view, source=source, issue=issue)
+        pane_col = (
+            '<div class="reader-pane-col open" role="dialog" aria-modal="true" '
+            f'aria-label="{escape(selected["title"])}">'
+            f'<div class="reader-close"><a class="btn tiny" href="{close}">✕ Close</a></div>'
+            f"{pane}</div>"
+        )
+    else:
+        pane_col = f'<div class="reader-pane-col">{pane}</div>'
     page_title = f"Issue · {issue_title}" if issue else "Reader"
     lede = (
         "The articles printed in this issue. Switch to All news for everything else."
@@ -1507,7 +1533,7 @@ def reader_page(
 {filter_form}
 <div class="reader-split">
   <div class="card reader-list">{rows}</div>
-  <div class="reader-pane-col">{pane}</div>
+  {pane_col}
 </div>
 <script>{READER_SCROLL_JS}</script>
 """
