@@ -945,7 +945,7 @@ def test_queueing_does_not_move_a_row_in_the_list(client):
     queued = client.get(f"/{secret}/read?view=all").text
     # The queued row says so in place: tinted class plus a badge.
     assert re.search(
-        r'class="row queued">\s*<div class="row-main">\s*'
+        r'class="row queued" data-id="[^"]+">\s*<div class="row-main">\s*'
         r'<a class="row-title"[^>]*>First story</a>\s*'
         r'<span class="row-sub">Example Feed(?: · \d+ \w+ \d{4})? · \d+ minute'
         r'<span class="row-badge">Next issue</span></span>',
@@ -973,12 +973,12 @@ def test_reader_lists_items_and_opening_one_marks_it_read(client):
     assert opened.status_code == 200
     assert "Body text of the first story" in opened.text
     assert "Saved for later" in opened.text
-    # The only script is our scroll restorer; the article itself adds none.
-    assert opened.text.count("<script>") == 1
+    # The only scripts are our own two (scroll, row actions); the article adds none.
+    assert opened.text.count("<script>") == 2
     assert "First story" not in client.get(f"/{secret}/read?view=unread").text
     # A read row is visually distinct: the CSS hangs off this class.
-    assert 'class="row read"' in client.get(f"/{secret}/read?view=all").text
-    assert 'class="row read"' not in page.text
+    assert 'class="row read" data-id=' in client.get(f"/{secret}/read?view=all").text
+    assert 'class="row read" data-id=' not in page.text
 
     client.post(
         f"/{secret}/read/{quote(article_id, safe=':-_')}/unread",

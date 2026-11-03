@@ -80,13 +80,18 @@ OTP_MAX_ATTEMPTS = 5
 # which is the EPUB builder's job, not the browser's. Links still cannot run
 # anything, and there is no script of our own on the page.
 def _reader_csp() -> str:
-    """Reader pages allow exactly one script: the scroll restorer, by hash."""
-    digest = hashlib.sha256(pages.READER_SCROLL_JS.encode("utf-8")).digest()
-    script = base64.b64encode(digest).decode()
+    """Reader pages allow exactly our two scripts, by hash: the scroll restorer
+    and the background row actions (which may only call back to this origin)."""
+    hashes = " ".join(
+        "'sha256-"
+        + base64.b64encode(hashlib.sha256(js.encode("utf-8")).digest()).decode()
+        + "'"
+        for js in (pages.READER_SCROLL_JS, pages.READER_ACTIONS_JS)
+    )
     return (
         "default-src 'none'; img-src https: http: data:; "
         "style-src 'unsafe-inline'; "
-        f"script-src 'sha256-{script}'; "
+        f"script-src {hashes}; connect-src 'self'; "
         "base-uri 'none'; form-action 'self'"
     )
 

@@ -1251,6 +1251,47 @@ READER_SCROLL_JS = (
     "restore();window.addEventListener('load',restore);}());"
 )
 
+# Like, + Next, Archive and the pane's buttons post in the background and patch
+# the rows and toolbar from the page the redirect lands on, so a tap does not
+# reload (and flash) the whole reader. Without fetch the forms post as before;
+# anything that changes the view or the open article still navigates.
+READER_ACTIONS_JS = """(function(){
+var split=document.querySelector('.reader-split');
+if(!split||!window.fetch||!window.DOMParser||!window.URLSearchParams)return;
+function q(u,k){return new URL(u,location.href).searchParams.get(k)||'';}
+function rowsFor(root,id){return Array.prototype.filter.call(
+  root.querySelectorAll('.row[data-id]'),function(r){return r.dataset.id===id;});}
+split.addEventListener('submit',function(ev){
+  var f=ev.target,row=f.closest('.row[data-id]'),pane=f.closest('.reader-pane');
+  var idField=f.querySelector('input[name=article_id]');
+  if((!row&&!pane)||!idField)return;
+  ev.preventDefault();
+  var id=idField.value,buttons=f.querySelectorAll('button');
+  buttons.forEach(function(b){b.disabled=true;});
+  fetch(f.action,{method:'POST',body:new URLSearchParams(new FormData(f)),
+    credentials:'same-origin',headers:{'Accept':'text/html'}})
+  .then(function(r){if(!r.ok||r.redirected===false)throw r;
+    return r.text().then(function(t){return {url:r.url,html:t};});})
+  .then(function(res){
+    var moved=q(res.url,'view')!==q(location.href,'view')||
+      (pane&&q(res.url,'article')!==q(location.href,'article'));
+    if(moved){location.href=res.url;return;}
+    try{patch(res);}catch(e){location.href=res.url;}
+  },function(){buttons.forEach(function(b){b.disabled=false;});f.submit();});
+  function patch(res){
+    var doc=new DOMParser().parseFromString(res.html,'text/html');
+    var fresh=rowsFor(doc,id)[0];
+    rowsFor(document,id).forEach(function(old){
+      if(fresh)old.replaceWith(document.importNode(fresh,true));else old.remove();});
+    var bar=document.querySelector('.reader-pane .article-toolbar'),
+        nbar=doc.querySelector('.reader-pane .article-toolbar');
+    if(bar&&nbar&&q(location.href,'article')===id)
+      bar.replaceWith(document.importNode(nbar,true));
+  }
+});
+}());"""
+
+
 _READER_VIEWS = (
     ("all", "All"),
     ("unread", "Unread"),
@@ -1303,7 +1344,7 @@ def _reader_row(
                 "issue": issue or "",
             },
         )
-        return f"""<div class="row archived">
+        return f"""<div class="row archived" data-id="{escape(item["id"])}">
   <div class="row-main">
     <span class="row-title">{escape(item["title"])}</span>
     <span class="row-sub">{escape(item["source"])} · archived</span>
@@ -1359,7 +1400,7 @@ def _reader_row(
     badge = '<span class="row-badge">Next issue</span>' if item["saved"] else ""
     timing = f" · {_minutes(item['minutes'] * 250)}" if item["minutes"] else ""
     date = f" · {escape(item['published'])}" if item.get("published") else ""
-    return f"""<div class="row{selected}{read}{queued}">
+    return f"""<div class="row{selected}{read}{queued}" data-id="{escape(item["id"])}">
   <div class="row-main">
     <a class="row-title" href="{_reader_href(secret, view, item["id"], source, issue)}">{escape(item["title"])}</a>
     <span class="row-sub">{escape(item["source"])}{date}{timing}{badge}</span>
@@ -1572,6 +1613,7 @@ def reader_page(
   {pane_col}
 </div>
 <script>{READER_SCROLL_JS}</script>
+<script>{READER_ACTIONS_JS}</script>
 """
     return _shell(
         secret, "read", "Reader", body_html, notice=notice, error=error, wide=True
