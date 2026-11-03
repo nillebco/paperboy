@@ -894,6 +894,8 @@ async def reader_feedback(
     view: str = Form("all"),
     source: str = Form(""),
     issue: str = Form(""),
+    selected: str = Form(""),
+    from_list: str = Form(""),
 ):
     """Like / not for me, keyed by URL so the curator can rank next morning."""
     _resolve(secret, request)
@@ -914,7 +916,7 @@ async def reader_feedback(
         )
     else:
         store.clear_signal(secret, item["url"])
-    return RedirectResponse(_read_href(secret, view, article_id, source=source or None, issue=issue or None), status_code=303)
+    return RedirectResponse(_read_href(secret, view, (selected or None) if from_list else article_id, source=source or None, issue=issue or None), status_code=303)
 
 
 @router.post("/{secret}/read/queue")
@@ -926,6 +928,8 @@ async def reader_queue(
     view: str = Form("all"),
     source: str = Form(""),
     issue: str = Form(""),
+    selected: str = Form(""),
+    from_list: str = Form(""),
 ):
     """Add any browsable item to the curated next issue."""
     _resolve(secret, request)
@@ -947,7 +951,7 @@ async def reader_queue(
     _store(request).save_url(
         secret, item["url"], item["title"], content=content, lede=lede, published=published
     )
-    return RedirectResponse(_read_href(secret, view, article_id, source=source or None, issue=issue or None), status_code=303)
+    return RedirectResponse(_read_href(secret, view, (selected or None) if from_list else article_id, source=source or None, issue=issue or None), status_code=303)
 
 
 @router.post("/{secret}/read/archive")
@@ -1093,6 +1097,8 @@ async def reader_unqueue(
     view: str = Form("all"),
     source: str = Form(""),
     issue: str = Form(""),
+    selected: str = Form(""),
+    from_list: str = Form(""),
 ):
     _resolve(secret, request)
     _require_csrf(secret, csrf)
@@ -1105,7 +1111,7 @@ async def reader_unqueue(
     )
     if queued is not None:
         store.delete_saved(secret, queued.id)
-    return RedirectResponse(_read_href(secret, view, article_id, source=source or None, issue=issue or None), status_code=303)
+    return RedirectResponse(_read_href(secret, view, (selected or None) if from_list else article_id, source=source or None, issue=issue or None), status_code=303)
 
 
 @router.post("/{secret}/read/mark-all")

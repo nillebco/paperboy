@@ -1284,8 +1284,12 @@ def _reader_row(
     view: str,
     source: str | None,
     issue: str | None,
+    selected_id: str = "",
 ) -> str:
-    """One list row: open it, like it, queue it, or discard it."""
+    """One list row: open it, like it, queue it, or discard it.
+
+    The row's buttons keep whatever article is open (none on a phone list), so
+    liking or queuing from the list never pops the article overlay open."""
     if item.get("archived"):
         restore = _button(
             f"/{escape(secret)}/read/restore",
@@ -1316,6 +1320,8 @@ def _reader_row(
         fields={
             "article_id": item["id"],
             "value": "clear" if liked else "like",
+            "selected": selected_id,
+            "from_list": "1",
             "view": view,
             "source": source or "",
             "issue": issue or "",
@@ -1328,6 +1334,8 @@ def _reader_row(
         style="tiny on" if queued else "tiny",
         fields={
             "article_id": item["id"],
+            "selected": selected_id,
+            "from_list": "1",
             "view": view,
             "source": source or "",
             "issue": issue or "",
@@ -1513,7 +1521,10 @@ def reader_page(
         )
     )
     rows = "".join(
-        _reader_row(secret, csrf, item, view, source, issue) for item in items
+        _reader_row(
+            secret, csrf, item, view, source, issue, selected["id"] if selected else ""
+        )
+        for item in items
     ) or f'<p class="meta">{empty}</p>'
     if selected and body is not None:
         pane = _reader_pane(

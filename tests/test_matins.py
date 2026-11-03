@@ -987,6 +987,33 @@ def test_reader_lists_items_and_opening_one_marks_it_read(client):
     assert "First story" in client.get(f"/{secret}/read?view=unread").text
 
 
+def test_reader_row_actions_do_not_open_the_article(client):
+    """A like or + Next from the list keeps whatever is open, so a phone does
+    not pop the article overlay; the pane's own buttons stay on the article."""
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    article_id = _reader_article_id(client, secret, "First story")
+    csrf = _csrf(client, secret)
+
+    listing = client.get(f"/{secret}/read?view=all").text
+    assert 'name="from_list" value="1"' in listing
+    for path, extra in (("feedback", {"value": "like"}), ("queue", {}), ("unqueue", {})):
+        response = client.post(
+            f"/{secret}/read/{path}",
+            data={"csrf": csrf, "article_id": article_id, "view": "all", "from_list": "1", **extra},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert "article=" not in response.headers["location"]
+
+    from_pane = client.post(
+        f"/{secret}/read/feedback",
+        data={"csrf": csrf, "article_id": article_id, "value": "clear", "view": "all"},
+        follow_redirects=False,
+    )
+    assert "article=" in from_pane.headers["location"]
+
+
 def test_reader_like_and_next_issue_are_stateful(client):
     secret = _signup_without_readwise(client)
     _add_feed(client, secret)
