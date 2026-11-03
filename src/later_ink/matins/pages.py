@@ -169,6 +169,9 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .source-filter a { color: var(--muted); text-decoration: none; }
 .source-filter a:hover { color: var(--fg); }
 .source-filter a[aria-current] { color: var(--fg); font-weight: 650; }
+.bulk-archive { margin: .4rem 0 .2rem; }
+.bulk-archive summary { cursor: pointer; font-size: .82rem; }
+.bulk-archive .row-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
 /* Both panes share the viewport and scroll independently: a mailbox, not a
    page with one box that happens to scroll. */
 .reader-split { display: grid; grid-template-columns: minmax(0, 26rem) minmax(0, 1fr);
@@ -1481,9 +1484,24 @@ def reader_page(
             f'<a href="{base}/read">All news</a></div>'
         )
     else:
+        scope = f" from {escape(source)}" if source else ""
+        bulk = "".join(
+            _button(
+                f"{base}/read/archive-all",
+                csrf,
+                label,
+                style="tiny",
+                fields={"keep": keep, "source": source or ""},
+            )
+            for keep, label in (("liked", "Archive all not liked"), ("none", "Archive all"))
+        )
         filter_form = (
             f'<div class="source-filter"><span class="label">Source</span>'
             f"{all_link}{source_links}</div>"
+            # Folded away: one stray click should not empty the reader.
+            f'<details class="bulk-archive"><summary class="meta">Archive in bulk{scope}…</summary>'
+            f'<p class="meta">Queued articles stay. Archived articles stay under the Archived tab.</p>'
+            f'<div class="row-actions">{bulk}</div></details>'
         )
     empty = (
         "This issue has no articles here."

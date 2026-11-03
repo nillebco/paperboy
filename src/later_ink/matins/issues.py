@@ -101,6 +101,7 @@ class IssueService:
     ) -> Issue | None:
         now = now or datetime.now(UTC)
         limits = limits_for(self.store.get_delivery(secret))
+        self.expire_queue(secret, now)
         # The whole queue, not the capped view: a link that cannot be fetched must
         # not cost a slot, so the cap is applied to what actually prints.
         candidates = await self.plan(secret, reader, now, only=only, whole_queue=True)
@@ -190,6 +191,21 @@ class IssueService:
         # whose page failed to extract stays in the queue for tomorrow.
         saved_ids = [int(c.article.id) for c in printed if c.source == "later"]
         self.store.consume_saved(secret, saved_ids, issue_id)
+        # Printed means done with: out of the reader's list, and out of the
+        # curator's shortlist tomorrow. No "not for me" signal is recorded.
+        self.store.archive_many(
+            secret,
+            [
+                {
+                    "url": c.article.url,
+                    "article_id": reader.decorate_id(c.source, c.article.id),
+                    "title": c.article.title,
+                    "source": c.section,
+                    "kind": "issue",
+                }
+                for c in printed
+            ],
+        )
         self._prune(secret)
         logger.info(
             "built issue %s for a catalogue: %d articles, %d words",
@@ -198,6 +214,38 @@ class IssueService:
             issue.word_count,
         )
         return issue
+
+    def expire_queue(self, secret: str, now: datetime | None = None) -> list[dict]:
+        """Drop queued links that can no longer print: too old, or archived.
+
+        An issue is the news of the last `window_hours`. A queued link is dated
+        by its publication when the source stated one, else by when it was
+        queued (a link shared from the phone is "new to me" from that moment).
+        Anything archived in the meantime was dismissed, so it goes too."""
+        now = now or datetime.now(UTC)
+        limits = limits_for(self.store.get_delivery(secret))
+        cutoff = now.timestamp() - limits.window_hours * 3600
+        saved = self.store.list_saved(secret)
+        archived = self.store.archived_urls(secret, [item.url for item in saved])
+        expired: list[dict] = []
+        for item in saved:
+            reason = (
+                "archived"
+                if item.url in archived
+                else "too old"
+                if (item.published or item.added_at) < cutoff
+                else None
+            )
+            if reason is None:
+                continue
+            self.store.delete_saved(secret, item.id)
+            expired.append(
+                {"title": item.title or item.url, "url": item.url,
+                 "origin": item.origin, "reason": reason}
+            )
+        if expired:
+            logger.info("expired %d queued links for %s", len(expired), _mask(secret))
+        return expired
 
     def delete(self, secret: str, issue_id: str) -> bool:
         """Delete one edition. Its articles become eligible for the next one."""
@@ -208,7 +256,9 @@ class IssueService:
             Path(issue.path).unlink(missing_ok=True)
         except OSError:
             logger.debug("could not remove %s", issue.path, exc_info=True)
+        urls = [entry.url for entry in self.store.issue_entries(secret, issue_id) if entry.url]
         self.store.release_issue(secret, issue_id)
+        self.store.unarchive_printed(secret, urls)
         return True
 
     def rename(self, old: str, new: str) -> None:
@@ -291,6 +341,15 @@ class IssueService:
                 saved, _ = await queue.list_articles("inbox")
             except (UpstreamError, KeyError):
                 saved = []
+            # Same rule as expire_queue, without deleting: the preview must not
+            # promise a link that composing would drop.
+            archived = self.store.archived_urls(secret, [a.url for a in saved if a.url])
+            saved = [
+                a
+                for a in saved
+                if a.url not in archived
+                and _queued_fresh(a, now, limits.window_hours)
+            ]
             for article in saved if whole_queue else saved[: limits.max_saved]:
                 cost = article.word_count or DEFAULT_ITEM_WORDS
                 if not whole_queue and selected and budget - cost < 0:
@@ -328,11 +387,15 @@ class IssueService:
                     continue
                 section = (stored.title if stored else "") or folder.title
                 already = self.store.issued_articles(secret, list(keys.values()))
+                archived = self.store.archived_urls(
+                    secret, [a.url for a in articles if a.url]
+                )
                 fresh = [
                     a
                     for a in articles
                     if keys[a.id] not in already
                     and keys[a.id] not in skipped
+                    and a.url not in archived
                     and _fresh(a, now, limits.window_hours)
                 ]
                 per_feed = 0
@@ -435,6 +498,14 @@ def _fresh(article, now: datetime, hours: int) -> bool:
         return True  # a feed that dates nothing still deserves to be read
     reference = now.replace(tzinfo=None)
     return (reference - article.content_date).total_seconds() <= hours * 3600
+
+
+def _queued_fresh(article, now: datetime, hours: int) -> bool:
+    """A queued link: its publication date if known, else when it was queued."""
+    reference = article.published or article.content_date
+    if reference is None:
+        return True
+    return (now.replace(tzinfo=None) - reference).total_seconds() <= hours * 3600
 
 
 def _words(html: str) -> int:

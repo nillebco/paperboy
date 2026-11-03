@@ -12,6 +12,7 @@ which is the product.
 
 import hashlib
 import logging
+import time
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -433,9 +434,14 @@ async def compose_issue(request: Request, force: int = 0, only: str | None = Non
     if not force and store.has_issue_for_day(secret, day):
         raise HTTPException(409, "An issue already exists for today; pass force=1 to build another")
     reader = await request.app.state.tenant_reader(secret)
+    # Explicit here (build repeats it) so the caller learns what was dropped.
+    expired = service.expire_queue(secret)
     issue = await service.build(secret=secret, reader=reader, local_day=day, only=only)
     if issue is None:
-        return JSONResponse({"issue": None, "reason": "nothing new to compose"}, status_code=200)
+        return JSONResponse(
+            {"issue": None, "reason": "nothing new to compose", "expired": expired},
+            status_code=200,
+        )
     await service.deliver(secret, issue)
     return {
         "id": issue.id,
@@ -443,7 +449,19 @@ async def compose_issue(request: Request, force: int = 0, only: str | None = Non
         "articles": issue.article_count,
         "words": issue.word_count,
         "download": f"/{secret}/issues/{issue.id}.epub",
+        "expired": expired,
     }
+
+
+@router.get("/archived")
+async def list_archived(request: Request, hours: float = 72, limit: int = 5000):
+    """URLs archived in the last `hours`: printed, or dismissed in the reader.
+
+    A curator excludes them from its shortlist; the window only needs to cover
+    the age of what it considers."""
+    secret = _secret(request)
+    since = time.time() - max(1.0, min(hours, 24 * 365)) * 3600
+    return {"urls": _store(request).archived_since(secret, since, limit=limit)}
 
 
 # ------------------------------------------------------------------- shared

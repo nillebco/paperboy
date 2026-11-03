@@ -849,6 +849,63 @@ class MatinsStore:
                 ),
             )
 
+    def archive_many(self, secret: str, items: list[dict]) -> int:
+        """Archive several items in one transaction, without touching signals.
+
+        Bulk archiving is housekeeping ("I am done with these"), not 700 verdicts
+        of "not for me": the curator must not learn from it. Already archived
+        rows keep their original date."""
+        rows = [
+            (
+                _archive_id(item["url"]),
+                secret,
+                item["url"],
+                item.get("article_id"),
+                item.get("title") or "",
+                item.get("source") or "",
+                item.get("kind"),
+                time.time(),
+            )
+            for item in items
+            if item.get("url")
+        ]
+        if not rows:
+            return 0
+        with self._conn() as conn:
+            before = conn.total_changes
+            conn.executemany(
+                "INSERT INTO archived_articles"
+                " (id, secret, url, article_id, title, source, kind, archived_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT (secret, url) DO NOTHING",
+                rows,
+            )
+            return conn.total_changes - before
+
+    def unarchive_printed(self, secret: str, urls: list[str]) -> None:
+        """Undo the archiving that printing did; a dismissal by hand stays."""
+        with self._conn() as conn:
+            conn.executemany(
+                "DELETE FROM archived_articles WHERE secret = ? AND url = ? AND kind = 'issue'",
+                [(secret, url) for url in urls if url],
+            )
+
+    def archived_since(self, secret: str, since: float, limit: int = 5000) -> list[str]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT url FROM archived_articles WHERE secret = ? AND archived_at >= ?"
+                " ORDER BY archived_at DESC LIMIT ?",
+                (secret, since, max(1, min(limit, 20000))),
+            ).fetchall()
+        return [r["url"] for r in rows]
+
+    def count_archived(self, secret: str) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM archived_articles WHERE secret = ?", (secret,)
+            ).fetchone()
+        return int(row[0])
+
     def unarchive_article(self, secret: str, url: str) -> bool:
         with self._conn() as conn:
             cur = conn.execute(

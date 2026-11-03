@@ -2240,3 +2240,76 @@ def test_an_issue_prints_the_publication_date_not_a_stand_in():
     assert "2026" not in _masthead(bare, when)
     off = IssueItem(title="T", html="", section="Le Monde", published="1 Nov 2026")
     assert "Monday 02 November 2026" in _masthead(off, when)
+
+
+# ------------------------------------------------- freshness and archiving
+
+
+def test_compose_drops_stale_and_archived_queue_links(client, monkeypatch):
+    import time as _time
+
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.ensure_delivery(secret, schedule="07:00", timezone="Europe/Paris")
+    store.set_issue_limits(
+        secret, max_articles=None, max_per_feed=None, max_words=None,
+        window_hours=24, max_saved=None,
+    )
+    now = _time.time()
+    store.save_url(secret, "https://example.com/fresh", "Fresh", published=now - 3600)
+    store.save_url(secret, "https://example.com/old", "Old", published=now - 3 * 86400)
+    store.save_url(secret, "https://example.com/gone", "Gone")
+    store.archive_article(secret, "https://example.com/gone", title="Gone")
+
+    composed = client.post("/api/v1/issues?only=queue", headers=_api(secret)).json()
+    assert {(e["title"], e["reason"]) for e in composed["expired"]} == {
+        ("Old", "too old"),
+        ("Gone", "archived"),
+    }
+    assert composed["articles"] == 1
+    assert store.list_saved(secret) == []
+
+
+def test_printed_articles_are_archived_without_a_signal(client):
+    secret = _signup_without_readwise(client)
+    client.post(f"/{secret}/save", json={"url": "https://example.com/later"})
+    client.post("/api/v1/issues?only=queue", headers=_api(secret))
+
+    urls = client.get("/api/v1/archived", headers=_api(secret)).json()["urls"]
+    assert urls == ["https://example.com/later"]
+    assert client.get("/api/v1/signals", headers=_api(secret)).json()["signals"] == []
+    # The edition's own view still shows it as a normal, likeable row.
+    issue = client.app.state.matins.list_issues(secret)[0]
+    page = client.get(f"/{secret}/read?issue={issue.id}").text
+    assert "· archived" not in page
+
+
+def test_archive_all_keeps_liked_and_queued_and_records_no_signal(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    csrf = _csrf(client, secret)
+    first = _reader_article_id(client, secret, "First story")
+    client.post(
+        f"/{secret}/read/feedback",
+        data={"csrf": csrf, "article_id": first, "value": "like", "view": "all"},
+    )
+    client.post(f"/{secret}/save", json={"url": "https://example.com/mine"})
+
+    done = client.post(
+        f"/{secret}/read/archive-all",
+        data={"csrf": csrf, "keep": "liked"},
+        follow_redirects=False,
+    )
+    assert done.status_code == 303
+    page = client.get(f"/{secret}/read?view=all").text
+    assert "First story" in page
+    assert "Second story" not in page
+    assert client.app.state.matins.list_saved(secret)
+    ratings = {
+        s["url"]: s["rating"]
+        for s in client.get("/api/v1/signals", headers=_api(secret)).json()["signals"]
+    }
+    assert "not_interested" not in ratings.values()
+
+    client.post(f"/{secret}/read/archive-all", data={"csrf": csrf, "keep": "none"})
+    assert "First story" not in client.get(f"/{secret}/read?view=all").text

@@ -643,7 +643,9 @@ async def reader_index(
     archived_rows = store.list_archived(secret, limit=MAX_READER_ITEMS)
     archived_urls = store.archived_urls(secret, [item["url"] for item in items if item["url"]])
     for item in items:
-        item["archived"] = bool(item["url"]) and item["url"] in archived_urls
+        # Printing archives an article, so an edition's own view must not show
+        # its articles as dismissed: they stay likeable there.
+        item["archived"] = not issue and bool(item["url"]) and item["url"] in archived_urls
     visible = items if issue else [item for item in items if not item["archived"]]
     names = {_source_key(item) for item in visible} | {
         _archived_key(row) for row in archived_rows
@@ -663,7 +665,7 @@ async def reader_index(
         "unread": sum(1 for item in visible if not item["read"]),
         "liked": sum(1 for item in visible if item["rating"] > 0),
         "queued": sum(1 for item in visible if item["saved"]),
-        "archived": len(archived_rows),
+        "archived": store.count_archived(secret) if not source else len(archived_rows),
     }
     view = view if view in counts else "all"
     if view == "archived":
@@ -995,6 +997,56 @@ async def reader_archive(
             notice="Archived. It is under the Archived tab if you want it back.",
             source=source or None,
             issue=issue or None,
+        ),
+        status_code=303,
+    )
+
+
+@router.post("/{secret}/read/archive-all")
+async def reader_archive_all(
+    secret: str,
+    request: Request,
+    csrf: str = Form(""),
+    keep: str = Form("none"),
+    source: str = Form(""),
+):
+    """Archive everything in the list at once, optionally keeping the liked ones.
+
+    Housekeeping, not feedback: no "not for me" signal is recorded, so a
+    curator does not learn that 700 unread articles were all unwanted. Items
+    queued for the next issue are left alone; unqueue them first if wanted."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    store = _store(request)
+    stream = await _reader_items(request, secret)
+    urls = [getattr(entry[1], "url", "") or "" for entry in stream]
+    liked = {url for url, rating in store.signals_for(secret, [u for u in urls if u]).items() if rating > 0}
+    queued = {item.url for item in store.list_saved(secret)}
+    rows = []
+    for item_id, article, section, kind in stream:
+        url = getattr(article, "url", "") or ""
+        if not url or url in queued or (keep == "liked" and url in liked):
+            continue
+        name = "Bluesky" if kind == "candidate" else section
+        if source and name != source:
+            continue
+        rows.append(
+            {
+                "url": url,
+                "article_id": item_id,
+                "title": article.title,
+                "source": getattr(article, "signal_source", section),
+                "kind": kind,
+            }
+        )
+    count = store.archive_many(secret, rows)
+    kept = " Liked and queued articles were kept." if keep == "liked" else " Queued articles were kept."
+    return RedirectResponse(
+        _read_href(
+            secret,
+            "all",
+            notice=f"Archived {count} article{'s' if count != 1 else ''}.{kept}",
+            source=source or None,
         ),
         status_code=303,
     )
