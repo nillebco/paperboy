@@ -94,17 +94,29 @@ curl -fsS -X POST "https://matins.nilleb.co/admin/issues/run?secret=<secret>&for
 
 ### Backup
 
-Everything that matters is the volume plus the env file:
+`backup.sh` runs nightly from a systemd timer (02:30 UTC, `Persistent=true`):
+it snapshots `app.db` through SQLite's online backup API inside the app
+container (a tar of a live WAL database can tear), checks `integrity_check`,
+then archives the snapshot plus the rest of the volume to
+`/srv/matins/backups/matins-<UTC stamp>.tgz` (0600, owner `ubuntu`). The newest
+7 are kept.
 
 ```bash
-docker run --rm -v matins_matins-data:/data -v "$PWD":/backup alpine \
-  tar czf /backup/matins-$(date +%F).tgz -C /data .
+sudo cp deploy/oci/systemd/matins-backup.* /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now matins-backup.timer
+sudo systemctl start matins-backup.service      # run one now
+journalctl -u matins-backup.service -n 5
 ```
 
-The database is SQLite in WAL mode, so copy the `-wal` and `-shm` sidecars too
-(tar of the whole directory does this). `ENCRYPTION_KEY` is not in the backup —
-store it in the password manager, or the backup restores into an app that cannot
-decrypt any stored token.
+The box is a single point of failure, so a copy must leave it: a workstation
+pulls the archives with `rsync` over SSH and checks the newest one opens
+(`~/.local/bin/matins-backup-pull.sh` on the operator's Mac, kept 30 days).
+
+`ENCRYPTION_KEY` is not in the backup — store it in the password manager, or
+the backup restores into an app that cannot decrypt any stored token.
+
+Restore: stop `matins`, extract the archive into the `matins_matins-data`
+volume, then `mv .snapshot/app.db app.db && rm -rf .snapshot` and start it.
 
 ### Upgrade
 
