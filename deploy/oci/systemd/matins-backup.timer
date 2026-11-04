@@ -1,0 +1,11 @@
+[Unit]
+Description=Matins nightly backup
+
+[Timer]
+# 03:30 Paris in winter: clear of the 06:00 curator and 07:00 composition.
+OnCalendar=*-*-* 02:30:00 UTC
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

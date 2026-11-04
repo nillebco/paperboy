@@ -1,0 +1,8 @@
+[Unit]
+Description=Matins nightly backup (SQLite snapshot + data volume)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/srv/matins/app/deploy/oci/backup.sh
