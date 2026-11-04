@@ -110,7 +110,7 @@ journalctl -u matins-backup.service -n 5
 
 The box is a single point of failure, so a copy must leave it: a workstation
 pulls the archives with `rsync` over SSH and checks the newest one opens
-(`~/.local/bin/matins-backup-pull.sh` on the operator's Mac, kept 30 days, mirrored to Proton Drive). It alerts on Telegram when the pull, the integrity check or the Proton copy fails, or when the newest archive is over 36 h old — so a dead box timer is caught too.
+(`~/.local/bin/matins-backup-pull.sh` on the operator's Mac, kept 30 days). It alerts on Telegram when the pull or the integrity check fails, or when the newest archive is over 36 h old — so a dead box timer is caught too.
 
 `ENCRYPTION_KEY` is not in the backup — store it in the password manager, or
 the backup restores into an app that cannot decrypt any stored token.
