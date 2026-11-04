@@ -5,8 +5,8 @@
 name: matins
 
 #
-# Two containers: the app and Caddy. Caddy is here for TLS and for the two
-# hostnames (matins.nilleb.co and .com) pointing at one service; it terminates
+# Two containers: the app and Caddy. Caddy is here for TLS and for the
+# hostnames (mynews.ink, plus matins.nilleb.co and .com) pointing at one service; it terminates
 # HTTPS and proxies to the app over the compose network, so the app never
 # publishes a port.
 #
@@ -28,7 +28,7 @@ services:
       # Behind Caddy, which sets the forwarded headers. Only enable this when
       # the proxy is the only way in — see the app's config.trust_proxy_headers.
       TRUST_PROXY_HEADERS: "1"
-      BASE_URL: https://matins.nilleb.co
+      BASE_URL: https://mynews.ink
       TZ: Europe/Paris
     volumes:
       - matins-data:/data

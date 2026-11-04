@@ -1,11 +1,16 @@
-# Both hostnames serve the same instance. Keeping two zones pointed here means
-# a reader that types the wrong TLD still lands on their catalogue.
+# mynews.ink is the public name (BASE_URL). The matins.nilleb.* names keep
+# serving directly, not redirecting: e-readers already hold OPDS URLs on them,
+# and an OPDS client following a cross-host redirect is not something to bet on.
 #
 # Replace the addresses below with the ones you actually use. The app's
 # canonical-host redirect is off unless CANONICAL_HOST is set, so both names
 # answering directly is the expected setup.
 
-matins.nilleb.co, matins.nilleb.com {
+www.mynews.ink {
+	redir https://mynews.ink{uri} permanent
+}
+
+mynews.ink, matins.nilleb.co, matins.nilleb.com {
 	encode zstd gzip
 
 	# Caddy gets and renews the certificate over HTTP-01/TLS-ALPN. That only
