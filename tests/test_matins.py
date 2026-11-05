@@ -2340,3 +2340,44 @@ def test_archive_all_keeps_liked_and_queued_and_records_no_signal(client):
 
     client.post(f"/{secret}/read/archive-all", data={"csrf": csrf, "keep": "none"})
     assert "First story" not in client.get(f"/{secret}/read?view=all").text
+
+
+def test_a_link_only_post_prints_the_linked_article(client, monkeypatch):
+    from later_ink.matins.queue import QueueConnector
+
+    fetched = []
+
+    async def fake(url):
+        fetched.append(url)
+        return _prose()
+
+    monkeypatch.setattr("later_ink.matins.queue._fetch_page", fake)
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    post = (
+        '<p>Local privilege escalation in Linux | '
+        '<a href="https://news.ycombinator.com/item?id=1">Discussion</a> '
+        '<a href="https://openai.com/index/fewer-paths">https://openai.com/index/fewer-paths</a></p>'
+    )
+    store.save_url(secret, "https://bsky.app/profile/bot/post/1", "Local privilege", post)
+    item = store.list_saved(secret)[0]
+    reader = QueueConnector(store, secret)
+    _article, html = asyncio.run(reader.get_article_html(str(item.id)))
+    assert fetched == ["https://openai.com/index/fewer-paths"]
+    assert "sentence, with enough text" in html
+
+
+def test_a_post_with_its_own_text_is_printed_as_is(client, monkeypatch):
+    from later_ink.matins.queue import QueueConnector
+
+    async def fake(url):
+        raise AssertionError("nothing to fetch")
+
+    monkeypatch.setattr("later_ink.matins.queue._fetch_page", fake)
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    post = "<p>" + "commentary " * 40 + '<a href="https://example.com/a">link</a></p>'
+    store.save_url(secret, "https://bsky.app/profile/x/post/2", "Thoughts", post)
+    item = store.list_saved(secret)[0]
+    _article, html = asyncio.run(QueueConnector(store, secret).get_article_html(str(item.id)))
+    assert html == post

@@ -15,6 +15,7 @@ publish anyway.
 
 import re
 from html import escape
+from urllib.parse import urlsplit
 
 from lxml.html import HtmlElement, document_fromstring, tostring
 from readability import Document
@@ -96,6 +97,43 @@ def looks_blocked(raw: str) -> bool:
     if len(text.split()) > _MAX_WALL_WORDS:
         return False
     return any(marker in text for marker in _BLOCK_MARKERS)
+
+
+# A post that is a headline and a link ("Title | Discussion https://…") has
+# nothing to print of its own: the article is behind the link. Above this many
+# words of its own, the post is commentary worth keeping.
+_MAX_LINK_POST_WORDS = 30
+_URL = re.compile(r"https?://\S+")
+# Links that are never the article: the post itself, discussion threads, images.
+_NOT_ARTICLE_HOSTS = ("bsky.app", "cdn.bsky.app", "news.ycombinator.com")
+_IMAGE_PATH = re.compile(r"\.(jpe?g|png|gif|webp|avif|svg)$", re.IGNORECASE)
+
+
+def linked_article(html: str) -> str | None:
+    """The article URL when an HTML fragment is only a short line and a link.
+
+    Supplied content from a Bluesky bot is "Title | Discussion <url>": printing
+    it would give the reader a link on paper. None when the fragment says
+    enough on its own, or links nowhere worth fetching."""
+    try:
+        doc = document_fromstring(html)
+    except (ValueError, TypeError):
+        return None
+    hrefs = [a.get("href") or "" for a in doc.iter("a")]
+    text = doc.text_content()
+    hrefs += _URL.findall(text)
+    own_words = [w for w in _URL.sub(" ", text).split() if any(c.isalnum() for c in w)]
+    if len(own_words) > _MAX_LINK_POST_WORDS:
+        return None
+    for href in hrefs:
+        parts = urlsplit(href.rstrip(".,;)"))
+        host = (parts.hostname or "").removeprefix("www.")
+        if parts.scheme not in ("http", "https") or not host:
+            continue
+        if host in _NOT_ARTICLE_HOSTS or _IMAGE_PATH.search(parts.path):
+            continue
+        return href.rstrip(".,;)")
+    return None
 
 
 def visible_text(html: str) -> str:

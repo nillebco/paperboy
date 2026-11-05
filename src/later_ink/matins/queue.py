@@ -79,6 +79,14 @@ class QueueConnector(Connector):
         if item is None:
             raise ArticleUnavailable("That saved item is gone", 404)
         if item.content:
+            # A post that only points at an article prints the article.
+            link = extract.linked_article(item.content)
+            if link:
+                page = await _fetch_page(link)
+                if page and not extract.looks_blocked(page):
+                    content = extract.html_to_content(page, link)
+                    if content:
+                        return _article(item), _with_recap(item.recap, content)
             # Supplied by the caller (API/agent): trust it as text, but it still
             # goes through the same sanitising EPUB path as fetched HTML.
             return _article(item), _with_recap(item.recap, item.content)
