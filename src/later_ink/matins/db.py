@@ -37,6 +37,8 @@ class Feed:
     # Subscriber session cookie for paywalled publishers (Le Monde). Encrypted
     # at rest and never rendered back into a page.
     auth_cookie: str | None = None
+    # Reader voice for this feed's articles; None = the catalogue's voice.
+    voice: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,8 @@ class Delivery:
     # Automatic: compose from feeds + queue. Curated: print only the queue.
     auto_select: bool = True
     show_dates: bool = True
+    # The Reader's voice when a feed does not set its own. None = the default.
+    voice: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +202,7 @@ class MatinsStore:
             _ensure_column(conn, "feeds", "item_count", "INTEGER")
             _ensure_column(conn, "feeds", "last_item_at", "REAL")
             _ensure_column(conn, "feeds", "auth_cookie", "TEXT")
+            _ensure_column(conn, "feeds", "voice", "TEXT")
             # The queue a user fills with the share sheet or POST /{secret}/save.
             # consumed_by records which issue took the item, so a link is never
             # printed twice even across restarts.
@@ -317,6 +322,7 @@ class MatinsStore:
                 _ensure_column(conn, "delivery", column, "INTEGER")
             _ensure_column(conn, "delivery", "auto_select", "INTEGER NOT NULL DEFAULT 1")
             _ensure_column(conn, "delivery", "show_dates", "INTEGER NOT NULL DEFAULT 1")
+            _ensure_column(conn, "delivery", "voice", "TEXT")
             # Articles the user took out of the next issue. Kept with their title
             # so the list can offer "put it back" without refetching the feed.
             conn.execute(
@@ -458,6 +464,14 @@ class MatinsStore:
                 "UPDATE feeds SET title = ? WHERE secret = ? AND id = ?",
                 (title, secret, fid),
             )
+
+    def set_feed_voice(self, secret: str, fid: str, voice: str | None) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE feeds SET voice = ? WHERE secret = ? AND id = ?",
+                (voice, secret, fid),
+            )
+        return cur.rowcount > 0
 
     def set_feed_paused(self, secret: str, fid: str, paused: bool) -> bool:
         with self._conn() as conn:
@@ -1349,6 +1363,10 @@ class MatinsStore:
                 (int(enabled), secret),
             )
 
+    def set_voice(self, secret: str, voice: str | None) -> None:
+        with self._conn() as conn:
+            conn.execute("UPDATE delivery SET voice = ? WHERE secret = ?", (voice, secret))
+
     def set_auto_select(self, secret: str, enabled: bool) -> None:
         with self._conn() as conn:
             conn.execute(
@@ -1464,6 +1482,7 @@ def _feed(row: sqlite3.Row, fernet: Fernet) -> Feed:
         item_count=row["item_count"],
         last_item_at=row["last_item_at"],
         auth_cookie=cookie,
+        voice=row["voice"],
     )
 
 
@@ -1505,6 +1524,7 @@ def _delivery(row: sqlite3.Row, fernet: Fernet) -> Delivery:
         max_saved=row["max_saved"],
         auto_select=bool(row["auto_select"]),
         show_dates=bool(row["show_dates"]),
+        voice=row["voice"],
     )
 
 

@@ -26,7 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from .. import config as app_config
 from .. import opds
 from ..connectors.base import Article, ArticleUnavailable, UpstreamError
-from . import catalogues, config, extract, notify, pages, rss, webhooks
+from . import catalogues, config, extract, notify, pages, rss, voices, webhooks
 from .issues import (
     IssueLimits,
     IssueService,
@@ -80,18 +80,20 @@ OTP_MAX_ATTEMPTS = 5
 # which is the EPUB builder's job, not the browser's. Links still cannot run
 # anything, and there is no script of our own on the page.
 def _reader_csp() -> str:
-    """Reader pages allow exactly our two scripts, by hash: the scroll restorer
-    and the background row actions (which may only call back to this origin)."""
+    """Reader pages allow exactly our three scripts, by hash: the scroll
+    restorer, the background row actions (which may only call back to this
+    origin) and the Listen player. The player's synthesis runs in a worker
+    served from /assets/tts/, which carries its own policy."""
     hashes = " ".join(
         "'sha256-"
         + base64.b64encode(hashlib.sha256(js.encode("utf-8")).digest()).decode()
         + "'"
-        for js in (pages.READER_SCROLL_JS, pages.READER_ACTIONS_JS)
+        for js in (pages.READER_SCROLL_JS, pages.READER_ACTIONS_JS, pages.READER_LISTEN_JS)
     )
     return (
         "default-src 'none'; img-src https: http: data:; "
         "style-src 'unsafe-inline'; "
-        f"script-src {hashes}; connect-src 'self'; "
+        f"script-src {hashes}; connect-src 'self'; worker-src 'self'; "
         "base-uri 'none'; form-action 'self'"
     )
 
@@ -431,6 +433,8 @@ async def feed_detail(
             csrf=_csrf_token(secret),
             feed=_feed_row(store.get_feed(secret, feed_id)),
             items=rows,
+            account_voice=_account_voice(store.get_delivery(secret)),
+            listening=config.get_tts_assets_dir() is not None,
             window_hours=limits.window_hours,
             max_per_feed=limits.max_per_feed,
             notice=notice,
@@ -453,6 +457,20 @@ async def rename_feed(
         return _back(secret, to=f"feeds/{feed_id}", error="A feed needs a name.")
     store.rename_feed(secret, feed_id, name)
     return _back(secret, to=f"feeds/{feed_id}", notice="Renamed.")
+
+
+@router.post("/{secret}/feeds/{feed_id}/voice")
+async def feed_voice(
+    secret: str, feed_id: str, request: Request, csrf: str = Form(""), voice: str = Form("")
+):
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    chosen = voices.valid_voice(voice)
+    if voice.strip() and chosen is None:
+        return _back(secret, to=f"feeds/{feed_id}", error="Unknown voice.")
+    if not _store(request).set_feed_voice(secret, feed_id, chosen):
+        raise HTTPException(404, "No such feed")
+    return _back(secret, to=f"feeds/{feed_id}", notice="Voice saved.")
 
 
 @router.post("/{secret}/feeds/{feed_id}/pause")
@@ -726,11 +744,30 @@ async def reader_index(
             issue_title=issue_obj.title if issue_obj else None,
             selected=selected,
             body=body,
+            voice=_listen_voice(store, secret, selected, delivery) if body else None,
             notice=notice,
             error=error,
         ),
         csp=READER_CSP,
+        isolated=True,
     )
+
+
+def _listen_voice(store, secret: str, item: dict, delivery) -> str | None:
+    """The voice to read this article with, or None when listening is off.
+
+    A feed's own voice wins (Il Post reads in Italian), then the catalogue's.
+    Saved links and Bluesky posts have no feed, so they use the catalogue's."""
+    if config.get_tts_assets_dir() is None:
+        return None
+    fallback = (delivery.voice if delivery else None) or voices.DEFAULT_VOICE
+    item_id = item.get("id") or ""
+    if item.get("kind") == "rss" and item_id.startswith("feeds:"):
+        feed_id, _, _digest = item_id.removeprefix("feeds:").rpartition("-")
+        feed = store.get_feed(secret, feed_id) if feed_id else None
+        if feed is not None and feed.voice:
+            return feed.voice
+    return fallback
 
 
 def _issue_item(entry, ratings: dict[str, int], queued: dict, read: set[str]) -> dict:
@@ -1303,6 +1340,7 @@ async def settings_post(
     max_saved: str = Form(""),
     auto_select: str = Form("1"),
     show_dates: str = Form(""),
+    voice: str = Form(""),
 ):
     """Schedule, limits and notifications. Sources have their own page."""
     _resolve(secret, request)
@@ -1317,6 +1355,7 @@ async def settings_post(
         "enabled": bool(enabled),
         "auto_select": not curated,
         "show_dates": bool(show_dates),
+        "voice": voice,
         "limits": {
             "max_articles": max_articles,
             "max_per_feed": max_per_feed,
@@ -1335,6 +1374,11 @@ async def settings_post(
             _render_settings(
                 request, secret, error=f"Unknown timezone: {timezone}", overrides=overrides
             ),
+            status=400,
+        )
+    if voice.strip() and voices.valid_voice(voice) is None:
+        return _html(
+            _render_settings(request, secret, error="Unknown voice.", overrides=overrides),
             status=400,
         )
     if webhook_url.strip() and not _valid_url(webhook_url):
@@ -1390,6 +1434,7 @@ async def settings_post(
     _store(request).set_issue_limits(secret, **limits)
     _store(request).set_auto_select(secret, not curated)
     _store(request).set_show_dates(secret, bool(show_dates))
+    _store(request).set_voice(secret, voices.valid_voice(voice))
     return RedirectResponse(f"/{secret}/settings?saved=1", status_code=303)
 
 
@@ -1812,7 +1857,12 @@ def _feed_row(feed) -> dict:
         "item_count": feed.item_count,
         "last_item_at": feed.last_item_at,
         "auth_cookie_set": bool(feed.auth_cookie),
+        "voice": feed.voice,
     }
+
+
+def _account_voice(delivery) -> str:
+    return (delivery.voice if delivery else None) or voices.DEFAULT_VOICE
 
 
 def _feed_rows(request: Request, secret: str) -> list[dict]:
@@ -1883,12 +1933,22 @@ def _back(
     return RedirectResponse(f"/{secret}/{to}{query}", status_code=303)
 
 
-def _html(body: str, *, status: int = 200, csp: str | None = None) -> HTMLResponse:
+def _html(
+    body: str, *, status: int = 200, csp: str | None = None, isolated: bool = False
+) -> HTMLResponse:
     response = HTMLResponse(body, status_code=status)
     if csp:
         # The security middleware uses setdefault, so a route that needs a
         # different policy sets it here and wins.
         response.headers["Content-Security-Policy"] = csp
+    if isolated:
+        # Cross-origin isolation lets the Listen worker run WASM on several
+        # threads; single-threaded, Kokoro is slower than speech on a machine
+        # without WebGPU. "credentialless" rather than "require-corp", so the
+        # article's remote images still load (without cookies). Browsers that
+        # do not know it (Safari) stay single-threaded and work as before.
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
     return response
 
 
@@ -1936,6 +1996,7 @@ def _render_settings(
         "enabled": bool(delivery.enabled) if delivery else True,
         "auto_select": delivery.auto_select if delivery else True,
         "show_dates": delivery.show_dates if delivery else True,
+        "voice": _account_voice(delivery),
         "limits": {
             key: getattr(delivery, key, None) if delivery else None for key in LIMIT_BOUNDS
         },
@@ -1953,6 +2014,8 @@ def _render_settings(
         enabled=values["enabled"],
         auto_select=values["auto_select"],
         show_dates=values["show_dates"],
+        voice=values["voice"],
+        listening=config.get_tts_assets_dir() is not None,
         webhook_secret_set=bool(delivery and delivery.webhook_secret),
         limits=values["limits"],
         defaults={key: getattr(defaults, key) for key in LIMIT_BOUNDS},

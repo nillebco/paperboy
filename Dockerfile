@@ -39,9 +39,22 @@ COPY src/ src/
 RUN pip wheel --no-cache-dir --no-deps --no-build-isolation -w /wheels .
 
 
+# The Reader's text-to-speech files (~420 MB: Kokoro, onnxruntime-web, eSpeak
+# NG). Fetched here rather than committed, every file checked against the
+# hashes in scripts/vendor_tts.sha256; the script uses only the standard
+# library. Its own layer, so a code change does not download them again.
+FROM python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36 AS tts
+
+COPY scripts/vendor_tts.py scripts/vendor_tts.sha256 /vendor/
+RUN python /vendor/vendor_tts.py /tts-assets
+
+
 FROM python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
 
 WORKDIR /app
+
+COPY --from=tts /tts-assets /app/tts-assets
+ENV TTS_ASSETS_DIR=/app/tts-assets
 
 # Dependencies first, from the lockfile, so this layer is cached until the pins
 # actually change — and so the image runs the exact versions CI tested rather

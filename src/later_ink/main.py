@@ -577,6 +577,62 @@ async def demo_gif():
     )
 
 
+# The Reader's Listen player. The worker is ours (in the package); everything it
+# loads is vendored by scripts/vendor_tts.py into TTS_ASSETS_DIR. Workers take
+# their own Content-Security-Policy from their response, so these files carry
+# one: WASM compilation, and nothing fetched from anywhere but here.
+_TTS_TYPES = {
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".wasm": "application/wasm",
+    ".json": "application/json",
+    ".onnx": "application/octet-stream",
+    ".bin": "application/octet-stream",
+}
+_TTS_CSP = (
+    "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; "
+    "connect-src 'self'; worker-src 'self'"
+)
+
+
+@app.api_route("/assets/tts/{path:path}", methods=["GET", "HEAD"])
+async def tts_asset(path: str):
+    from pathlib import Path
+
+    from .matins import config as matins_config
+
+    root = matins_config.get_tts_assets_dir()
+    if root is None:
+        raise HTTPException(404)
+    if path == "worker.js":
+        file = Path(_ASSETS_DIR) / "tts-worker.js"
+        cache = "no-cache"
+    else:
+        file = (root / path).resolve()
+        if not file.is_relative_to(root.resolve()) or not file.is_file():
+            raise HTTPException(404)
+        # Pinned by hash; a new pin changes the bytes, and the ETag with them.
+        cache = "public, max-age=604800"
+    media_type = _TTS_TYPES.get(file.suffix)
+    if media_type is None:
+        if file.name.startswith(("LICENSE", "COPYING")):
+            media_type = "text/plain; charset=utf-8"
+        else:
+            raise HTTPException(404)
+    return FileResponse(
+        file,
+        media_type=media_type,
+        headers={
+            "Cache-Control": cache,
+            "Content-Security-Policy": _TTS_CSP,
+            # The worker must be isolated too to get threads (see the reader's
+            # headers); everything it loads is same-origin.
+            "Cross-Origin-Embedder-Policy": "require-corp",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        },
+    )
+
+
 _OG_IMAGE_PATH = os.path.join(_ASSETS_DIR, "og.png")
 
 

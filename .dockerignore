@@ -1,5 +1,5 @@
 # The Dockerfile only COPYs requirements.txt, requirements-build.txt,
-# pyproject.toml, README.md, docker-entrypoint.sh, and src/.
+# pyproject.toml, README.md, docker-entrypoint.sh, src/ and scripts/vendor_tts.*.
 # Everything else is dead weight in the build context (uploaded to the
 # builder on every deploy) — exclude it.
 
@@ -33,3 +33,6 @@ fly.toml
 # are COPYed and must NOT be listed here.
 requirements-dev.txt
 *.in
+
+# Text-to-speech files: the image fetches its own, pinned (scripts/vendor_tts.py)
+tts-assets/

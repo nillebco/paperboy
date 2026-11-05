@@ -121,16 +121,16 @@ label { display: block; margin: 1rem 0 .3rem; font-size: .86rem; font-weight: 60
 label.check { display: flex; gap: .55rem; align-items: flex-start; font-weight: 500; font-size: .95rem; }
 label.check input { margin-top: .3rem; width: 1.05rem; height: 1.05rem; flex: none; }
 input[type=text], input[type=email], input[type=url], input[type=time], input[type=number],
-input[type=password], input[type=file], textarea {
+input[type=password], input[type=file], textarea, select {
   width: 100%; padding: .58rem .65rem; font: inherit; color: inherit; min-height: 2.6rem;
   background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
 }
-input:focus-visible, button:focus-visible, a:focus-visible, summary:focus-visible {
+input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible, summary:focus-visible {
   outline: 2px solid var(--fg); outline-offset: 2px;
 }
 .hint { font-size: .82rem; color: var(--muted); margin: .3rem 0 0; }
 .inline-form { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0; }
-.inline-form input:not([type=hidden]) { flex: 1 1 13rem; width: auto; }
+.inline-form input:not([type=hidden]), .inline-form select { flex: 1 1 13rem; width: auto; }
 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: 0 1rem; }
 .stats { display: flex; flex-wrap: wrap; gap: .75rem 1.75rem; margin: .7rem 0 0; }
 .stat strong { display: block; font: 700 1.3rem/1.2 var(--serif); }
@@ -208,6 +208,9 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .row-actions .btn { padding: .15rem .45rem; font-size: .78rem; line-height: 1.4; }
 .btn.on { background: var(--soft); border-color: var(--ink); font-weight: 700; }
 .article-toolbar { display: flex; gap: .4rem; flex-wrap: wrap; margin: 0 0 1rem; }
+.listen { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; margin: -.4rem 0 1rem; }
+.listen select { width: auto; min-height: 0; margin: 0; padding: .2rem .4rem; font-size: .85rem; }
+.article .speaking { background: var(--soft); border-radius: 4px; box-shadow: 0 0 0 .3em var(--soft); }
 .article-toolbar form { margin: 0; }
 .reader-pane .card h1 { margin-top: 0; }
 .reader-pane .article { max-width: 42rem; }
@@ -677,11 +680,23 @@ def feed_page(
     items: list[dict],
     window_hours: int,
     max_per_feed: int,
+    account_voice: str = "af_heart",
+    listening: bool = False,
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
     base = f"/{escape(secret)}"
     action = f"{base}/feeds/{escape(feed['id'])}"
+    voice_form = (
+        f"""<label for="voice">Listening voice</label>
+  <form class="inline-form" method="post" action="{action}/voice">
+    {_csrf(csrf)}
+    <select id="voice" name="voice">{_voice_options(feed.get("voice"), inherit=_voice_label(account_voice))}</select>
+    <button class="btn" type="submit">Save</button>
+  </form>"""
+        if listening
+        else ""
+    )
     if feed["error"]:
         status = f'<p class="flash err">Last check failed: {escape(feed["error"])}</p>'
     else:
@@ -729,6 +744,7 @@ at most {max_per_feed} per feed.</p>
     <input type="text" id="title" name="title" value="{escape(feed["title"])}" maxlength="120" required>
     <button class="btn" type="submit">Rename</button>
   </form>
+  {voice_form}
   <div class="actions">
     {_button(f"{action}/pause", csrf, pause_label, fields={"paused": "0" if feed["paused"] else "1"})}
     <span class="meta">{pause_note}</span>
@@ -1040,6 +1056,37 @@ def issue_page(
 
 
 @lru_cache(maxsize=1)
+def _voice_options(current: str | None, *, inherit: str | None = None) -> str:
+    """Grouped by language; `inherit` adds a first "use the default" choice."""
+    from .voices import VOICES
+
+    groups: dict[str, list] = {}
+    for voice in VOICES:
+        groups.setdefault(voice.language, []).append(voice)
+    head = (
+        f'<option value=""{" selected" if not current else ""}>Catalogue voice ({escape(inherit)})</option>'
+        if inherit is not None
+        else ""
+    )
+    return head + "".join(
+        f'<optgroup label="{escape(language)}">'
+        + "".join(
+            f'<option value="{voice.id}"{" selected" if voice.id == current else ""}>'
+            f"{escape(voice.name)}</option>"
+            for voice in members
+        )
+        + "</optgroup>"
+        for language, members in groups.items()
+    )
+
+
+def _voice_label(voice_id: str) -> str:
+    from .voices import VOICES
+
+    voice = next((v for v in VOICES if v.id == voice_id), None)
+    return f"{voice.name}, {voice.language}" if voice else voice_id
+
+
 def _timezone_options() -> str:
     names = sorted(name for name in available_timezones() if "/" in name and not name.startswith("Etc/"))
     return "".join(f'<option value="{escape(name)}">' for name in names)
@@ -1051,6 +1098,20 @@ def _number(name: str, label: str, value, default: int, low: int, high: int) -> 
   <input type="number" id="{name}" name="{name}" min="{low}" max="{high}"
     value="{escape(str(value)) if value is not None and value != "" else ""}" placeholder="{default}">
 </div>"""
+
+
+def _listening_card(voice: str) -> str:
+    return f"""
+  <h2 id="listening">Listening</h2>
+  <div class="card">
+    <label for="voice" style="margin-top:0">Voice</label>
+    <select id="voice" name="voice">{_voice_options(voice)}</select>
+    <p class="hint">Reads an article aloud from the Reader's ▶ Listen button. The voice
+    runs in your browser: the first time it downloads about 90 MB (330 MB on a computer
+    with a graphics card), then nothing leaves your device. A feed can have its own
+    voice, for a feed in another language.</p>
+  </div>
+"""
 
 
 def settings_page(
@@ -1066,6 +1127,8 @@ def settings_page(
     auto_select: bool,
     show_dates: bool,
     webhook_secret_set: bool,
+    voice: str = "af_heart",
+    listening: bool = False,
     limits: dict,
     defaults: dict,
     bounds: dict,
@@ -1149,6 +1212,7 @@ def settings_page(
     <div class="grid2">{limit_fields}</div>
     <p class="hint">Blank uses the default shown. Nothing is printed twice.</p>
   </div>
+{_listening_card(voice) if listening else f'<input type="hidden" name="voice" value="{escape(voice)}">'}
 
   <details id="account"{" open" if not email else ""}>
   <summary><h2 style="display:inline">Account and notifications</h2></summary>
@@ -1292,6 +1356,97 @@ split.addEventListener('submit',function(ev){
 }());"""
 
 
+# Listen: reads the open article aloud, synthesised in the reader's own browser
+# by Kokoro in a worker (/assets/tts/worker.js). The page pulls audio one chunk
+# at a time, a few ahead of what is playing, so a long article never piles up in
+# memory and the first sentence plays as soon as it is ready. Clicking a
+# paragraph while listening jumps there. Delegated from the document, because the
+# background row actions replace the toolbar's buttons after every tap.
+READER_LISTEN_JS = """(function(){
+var box=document.querySelector('.reader-pane .listen');
+if(!box||!window.Worker||!(window.AudioContext||window.webkitAudioContext))return;
+box.hidden=false;
+var button=box.querySelector('[data-listen]'),stopper=box.querySelector('[data-stop]'),
+    status=box.querySelector('[data-status]'),speed=box.querySelector('[data-speed]');
+var AHEAD=3,worker=null,ctx=null,run=0,blocks=[],pending=0,ended=false,
+    playing=false,nextAt=0,sources=[],current=-1;
+try{var saved=localStorage.getItem('matins-listen-speed');if(saved)speed.value=saved;}catch(e){}
+function say(t){status.textContent=t;}
+function texts(){
+  var root=document.querySelector('.reader-pane .article'),sel='p,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption';
+  return Array.prototype.filter.call(root.querySelectorAll(sel),function(el){
+    return !el.querySelector(sel)&&!el.closest('pre')&&el.textContent.trim();});
+}
+function mark(i){
+  if(current>=0&&blocks[current])blocks[current].classList.remove('speaking');
+  current=i;
+  if(i>=0&&blocks[i]){blocks[i].classList.add('speaking');
+    blocks[i].scrollIntoView({block:'nearest',behavior:'smooth'});}
+}
+function request(){while(!ended&&pending<AHEAD){pending++;
+  worker.postMessage({type:'next',run:run,speed:+speed.value});}}
+function start(from){
+  run++;pending=0;ended=false;
+  sources.forEach(function(s){try{s.onended=null;s.stop();}catch(e){}});sources=[];
+  if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)();
+  ctx.resume();nextAt=ctx.currentTime;playing=true;
+  button.textContent='❚❚ Pause';stopper.hidden=false;
+  worker.postMessage({type:'speak',run:run,voice:box.dataset.voice,
+    blocks:blocks.slice(from).map(function(el){return el.textContent.replace(/\s+/g,' ').trim();}),
+    offset:from});
+  request();
+}
+function stop(){
+  run++;ended=true;playing=false;
+  sources.forEach(function(s){try{s.onended=null;s.stop();}catch(e){}});sources=[];
+  if(ctx)ctx.suspend();mark(-1);button.textContent='▶ Listen';stopper.hidden=true;say('');
+}
+function onMessage(ev){
+  var m=ev.data;
+  if(m.type==='status'){say(m.text);return;}
+  if(m.type==='error'){stop();say(m.text);return;}
+  if(m.run!==run)return;
+  if(m.type==='end'){ended=true;pending=0;
+    var last=sources[sources.length-1];
+    if(last)last.addEventListener('ended',function(){if(m.run===run)stop();});else stop();
+    return;}
+  if(m.type!=='audio')return;
+  pending--;
+  var buffer=ctx.createBuffer(1,m.samples.length,m.rate);
+  buffer.copyToChannel(m.samples,0);
+  var src=ctx.createBufferSource();src.buffer=buffer;src.connect(ctx.destination);
+  var at=Math.max(nextAt,ctx.currentTime+0.05);src.start(at);nextAt=at+buffer.duration;
+  sources.push(src);
+  var block=m.block,wait=Math.max(0,(at-ctx.currentTime)*1000),mine=run;
+  setTimeout(function(){if(mine===run&&playing)mark(block);},wait);
+  src.onended=function(){sources.splice(sources.indexOf(src),1);if(mine===run)request();};
+  say('');
+}
+document.addEventListener('click',function(ev){
+  if(ev.target.closest('[data-stop]')){stop();return;}
+  if(ev.target.closest('[data-listen]')){
+    if(!worker){worker=new Worker(box.dataset.worker,{type:'module'});
+      worker.onmessage=onMessage;
+      worker.onerror=function(){stop();say('Listening is not available in this browser.');};}
+    if(!blocks.length)blocks=texts();
+    if(!blocks.length){say('Nothing to read.');return;}
+    if(sources.length||pending){
+      if(playing){ctx.suspend();playing=false;button.textContent='▶ Resume';}
+      else{ctx.resume();playing=true;button.textContent='❚❚ Pause';}
+      return;}
+    start(Math.max(0,current));return;}
+  var para=worker&&!stopper.hidden&&ev.target.closest('.reader-pane .article *');
+  if(para&&!ev.target.closest('a')){
+    var i=blocks.findIndex(function(el){return el===para||el.contains(para);});
+    if(i>=0){mark(i);start(i);}
+  }
+});
+speed.addEventListener('change',function(){
+  try{localStorage.setItem('matins-listen-speed',speed.value);}catch(e){}});
+window.addEventListener('pagehide',function(){if(worker)worker.terminate();});
+}());"""
+
+
 _READER_VIEWS = (
     ("all", "All"),
     ("unread", "Unread"),
@@ -1418,6 +1573,7 @@ def _reader_pane(
     issue: str | None,
     selected: dict,
     body: str,
+    voice: str | None = None,
 ) -> str:
     base = f"/{escape(secret)}"
     rating = selected["rating"]
@@ -1481,8 +1637,26 @@ def _reader_pane(
 <h1>{escape(selected["title"])}</h1>
 <p class="meta" style="margin-top:-.4rem">{escape(selected["source"])}{date}{timing}</p>
 <div class="article-toolbar">{like}{dislike}{queue}{archive}{unread}{original}</div>
+{_listen_bar(voice)}
 <div class="article">{body}</div>
 </div>"""
+
+
+def _listen_bar(voice: str | None) -> str:
+    """The player, hidden until its script finds a browser that can run it."""
+    if not voice:
+        return ""
+    speeds = "".join(
+        f'<option value="{value}"{" selected" if value == "1" else ""}>{label}</option>'
+        for value, label in (("0.8", "0.8×"), ("1", "1×"), ("1.2", "1.2×"), ("1.4", "1.4×"))
+    )
+    return (
+        f'<div class="listen" hidden data-voice="{escape(voice)}" data-worker="/assets/tts/worker.js">'
+        '<button class="btn tiny" type="button" data-listen>▶ Listen</button>'
+        '<button class="btn tiny" type="button" data-stop hidden>■ Stop</button>'
+        f'<select class="tiny" data-speed aria-label="Speed">{speeds}</select>'
+        '<span class="meta" data-status aria-live="polite"></span></div>'
+    )
 
 
 def reader_page(
@@ -1498,6 +1672,7 @@ def reader_page(
     issue_title: str | None = None,
     selected: dict | None = None,
     body: str | None = None,
+    voice: str | None = None,
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
@@ -1576,6 +1751,7 @@ def reader_page(
             issue=issue,
             selected=selected,
             body=body,
+            voice=voice,
         )
     else:
         pane = (
@@ -1614,6 +1790,7 @@ def reader_page(
 </div>
 <script>{READER_SCROLL_JS}</script>
 <script>{READER_ACTIONS_JS}</script>
+<script>{READER_LISTEN_JS}</script>
 """
     return _shell(
         secret, "read", "Reader", body_html, notice=notice, error=error, wide=True

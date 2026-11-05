@@ -973,8 +973,9 @@ def test_reader_lists_items_and_opening_one_marks_it_read(client):
     assert opened.status_code == 200
     assert "Body text of the first story" in opened.text
     assert "Saved for later" in opened.text
-    # The only scripts are our own two (scroll, row actions); the article adds none.
-    assert opened.text.count("<script>") == 2
+    # The only scripts are our own three (scroll, row actions, listen); the
+    # article adds none.
+    assert opened.text.count("<script>") == 3
     assert "First story" not in client.get(f"/{secret}/read?view=unread").text
     # A read row is visually distinct: the CSS hangs off this class.
     assert 'class="row read" data-id=' in client.get(f"/{secret}/read?view=all").text
@@ -2381,3 +2382,107 @@ def test_a_post_with_its_own_text_is_printed_as_is(client, monkeypatch):
     item = store.list_saved(secret)[0]
     _article, html = asyncio.run(QueueConnector(store, secret).get_article_html(str(item.id)))
     assert html == post
+
+
+# ------------------------------------------------------------------- listening
+
+
+def _tts_dir(tmp_path, monkeypatch):
+    root = tmp_path / "tts"
+    (root / "model" / "voices").mkdir(parents=True)
+    (root / "kokoro.web.js").write_text("export {};")
+    (root / "model" / "voices" / "ff_siwis.bin").write_bytes(b"\0" * 8)
+    monkeypatch.setenv("TTS_ASSETS_DIR", str(root))
+    return root
+
+
+def test_listening_reads_with_the_feed_voice_then_the_catalogue_voice(client, tmp_path, monkeypatch):
+    _tts_dir(tmp_path, monkeypatch)
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    store = client.app.state.matins
+    article = _reader_article_id(client, secret, "First story")
+
+    def bar():
+        page = client.get(f"/{secret}/read", params={"article": article}, headers=HTML).text
+        match = re.search(r'class="listen" hidden data-voice="([a-z_]+)"', page)
+        return match and match.group(1)
+
+    assert bar() == "af_heart"
+    client.post(
+        f"/{secret}/settings",
+        data={"csrf": _csrf(client, secret), "schedule": "07:00", "voice": "bm_george"},
+        follow_redirects=False,
+    )
+    assert store.get_delivery(secret).voice == "bm_george"
+    assert bar() == "bm_george"
+
+    feed = store.list_feeds(secret)[0]
+    saved = client.post(
+        f"/{secret}/feeds/{feed.id}/voice",
+        data={"csrf": _csrf(client, secret), "voice": "ff_siwis"},
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    assert bar() == "ff_siwis"
+    # Back to the catalogue's.
+    client.post(
+        f"/{secret}/feeds/{feed.id}/voice",
+        data={"csrf": _csrf(client, secret), "voice": ""},
+        follow_redirects=False,
+    )
+    assert store.get_feed(secret, feed.id).voice is None
+    assert bar() == "bm_george"
+
+
+def test_an_unknown_voice_is_refused(client, tmp_path, monkeypatch):
+    _tts_dir(tmp_path, monkeypatch)
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    store = client.app.state.matins
+    bad = client.post(
+        f"/{secret}/settings",
+        data={"csrf": _csrf(client, secret), "schedule": "07:00", "voice": "../etc"},
+        follow_redirects=False,
+    )
+    assert bad.status_code == 400
+    feed = store.list_feeds(secret)[0]
+    client.post(
+        f"/{secret}/feeds/{feed.id}/voice",
+        data={"csrf": _csrf(client, secret), "voice": "zz_nope"},
+        follow_redirects=False,
+    )
+    assert store.get_feed(secret, feed.id).voice is None
+
+
+def test_without_the_tts_files_there_is_no_listen_button(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("TTS_ASSETS_DIR", str(tmp_path / "missing"))
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    article = _reader_article_id(client, secret, "First story")
+    page = client.get(f"/{secret}/read", params={"article": article}, headers=HTML).text
+    assert 'class="listen"' not in page
+    assert 'id="voice"' not in client.get(f"/{secret}/settings", headers=HTML).text
+    assert client.get("/assets/tts/worker.js").status_code == 404
+
+
+def test_the_reader_policy_allows_the_player_and_its_worker(client):
+    from later_ink.matins.routes import READER_CSP
+
+    assert "worker-src 'self'" in READER_CSP
+    assert READER_CSP.count("'sha256-") == 3
+
+
+def test_tts_files_are_served_with_a_worker_policy_and_nothing_else(client, tmp_path, monkeypatch):
+    _tts_dir(tmp_path, monkeypatch)
+    (tmp_path / "secret.txt").write_text("no")
+    worker = client.get("/assets/tts/worker.js")
+    assert worker.status_code == 200
+    assert worker.headers["content-type"].startswith("text/javascript")
+    assert "'wasm-unsafe-eval'" in worker.headers["content-security-policy"]
+    assert "connect-src 'self'" in worker.headers["content-security-policy"]
+    voice = client.get("/assets/tts/model/voices/ff_siwis.bin")
+    assert voice.status_code == 200 and voice.content == b"\0" * 8
+    assert client.get("/assets/tts/../secret.txt").status_code == 404
+    assert client.get("/assets/tts/%2e%2e/secret.txt").status_code == 404
+    assert client.get("/assets/tts/model/voices/nope.bin").status_code == 404

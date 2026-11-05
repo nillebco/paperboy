@@ -20,3 +20,6 @@ docs/superpowers/
 
 # Secret references are local to this machine.
 fnox.toml
+
+# Text-to-speech files fetched by scripts/vendor_tts.py (~420 MB)
+/tts-assets/

@@ -146,3 +146,13 @@ def get_webhook_timeout() -> float:
 
 def get_webhook_attempts() -> int:
     return _int("WEBHOOK_ATTEMPTS", 3, minimum=1)
+
+
+def get_tts_assets_dir() -> Path | None:
+    """The vendored text-to-speech files (scripts/vendor_tts.py), or None.
+
+    Without them the Reader simply has no Listen button: the files are large and
+    fetched separately, and a development checkout should not need them."""
+    raw = os.environ.get("TTS_ASSETS_DIR", "").strip()
+    path = Path(raw) if raw else Path.cwd() / "tts-assets"
+    return path if (path / "kokoro.web.js").is_file() else None
