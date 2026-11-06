@@ -1901,7 +1901,7 @@ def reader_page(
         f'<button type="submit" class="chip{"" if on else " off"}" aria-pressed="{"true" if on else "false"}" '
         f'title="{escape(title)}">{escape(label)}</button></form>'
     )
-    all_link = toggle("", "All", not off, "Show every source") if off else ""
+    all_link = toggle("", "Show all", True, "Switch every source back on") if off else ""
     source_links = "".join(
         toggle(name, name, name not in off, f"{'Show' if name in off else 'Hide'} {name}")
         for name in sources
