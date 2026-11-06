@@ -412,15 +412,20 @@ class RssConnector(Connector):
         # Prefer the feed's own full text. Publishers who ship content:encoded
         # have already made the editorial choice; re-extracting from their page
         # would only add a request and a way to get less.
-        if item.content_html and extract.word_count(item.content_html) >= 150:
+        # ...unless it ends "Read the full article on…": then it is a teaser,
+        # however long, and the article is behind that link.
+        more = extract.read_more_link(item.content_html) if item.content_html else None
+        if item.content_html and not more and extract.word_count(item.content_html) >= 150:
             return article, item.content_html
 
-        page = await self._fetch_page(item.link, cookie=feed.auth_cookie)
+        target = more or item.link
+        page = await self._fetch_page(target, cookie=feed.auth_cookie if target == item.link else None)
         # A wall (paywall interstitial, consent shell, JS challenge) is not an
         # article: keep the feed's own lede rather than printing the error.
         if page and not extract.looks_blocked(page):
-            extracted = extract.html_to_content(page, item.link)
-            if extracted:
+            extracted = extract.html_to_content(page, target)
+            teaser = extract.word_count(item.content_html) if item.content_html else 0
+            if extracted and (not more or extract.word_count(extracted) >= 1.5 * teaser):
                 return article, extracted
         if item.content_html:
             return article, item.content_html

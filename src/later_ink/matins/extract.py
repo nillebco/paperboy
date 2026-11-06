@@ -136,6 +136,48 @@ def linked_article(html: str) -> str | None:
     return None
 
 
+# "Read the full article on <a>Le Monde</a>", "Lire la suite", "Leggi tutto":
+# a teaser that says where the article is. Not "Read also" / "Leggi anche",
+# which point at another article.
+_READ_MORE = re.compile(
+    r"\b(?:read|see|view)\s+(?:the\s+)?(?:full|whole|complete|entire|rest|original)\b"
+    r"|\bread\s+more\b|\bcontinue\s+reading\b|\bfull\s+(?:article|story)\b"
+    r"|\blire\s+(?:la\s+suite|l['’]article)\b|\bcontinuer\s+(?:à|a)\s+lire\b"
+    r"|\barticle\s+complet\b|\bleggi\s+(?:tutto|l['’]articolo)\b"
+    r"|\bcontinua\s+a\s+leggere\b|\bseguir\s+leyendo\b|\bleer\s+m[aá]s\b"
+    r"|\bweiterlesen\b|\bleia\s+mais\b",
+    re.IGNORECASE,
+)
+# The line itself is short; a long paragraph that happens to say "read more"
+# is prose, not a pointer.
+_MAX_READ_MORE_WORDS = 15
+
+
+def read_more_link(html: str) -> str | None:
+    """The URL a teaser's "read the full article" line points at, or None."""
+    try:
+        doc = document_fromstring(html)
+    except (ValueError, TypeError):
+        return None
+    for a in doc.iter("a"):
+        href = (a.get("href") or "").strip()
+        parts = urlsplit(href)
+        if parts.scheme not in ("http", "https") or _IMAGE_PATH.search(parts.path):
+            continue
+        host = (parts.hostname or "").removeprefix("www.")
+        if host in _NOT_ARTICLE_HOSTS:
+            continue
+        line = a.getparent() if a.getparent() is not None else a
+        while line.tag in ("a", "strong", "em", "b", "i", "span") and line.getparent() is not None:
+            line = line.getparent()
+        text = " ".join(line.text_content().split())
+        if len(text.split()) <= _MAX_READ_MORE_WORDS and _READ_MORE.search(text):
+            return href
+        if _READ_MORE.search(a.text_content()):
+            return href
+    return None
+
+
 def visible_text(html: str) -> str:
     """Plain text of an HTML fragment, for word counts and length checks."""
     try:

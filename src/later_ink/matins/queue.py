@@ -159,7 +159,7 @@ async def linked_content(html: str) -> str | None:
 
     None too when the link is a wall or extracts to nothing: the caller keeps
     the post."""
-    link = extract.linked_article(html)
+    link = extract.linked_article(html) or extract.read_more_link(html)
     if not link:
         return None
     now = time.monotonic()
@@ -167,6 +167,7 @@ async def linked_content(html: str) -> str | None:
     # A failure is retried sooner: the publisher may only have been slow.
     if hit and now - hit[0] < (_LINKED_TTL if hit[1] else 600):
         return hit[1]
+    teaser = extract.word_count(html)
     content = None
     # Some publishers refuse servers outright (openai.com answers 403 behind
     # Cloudflare). The Wayback Machine's raw copy (id_: no toolbar, original
@@ -175,6 +176,10 @@ async def linked_content(html: str) -> str | None:
         page = await _fetch_page(url)
         if page and not extract.looks_blocked(page):
             content = extract.html_to_content(page, link)
+            # Only an article clearly longer than the teaser replaces it: an
+            # extraction that found a cookie notice must not.
+            if content and extract.word_count(content) < 1.5 * teaser:
+                content = None
             if content:
                 break
     if len(_linked) >= _LINKED_MAX:

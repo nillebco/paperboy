@@ -2455,6 +2455,36 @@ def test_a_first_line_that_repeats_the_title_is_dropped():
     assert _drop_repeated_title(other, "Local privilege escalation") == other
 
 
+def test_read_more_lines_point_at_the_article():
+    from later_ink.matins.extract import read_more_link
+
+    assert read_more_link(
+        '<p>Teaser.</p><p>Read the full article on <a href="https://lemonde.fr/a">Le Monde</a></p>'
+    ) == "https://lemonde.fr/a"
+    assert read_more_link('<p>Résumé. <a href="https://x.fr/b">Lire la suite</a></p>') == "https://x.fr/b"
+    assert read_more_link('<p><a href="https://x.it/c">Leggi tutto</a></p>') == "https://x.it/c"
+    # "Read also" points at another article; long prose is not a pointer.
+    assert read_more_link('<p><a href="https://x.it/d">Leggi anche</a>: altro</p>') is None
+    prose = "<p>" + "word " * 30 + 'and you can read more <a href="https://x.com/e">here</a></p>'
+    assert read_more_link(prose) is None
+
+
+def test_a_teaser_is_replaced_only_by_a_longer_article(monkeypatch):
+    from later_ink.matins import queue
+
+    queue._linked.clear()
+    pages = {"https://news.example/long": _prose(), "https://news.example/short": "<p>Cookies?</p>"}
+
+    async def fake(url):
+        return pages.get(url)
+
+    monkeypatch.setattr("later_ink.matins.queue._fetch_page", fake)
+    teaser = "<p>" + "teaser " * 40 + '</p><p>Continue reading on <a href="{}">News</a></p>'
+    long = asyncio.run(queue.linked_content(teaser.format("https://news.example/long")))
+    assert "sentence, with enough text" in long
+    assert asyncio.run(queue.linked_content(teaser.format("https://news.example/short"))) is None
+
+
 # ------------------------------------------------------------------- listening
 
 
