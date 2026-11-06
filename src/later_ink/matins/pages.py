@@ -106,6 +106,8 @@ a.row-title:hover { text-decoration: underline; opacity: 1; }
 .tag.bad { color: var(--warn); border-color: currentColor; }
 .actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: .9rem 0 0; align-items: center; }
 .actions form { margin: 0; }
+/* A class that sets display (.btn, .listen) would otherwise show a hidden element. */
+[hidden] { display: none !important; }
 .btn {
   font: 550 .92rem/1.1 var(--sans); padding: .68em 1em; min-height: 2.6rem;
   border: 1px solid var(--line); border-radius: 7px; background: var(--card);
@@ -1300,16 +1302,21 @@ def settings_page(
 # Progressive enhancement, not a dependency: without it the reader still works,
 # the list just jumps to the top after a click. A full-page navigation discards
 # both the inner list's scrollTop and the page scroll, so save them per tab and
-# restore on load. Kept as a constant because its hash is in the reader's CSP.
+# restore on load. Under a phone's article overlay the page stays at the top:
+# iOS Safari can draw a fixed overlay over a deeply scrolled page with its top
+# (and the Close button) off screen. The list position is kept for when the
+# overlay closes. Kept as a constant because its hash is in the reader's CSP.
 READER_SCROLL_JS = (
     "(function(){var l=document.querySelector('.reader-list');if(!l)return;"
     "var k='matins-scroll:'+location.pathname;"
     "if('scrollRestoration' in history)history.scrollRestoration='manual';"
+    "var o=document.querySelector('.reader-pane-col.open');"
+    "o=o&&getComputedStyle(o).position==='fixed';"
     "function restore(){try{var y=sessionStorage.getItem(k);"
     "if(y!==null)l.scrollTop=+y;var p=sessionStorage.getItem(k+':page');"
-    "if(p!==null)window.scrollTo(0,+p);}catch(e){}}"
+    "if(p!==null&&!o)window.scrollTo(0,+p);}catch(e){}}"
     "function save(){try{sessionStorage.setItem(k,l.scrollTop);"
-    "sessionStorage.setItem(k+':page',window.scrollY);}catch(e){}}"
+    "if(!o)sessionStorage.setItem(k+':page',window.scrollY);}catch(e){}}"
     "window.addEventListener('pagehide',save);"
     "l.addEventListener('click',save);l.addEventListener('submit',save);"
     "restore();window.addEventListener('load',restore);}());"
