@@ -2384,6 +2384,75 @@ def test_a_post_with_its_own_text_is_printed_as_is(client, monkeypatch):
     assert html == post
 
 
+def test_the_reader_shows_the_article_a_link_only_post_points_at(client, monkeypatch):
+    from later_ink.matins import queue
+
+    queue._linked.clear()
+    fetched = []
+
+    async def fake(url):
+        fetched.append(url)
+        return _prose()
+
+    monkeypatch.setattr("later_ink.matins.queue._fetch_page", fake)
+    secret = _signup_without_readwise(client)
+    title = "Local privilege escalation in Linux | Discussion"
+    client.post(
+        "/api/v1/candidates",
+        headers=_api(secret),
+        json={
+            "items": [
+                {
+                    "id": "hn1",
+                    "url": "https://bsky.app/profile/bot/post/1",
+                    "title": title,
+                    "source": "@hackernewsbot",
+                    "content": (
+                        '<p>Local privilege escalation in Linux | '
+                        '<a href="https://news.ycombinator.com/item?id=1">Discussion</a> '
+                        '<a href="https://example.org/lpe">https://example.org/lpe</a></p>'
+                    ),
+                    "published": datetime.now(UTC).timestamp(),
+                }
+            ]
+        },
+    )
+    page = client.get(f"/{secret}/read?article=cand%3Ahn1").text
+    assert "sentence, with enough text" in page
+    assert "https://example.org/lpe</a>" not in page
+    client.get(f"/{secret}/read?article=cand%3Ahn1")
+    assert fetched == ["https://example.org/lpe"]  # cached the second time
+
+
+def test_a_publisher_that_refuses_servers_is_read_from_the_wayback_machine(monkeypatch):
+    from later_ink.matins import queue
+
+    queue._linked.clear()
+    fetched = []
+
+    async def fake(url):
+        fetched.append(url)
+        return _prose() if url.startswith("https://web.archive.org/") else None
+
+    monkeypatch.setattr("later_ink.matins.queue._fetch_page", fake)
+    post = '<p>Title | <a href="https://openai.com/index/x/">https://openai.com/index/x/</a></p>'
+    content = asyncio.run(queue.linked_content(post))
+    assert "sentence, with enough text" in content
+    assert fetched == [
+        "https://openai.com/index/x/",
+        "https://web.archive.org/web/2id_/https://openai.com/index/x/",
+    ]
+
+
+def test_a_first_line_that_repeats_the_title_is_dropped():
+    from later_ink.matins.routes import _drop_repeated_title
+
+    body = "<h1>Local privilege escalation</h1><p>The article.</p>"
+    assert _drop_repeated_title(body, "Local privilege escalation | Discussion") == "<p>The article.</p>"
+    other = "<p>Something else entirely.</p><p>More.</p>"
+    assert _drop_repeated_title(other, "Local privilege escalation") == other
+
+
 # ------------------------------------------------------------------- listening
 
 

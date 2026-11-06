@@ -8,6 +8,7 @@ builder exactly like a feed does.
 """
 
 import re
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from html import escape
@@ -80,13 +81,9 @@ class QueueConnector(Connector):
             raise ArticleUnavailable("That saved item is gone", 404)
         if item.content:
             # A post that only points at an article prints the article.
-            link = extract.linked_article(item.content)
-            if link:
-                page = await _fetch_page(link)
-                if page and not extract.looks_blocked(page):
-                    content = extract.html_to_content(page, link)
-                    if content:
-                        return _article(item), _with_recap(item.recap, content)
+            content = await linked_content(item.content)
+            if content:
+                return _article(item), _with_recap(item.recap, content)
             # Supplied by the caller (API/agent): trust it as text, but it still
             # goes through the same sanitising EPUB path as fetched HTML.
             return _article(item), _with_recap(item.recap, item.content)
@@ -147,6 +144,43 @@ def title_from_url(url: str) -> str:
     if not words:
         return urlsplit(url).hostname or url
     return words[:1].upper() + words[1:]
+
+
+# The reader opens the same post again and again (list, issue view, back): keep
+# what the link gave for a while instead of fetching the publisher every time.
+_LINKED_TTL = 6 * 3600
+_LINKED_MAX = 64
+_linked: dict[str, tuple[float, str | None]] = {}
+_WAYBACK = "https://web.archive.org/web/2id_/"
+
+
+async def linked_content(html: str) -> str | None:
+    """The linked article's body when `html` is only a line and a link, else None.
+
+    None too when the link is a wall or extracts to nothing: the caller keeps
+    the post."""
+    link = extract.linked_article(html)
+    if not link:
+        return None
+    now = time.monotonic()
+    hit = _linked.get(link)
+    # A failure is retried sooner: the publisher may only have been slow.
+    if hit and now - hit[0] < (_LINKED_TTL if hit[1] else 600):
+        return hit[1]
+    content = None
+    # Some publishers refuse servers outright (openai.com answers 403 behind
+    # Cloudflare). The Wayback Machine's raw copy (id_: no toolbar, original
+    # markup) is then the article as published.
+    for url in (link, f"{_WAYBACK}{link}"):
+        page = await _fetch_page(url)
+        if page and not extract.looks_blocked(page):
+            content = extract.html_to_content(page, link)
+            if content:
+                break
+    if len(_linked) >= _LINKED_MAX:
+        _linked.pop(next(iter(_linked)))
+    _linked[link] = (now, content)
+    return content
 
 
 async def _fetch_page(url: str) -> str | None:

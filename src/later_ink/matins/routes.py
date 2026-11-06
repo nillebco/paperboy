@@ -22,6 +22,7 @@ from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from lxml.html import fragment_fromstring, tostring
 
 from .. import config as app_config
 from .. import opds
@@ -35,6 +36,7 @@ from .issues import (
     next_run,
     published_label,
 )
+from .queue import linked_content
 from .reader import to_page_html
 
 logger = logging.getLogger(__name__)
@@ -841,9 +843,47 @@ async def _reader_body(request, secret: str, reader, item: dict) -> str | None:
         candidate = _store(request).get_candidate(secret, item["id"].split(":", 1)[1])
         if candidate is None:
             return None
-        return _candidate_html(candidate.content or candidate.summary)
+        content = candidate.content or candidate.summary
+        # A post that only points at an article ("Title | Discussion <link>")
+        # shows the article, as the issue prints it.
+        linked = await linked_content(content) if content else None
+        return _drop_repeated_title(
+            to_page_html(linked) if linked else _candidate_html(content), item["title"]
+        )
     _article, raw = await reader.get_article_html(item["id"])
-    return to_page_html(raw)
+    return _drop_repeated_title(to_page_html(raw), item["title"])
+
+
+def _drop_repeated_title(body: str | None, title: str) -> str | None:
+    """The body without a first line that only repeats the pane's heading.
+
+    A Bluesky bot's post is its own title, and many pages open with their <h1>:
+    either way the reader would see the title twice, the second time as the
+    whole first paragraph."""
+    if not body or not title:
+        return body
+    try:
+        root = fragment_fromstring(body, create_parent="div")
+    except (ValueError, TypeError):
+        return body
+    first = next((el for el in root if isinstance(el.tag, str)), None)
+    if first is None or first.tag not in ("h1", "h2", "h3", "p"):
+        return body
+
+    def norm(text: str) -> str:
+        return " ".join(text.replace("|", " ").split()).casefold()
+
+    text, heading = norm(first.text_content()), norm(title)
+    # The bot's line carries a "Discussion" anchor after the title.
+    text = text.removesuffix(" discussion").strip()
+    heading = heading.removesuffix(" discussion").strip()
+    if not text or text != heading:
+        return body
+    if first.findall(".//img"):
+        return body
+    root.remove(first)
+    rest = "".join(tostring(el, encoding="unicode") for el in root)
+    return ((root.text or "").strip() + rest) or body
 
 
 def _candidate_html(content: str) -> str:
