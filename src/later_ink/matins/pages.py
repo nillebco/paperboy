@@ -1165,9 +1165,30 @@ def _number(name: str, label: str, value, default: int, low: int, high: int) -> 
 </div>"""
 
 
-def _listening_card(secret: str, choices: dict[str, str]) -> str:
-    """A voice per language the catalogue reads, and a way to add one."""
+_ENGINES = (
+    ("kokoro", "Kokoro, in your browser",
+     "Runs on your device: the first time it downloads about 90 MB (330 MB on a computer "
+     "with a graphics card), then nothing leaves it. Too slow on most phones."),
+    ("server", "Kokoro, on the Matins server",
+     "The same voices, made on the server and kept for the next time: starts in a second "
+     "or two on any device, and keeps playing with the screen off."),
+    ("device", "This device's own voices",
+     "Instant and offline, with the voices your phone or computer has installed."),
+)
+
+
+def _listening_card(
+    secret: str, choices: dict[str, str], engine: str = "kokoro", server: bool = False
+) -> str:
+    """Who reads, a voice per language the catalogue reads, and a way to add one."""
     from .voices import LANGUAGE_NAMES, LANGUAGES
+
+    engines = [e for e in _ENGINES if server or e[0] != "server"]
+    engine_options = "".join(
+        f'<option value="{value}"{" selected" if value == engine else ""}>{escape(label)}</option>'
+        for value, label, _ in engines
+    )
+    engine_hints = " ".join(f"<b>{escape(label)}</b>: {escape(hint)}" for _, label, hint in engines)
 
     action = f"/{escape(secret)}/settings/languages"
     rows = "".join(
@@ -1191,16 +1212,17 @@ def _listening_card(secret: str, choices: dict[str, str]) -> str:
   <h2 id="listening">Listening</h2>
   <div class="card">
     <p class="hint" style="margin-top:0">Reads an article aloud from the Reader's ▶ Listen
-    button, with the voice of the language it is written in. The voices run in your
-    browser: the first time they download about 90 MB (330 MB on a computer with a
-    graphics card), then nothing leaves your device. A language not listed here is read
-    with a default voice of its own.</p>
+    button, with the voice of the language it is written in. A language not listed here
+    is read with a default voice of its own.</p>
+    <label for="listen_engine">Voice engine</label>
+    <select id="listen_engine" name="listen_engine" data-listen-engine>{engine_options}</select>
+    <p class="hint">{engine_hints}</p>
+    <h3>Kokoro voices</h3>
     {rows}
     {add}
     <div class="device-voices" data-device-voices data-languages="{",".join(choices)}" hidden>
       <h3>This device's voices</h3>
-      <p class="hint">On an iPhone or iPad, Matins reads with the device's own voices
-      instead: pick one per language. The choice stays on this device. Better voices can
+      <p class="hint">Pick one per language. The choice stays on this device. Better voices can
       be downloaded in the device's Settings → Accessibility → Spoken Content → Voices.</p>
       <div data-voice-list></div>
     </div>
@@ -1224,6 +1246,8 @@ def settings_page(
     webhook_secret_set: bool,
     voice_choices: dict[str, str] | None = None,
     listening: bool = False,
+    listen_engine: str = "kokoro",
+    server_speech: bool = False,
     limits: dict,
     defaults: dict,
     bounds: dict,
@@ -1309,7 +1333,7 @@ def settings_page(
     <div class="grid2">{limit_fields}</div>
     <p class="hint">Blank uses the default shown. Nothing is printed twice.</p>
   </div>
-{_listening_card(secret, voice_choices or {"en": "af_heart"}) if listening else ""}
+{_listening_card(secret, voice_choices or {"en": "af_heart"}, listen_engine, server_speech) if listening else ""}
 
   <details id="account"{" open" if not email else ""}>
   <summary><h2 style="display:inline">Account and notifications</h2></summary>
@@ -1483,10 +1507,13 @@ var LANG={a:'en-US',b:'en-GB',f:'fr-FR',i:'it-IT',e:'es-ES',p:'pt-BR'},forced=''
 try{forced=localStorage.getItem('matins-listen-engine')||'';}catch(e){}
 var apple=/iPhone|iPad|iPod/.test(navigator.userAgent)||
   (/Macintosh/.test(navigator.userAgent)&&navigator.maxTouchPoints>1);
-var SYSTEM='speechSynthesis' in window&&(forced?forced==='system':apple&&!window.crossOriginIsolated);
+// The engine chosen in Settings; localStorage 'matins-listen-engine' overrides it.
+var engine=bars[0].dataset.engine||'kokoro',BASE=location.pathname.replace(/\\/read.*$/,'');
+var SYSTEM='speechSynthesis' in window&&(forced?forced==='system':engine==='device');
+var SERVER=!SYSTEM&&(forced?forced==='server':engine==='server');
 var AHEAD=3,worker=null,ctx=null,run=0,pending=0,ended=true,playing=false,nextAt=0,sources=[],
     bar=null,session=0,blocks=[],current=-1,list=[],at=-1,articleOf={},texts={},row=null,
-    watch=0,heard=false,hold=null;
+    watch=0,heard=false,hold=null,silent=null,el=null,segs=[],seg=-1,segOffset=0;
 try{var saved=localStorage.getItem('matins-listen-speed');
   if(saved)bars.forEach(function(b){b.querySelector('[data-speed]').value=saved;});}catch(e){}
 function speed(){return +(bar||bars[0]).querySelector('[data-speed]').value||1;}
@@ -1515,6 +1542,17 @@ function markRow(k){
   if(row)row.classList.remove('speaking');row=null;
   if(k>=0&&list[k]){row=list[k];row.classList.add('speaking');
     row.scrollIntoView({block:'nearest',behavior:'smooth'});}}
+// One second of silence as a WAV: what an <audio> plays to keep the page in
+// the playback session (and the page alive with the screen off) between sounds.
+function silentUrl(){
+  if(!silent){var n=8000,w=new DataView(new ArrayBuffer(44+n*2)),
+      put=function(o,t){for(var j=0;j<t.length;j++)w.setUint8(o+j,t.charCodeAt(j));};
+    put(0,'RIFF');w.setUint32(4,36+n*2,true);put(8,'WAVEfmt ');w.setUint32(16,16,true);
+    w.setUint16(20,1,true);w.setUint16(22,1,true);w.setUint32(24,8000,true);w.setUint32(28,16000,true);
+    w.setUint16(32,2,true);w.setUint16(34,16,true);put(36,'data');w.setUint32(40,n*2,true);
+    silent=URL.createObjectURL(new Blob([w],{type:'audio/wav'}));}
+  return silent;}
+function quiet(a){try{var q=a.play();if(q&&q.catch)q.catch(function(){});}catch(e){}}
 function silence(){sources.forEach(function(s){try{s.onended=null;s.stop();}catch(e){}});sources=[];}
 function request(){while(!ended&&pending<AHEAD){pending++;
   worker.postMessage({type:'next',run:run,speed:speed()});}}
@@ -1571,6 +1609,7 @@ function say_(lines,voice,offset,mine){
   next();}
 function spoken(){
   if(bar!==all){stop();return;}
+  if(SERVER)idle();
   if(at+1>=list.length){stop();return;}
   var mine=session;nextAt=ctx.currentTime;chime();
   setTimeout(function(){if(mine===session)advance();},1300);}
@@ -1584,13 +1623,11 @@ function begin(b){
   // highlight goes on. Ask for playback, and on iOS before 17 hold a silent
   // <audio> loop, which moves the page into the playback session too.
   try{if(navigator.audioSession)navigator.audioSession.type='playback';}catch(e){}
-  if(apple&&!SYSTEM){if(!hold){var n=8000,w=new DataView(new ArrayBuffer(44+n*2)),
-      put=function(o,t){for(var j=0;j<t.length;j++)w.setUint8(o+j,t.charCodeAt(j));};
-    put(0,'RIFF');w.setUint32(4,36+n*2,true);put(8,'WAVEfmt ');w.setUint32(16,16,true);
-    w.setUint16(20,1,true);w.setUint16(22,1,true);w.setUint32(24,8000,true);w.setUint32(28,16000,true);
-    w.setUint16(32,2,true);w.setUint16(34,16,true);put(36,'data');w.setUint32(40,n*2,true);
-    hold=new Audio(URL.createObjectURL(new Blob([w],{type:'audio/wav'})));hold.loop=true;}
-    try{var q=hold.play();if(q&&q.catch)q.catch(function(){});}catch(e){}}
+  if(apple&&!SYSTEM&&!SERVER){if(!hold){hold=new Audio(silentUrl());hold.loop=true;}quiet(hold);}
+  // The server's paragraphs play in one <audio>, which has to start in the tap.
+  if(SERVER){if(!el){el=new Audio();el.addEventListener('playing',segPlaying);
+      el.addEventListener('ended',segEnded);el.addEventListener('error',segError);}
+    idle();}
   if(!ctx)ctx=new AC();
   ctx.resume();
   // iOS only lets a page make sound once it has started one inside the tap.
@@ -1599,12 +1636,12 @@ function begin(b){
   nextAt=ctx.currentTime;playing=true;heard=false;label(b,'playing');}
 function stop(){
   session++;run++;ended=true;playing=false;clearTimeout(watch);
-  silence();if(ctx)ctx.suspend();if(hold)hold.pause();if(SYSTEM)speechSynthesis.cancel();mark(-1);markRow(-1);
+  silence();if(ctx)ctx.suspend();if(hold)hold.pause();if(el){segs=[];el.pause();}if(SYSTEM)speechSynthesis.cancel();mark(-1);markRow(-1);
   if(bar){say('');label(bar,'idle');}
   bar=null;at=-1;}
 function startOne(from){
   begin(one);
-  (SYSTEM?talk:speak)(blocks.slice(from).map(function(el){return el.textContent.replace(/\\s+/g,' ').trim();}),
+  (SYSTEM?talk:SERVER?serve:speak)(blocks.slice(from).map(function(el){return el.textContent.replace(/\\s+/g,' ').trim();}),
     one.dataset.voice,from);}
 function load(k){
   var r=list[k],id=r&&r.dataset.id;
@@ -1620,12 +1657,46 @@ function advance(){
     if(mine!==session)return;
     if(!d||!d.blocks||!d.blocks.length){advance();return;}
     if(SYSTEM)talk(d.blocks,d.voice||all.dataset.voice,0);
+    else if(SERVER)serve(d.blocks,d.voice||all.dataset.voice,0);
     else articleOf[speak(d.blocks,d.voice||all.dataset.voice,0)]=at;
-    load(at+1);});}
+    // The server makes the next article while this one plays.
+    load(at+1).then(function(n){if(SERVER&&n&&n.blocks&&n.blocks.length&&mine===session)
+      post(n.blocks,n.voice||all.dataset.voice,true).catch(function(){});});});}
 function startAll(k){begin(all);markRow(-1);list=rows();at=k-1;advance();}
 function finish(){
   ended=true;var last=sources[sources.length-1],mine=session;
   if(last)last.addEventListener('ended',function(){if(mine===session)stop();});else stop();}
+// The server engine: paragraphs posted, then played one MP3 after the other
+// while the server makes the next ones (it speaks about twice as fast as it is
+// spoken, and keeps every paragraph for the next listener).
+function post(lines,voice,later){
+  return fetch(BASE+'/read/speech',{method:'POST',credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({voice:voice,blocks:lines,later:!!later})})
+    .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();});}
+function segUrl(k){return BASE+'/read/speech/'+k+'.mp3';}
+// Silence on a loop while waiting: the page stays in the playback session.
+function idle(){el.loop=true;el.src=silentUrl();quiet(el);}
+function serve(lines,voice,offset){
+  var mine=session;ended=false;segs=[];seg=-1;segOffset=offset;say('Preparing the voice\u2026');
+  post(lines,voice).then(function(d){if(mine!==session)return;segs=d.keys||[];nextSeg();})
+    .catch(function(e){if(mine===session)fail('The server could not read this article ('+e.message+').');});}
+function nextSeg(){
+  seg++;
+  if(seg>=segs.length){segs=[];ended=true;spoken();return;}
+  el.loop=false;el.src=segUrl(segs[seg]);el.defaultPlaybackRate=el.playbackRate=speed();
+  if(seg+1<segs.length)fetch(segUrl(segs[seg+1]),{credentials:'same-origin'}).catch(function(){});
+  if(playing)quiet(el);}
+function segPlaying(){
+  if(el.loop||seg<0||!bar)return;
+  heard=true;say('');el.playbackRate=speed();
+  if(bar===all)markRow(at);else mark(segOffset+seg);
+  if('mediaSession' in navigator&&window.MediaMetadata){
+    var t=bar===all?(list[at]&&list[at].querySelector('.row-title')):document.querySelector('.reader-pane > h1');
+    try{navigator.mediaSession.metadata=new MediaMetadata({title:t?t.textContent.trim():'Matins',artist:'Matins'});}catch(e){}}}
+function segEnded(){if(!el.loop&&segs.length)nextSeg();}
+function segError(){if(el.loop||!segs.length)return;
+  fail('Could not play the audio'+(el.error?' ('+el.error.code+')':'')+'.');}
+function fail(text){var b=bar;stop();bar=b;report(text);say(text);bar=null;}
 // Two soft notes between two articles, with a breath either side.
 function chime(){
   var rate=ctx.sampleRate,n=Math.floor(rate*0.7),buffer=ctx.createBuffer(1,n,rate),d=buffer.getChannelData(0);
@@ -1696,10 +1767,12 @@ document.addEventListener('click',function(ev){
   var b=ev.target.closest('.listen');
   if(b&&ev.target.closest('[data-stop]')){stop();return;}
   if(b&&ev.target.closest('[data-listen]')){
-    if(!SYSTEM)ensureWorker(b);
+    if(!SYSTEM&&!SERVER)ensureWorker(b);
     if(bar===b){
-      if(playing){if(SYSTEM)speechSynthesis.pause();else ctx.suspend();playing=false;label(b,'paused');}
-      else{if(SYSTEM)speechSynthesis.resume();else ctx.resume();playing=true;label(b,'playing');}
+      if(playing){if(SYSTEM)speechSynthesis.pause();else if(SERVER)el.pause();else ctx.suspend();
+        playing=false;label(b,'paused');}
+      else{if(SYSTEM)speechSynthesis.resume();else if(SERVER)quiet(el);else ctx.resume();
+        playing=true;label(b,'playing');}
       return;}
     if(b===one){blocks=leaves();
       if(!blocks.length){b.querySelector('[data-status]').textContent='Nothing to read.';return;}
@@ -1718,7 +1791,13 @@ document.addEventListener('click',function(ev){
 });
 bars.forEach(function(b){b.querySelector('[data-speed]').addEventListener('change',function(ev){
   bars.forEach(function(o){o.querySelector('[data-speed]').value=ev.target.value;});
+  if(el&&!el.loop)el.playbackRate=+ev.target.value||1;
   try{localStorage.setItem('matins-listen-speed',ev.target.value);}catch(e){}});});
+// The lock screen's play and pause buttons.
+if(SERVER&&'mediaSession' in navigator){try{
+  navigator.mediaSession.setActionHandler('pause',function(){if(bar&&playing){el.pause();playing=false;label(bar,'paused');}});
+  navigator.mediaSession.setActionHandler('play',function(){if(bar&&!playing){quiet(el);playing=true;label(bar,'playing');}});
+}catch(e){}}
 if(SYSTEM)speechSynthesis.getVoices();
 window.addEventListener('pagehide',function(){if(worker)worker.terminate();});
 }());"""
@@ -1851,6 +1930,7 @@ def _reader_pane(
     selected: dict,
     body: str,
     voice: str | None = None,
+    engine: str = "kokoro",
 ) -> str:
     base = f"/{escape(secret)}"
     rating = selected["rating"]
@@ -1914,12 +1994,12 @@ def _reader_pane(
 <h1>{escape(selected["title"])}</h1>
 <p class="meta" style="margin-top:-.4rem">{escape(selected["source"])}{date}{timing}</p>
 <div class="article-toolbar">{like}{dislike}{queue}{archive}{unread}{original}</div>
-{_listen_bar(voice)}
+{_listen_bar(voice, engine=engine)}
 <div class="article">{body}</div>
 </div>"""
 
 
-def _listen_bar(voice: str | None, *, source: str | None = None) -> str:
+def _listen_bar(voice: str | None, *, source: str | None = None, engine: str = "kokoro") -> str:
     """The player, hidden until its script finds a browser that can run it.
 
     With `source` it is the list's "Listen to all", which fetches each article's
@@ -1933,7 +2013,7 @@ def _listen_bar(voice: str | None, *, source: str | None = None) -> str:
     origin = f' data-source="{escape(source)}"' if source else ""
     return (
         f'<div class="listen{" listen-all" if source else ""}" hidden data-voice="{escape(voice)}" '
-        f'data-worker="/assets/tts/worker.js"{origin}>'
+        f'data-engine="{escape(engine)}" data-worker="/assets/tts/worker.js"{origin}>'
         f'<button class="btn tiny" type="button" data-listen>▶ Listen{" to all" if source else ""}</button>'
         '<button class="btn tiny" type="button" data-stop hidden>■ Stop</button>'
         f'<select class="tiny" data-speed aria-label="Speed">{speeds}</select>'
@@ -1976,6 +2056,7 @@ def reader_page(
     body: str | None = None,
     voice: str | None = None,
     list_voice: str | None = None,
+    listen_engine: str = "kokoro",
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
@@ -2051,7 +2132,7 @@ def reader_page(
         for item in items
     ) or f'<p class="meta">{empty}</p>'
     if items and view != "archived":
-        rows = _listen_bar(list_voice, source=f"{base}/read/listen") + rows
+        rows = _listen_bar(list_voice, source=f"{base}/read/listen", engine=listen_engine) + rows
     if selected and body is not None:
         pane = _reader_pane(
             secret=secret,
@@ -2062,6 +2143,7 @@ def reader_page(
             selected=selected,
             body=body,
             voice=voice,
+            engine=listen_engine,
         )
     else:
         pane = (

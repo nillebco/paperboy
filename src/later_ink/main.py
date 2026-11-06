@@ -344,6 +344,11 @@ async def canonical_host(request: Request, call_next):
     return RedirectResponse(target, status_code=301)
 
 
+# A paragraph read aloud by the server, named by its content: the browser may
+# keep it ("private", never a shared cache) so the next one can be fetched ahead.
+_PRIVATE_IMMUTABLE = re.compile(r"/read/speech/[0-9a-f]{32}\.mp3$")
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     """Hardening headers, and cache policy for anything user-specific.
@@ -361,7 +366,7 @@ async def security_headers(request: Request, call_next):
         )
     if response.headers.get("content-type", "").startswith("text/html"):
         response.headers.setdefault("Content-Security-Policy", pages.CSP)
-    if not _is_public(request.url.path):
+    if not _is_public(request.url.path) and not _PRIVATE_IMMUTABLE.search(request.url.path):
         # Overwrite rather than setdefault: a catalog feed or a page showing a
         # secret must not sit in a proxy cache, whatever the handler asked for.
         response.headers["Cache-Control"] = "private, no-store"

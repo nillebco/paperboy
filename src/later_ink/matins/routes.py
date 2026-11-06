@@ -24,14 +24,14 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from lxml.html import fragment_fromstring, tostring
 
 from .. import config as app_config
 from .. import opds
 from ..connectors.base import Article, ArticleUnavailable, UpstreamError
 from ..fetch import fetch_bytes
-from . import catalogues, config, extract, notify, pages, rss, taste, voices, webhooks
+from . import catalogues, config, extract, notify, pages, rss, speech, taste, voices, webhooks
 from .issues import (
     IssueLimits,
     IssueService,
@@ -99,7 +99,7 @@ def _reader_csp() -> str:
     return (
         "default-src 'none'; img-src https: http: data:; "
         "style-src 'unsafe-inline'; "
-        f"script-src {hashes}; connect-src 'self'; worker-src 'self'; media-src blob:; "
+        f"script-src {hashes}; connect-src 'self'; worker-src 'self'; media-src 'self' blob:; "
         "base-uri 'none'; form-action 'self'"
     )
 
@@ -776,6 +776,7 @@ async def reader_index(
                 else None
             ),
             list_voice=_listen_voice(store, secret, {}, delivery),
+            listen_engine=_listen_engine(delivery),
             notice=notice,
             error=error,
         ),
@@ -804,6 +805,17 @@ def _listen_voice(store, secret: str, item: dict, delivery, text: str = "") -> s
                 return feed.voice
     language = voices.detect_language(text) if text else None
     return voices.voice_for(language or "en", choices)
+
+
+ENGINES = ("kokoro", "server", "device")
+
+
+def _listen_engine(delivery) -> str:
+    """Who reads aloud: Kokoro in the browser unless the reader chose otherwise."""
+    engine = getattr(delivery, "listen_engine", None) or "kokoro"
+    if engine == "server" and speech.service() is None:
+        return "kokoro"
+    return engine if engine in ENGINES else "kokoro"
 
 
 def _issue_item(entry, ratings: dict[str, int], queued: dict, read: set[str]) -> dict:
@@ -1116,6 +1128,55 @@ async def reader_listen(secret: str, request: Request, article: str):
             "blocks": [item["title"], *blocks] if blocks else [],
         },
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.post("/{secret}/read/speech")
+async def reader_speech(secret: str, request: Request):
+    """Paragraphs to read aloud on the server: their keys, in order.
+
+    The paragraphs are queued at once, the first first, ahead of any older
+    listen; each one's MP3 is then at /read/speech/<key>.mp3."""
+    _resolve(secret, request)
+    service = speech.service()
+    if service is None:
+        raise HTTPException(404, "The server does not read aloud")
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Expected {voice, blocks}")
+    voice = str(body.get("voice") or "")
+    blocks = body.get("blocks")
+    if not voices.valid_voice(voice):
+        raise HTTPException(400, "Unknown voice")
+    if not isinstance(blocks, list) or not blocks or len(blocks) > speech.MAX_BLOCKS:
+        raise HTTPException(400, "Expected a list of paragraphs")
+    texts = [" ".join(str(text).split())[: speech.MAX_CHARS] for text in blocks]
+    if not all(texts):
+        raise HTTPException(400, "Empty paragraph")
+    keys = service.submit(voice, texts, speech.LATER if body.get("later") else speech.NOW)
+    return JSONResponse({"keys": keys}, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/{secret}/read/speech/{key}.mp3")
+async def reader_speech_audio(secret: str, key: str, request: Request):
+    _resolve(secret, request)
+    service = speech.service()
+    if service is None or not re.fullmatch(r"[0-9a-f]{32}", key):
+        raise HTTPException(404, "No such audio")
+    path = await service.audio(key)
+    if path is None:
+        raise HTTPException(404, "No such audio")
+    return FileResponse(
+        path,
+        media_type="audio/mpeg",
+        headers={
+            # The key is the content: it never changes.
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        },
     )
 
 
@@ -1612,6 +1673,7 @@ async def settings_post(
     max_saved: str = Form(""),
     auto_select: str = Form("1"),
     show_dates: str = Form(""),
+    listen_engine: str = Form(""),
 ):
     """Schedule, limits and notifications. Sources have their own page."""
     _resolve(secret, request)
@@ -1629,6 +1691,7 @@ async def settings_post(
         "auto_select": not curated,
         "show_dates": bool(show_dates),
         "voices": chosen if chosen is not None else _account_voices(_store(request).get_delivery(secret)),
+        "listen_engine": listen_engine if listen_engine in ENGINES else None,
         "limits": {
             "max_articles": max_articles,
             "max_per_feed": max_per_feed,
@@ -1710,6 +1773,8 @@ async def settings_post(
     _store(request).set_show_dates(secret, bool(show_dates))
     if chosen is not None:
         _store(request).set_voice(secret, voices.dump_choices(chosen))
+    if listen_engine in ENGINES:
+        _store(request).set_listen_engine(secret, None if listen_engine == "kokoro" else listen_engine)
     return RedirectResponse(f"/{secret}/settings?saved=1", status_code=303)
 
 
@@ -2312,11 +2377,14 @@ def _render_settings(
         "auto_select": delivery.auto_select if delivery else True,
         "show_dates": delivery.show_dates if delivery else True,
         "voices": _account_voices(delivery),
+        "listen_engine": None,
         "limits": {
             key: getattr(delivery, key, None) if delivery else None for key in LIMIT_BOUNDS
         },
     }
-    values.update(overrides or {})
+    values.update({k: v for k, v in (overrides or {}).items() if k != "listen_engine" or v})
+    if not values["listen_engine"]:
+        values["listen_engine"] = _listen_engine(delivery)
     defaults = limits_for(None)
     return pages.settings_page(
         secret=secret,
@@ -2331,6 +2399,8 @@ def _render_settings(
         show_dates=values["show_dates"],
         voice_choices=values["voices"],
         listening=config.get_tts_assets_dir() is not None,
+        listen_engine=values["listen_engine"],
+        server_speech=speech.service() is not None,
         webhook_secret_set=bool(delivery and delivery.webhook_secret),
         limits=values["limits"],
         defaults={key: getattr(defaults, key) for key in LIMIT_BOUNDS},

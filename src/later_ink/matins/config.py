@@ -166,3 +166,16 @@ def get_embed_model_dir() -> Path | None:
     path = Path(raw) if raw else Path.cwd() / "embed-model"
     ok = (path / "model.safetensors").is_file() and (path / "tokenizer.json").is_file()
     return path if ok else None
+
+
+def get_speech_cache_dir() -> Path:
+    """Where server-made speech is kept: beside the database unless set."""
+    raw = os.environ.get("SPEECH_CACHE_DIR", "").strip()
+    if raw:
+        return Path(raw)
+    database = Path(os.environ.get("DATABASE_PATH", "./data/app.db"))
+    return database.parent / "speech"
+
+
+def get_speech_cache_max_bytes() -> int:
+    return _int("SPEECH_CACHE_MAX_MB", 2048, minimum=16) * 1024 * 1024

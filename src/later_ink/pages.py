@@ -366,11 +366,10 @@ _COPY_JS = (
 _DEVICE_VOICES_JS = """(function(){
 var box=document.querySelector('[data-device-voices]');
 if(!box||!('speechSynthesis' in window))return;
-// Only where the Reader uses them: an iPhone or iPad (or an explicit override).
-var forced='';try{forced=localStorage.getItem('matins-listen-engine')||'';}catch(e){}
-var apple=/iPhone|iPad|iPod/.test(navigator.userAgent)||
-  (/Macintosh/.test(navigator.userAgent)&&navigator.maxTouchPoints>1);
-if(forced?forced!=='system':!apple)return;
+// Only when the Reader uses them: "This device's own voices" chosen above.
+var engine=document.querySelector('[data-listen-engine]');
+function shown(){return !engine||engine.value==='device';}
+if(engine)engine.addEventListener('change',function(){box.hidden=!(built&&shown());});
 var NAMES={en:'English',fr:'French',it:'Italian',es:'Spanish',pt:'Portuguese'},
     SAMPLE={en:'Good morning. Here is today\\u2019s paper.',fr:'Bonjour. Voici le journal du jour.',
       it:'Buongiorno. Ecco il giornale di oggi.',es:'Buenos d\\u00edas. Aqu\\u00ed est\\u00e1 el peri\\u00f3dico de hoy.',
@@ -385,7 +384,7 @@ function set(code,name){try{if(name)localStorage.setItem(key(code),name);
 function build(){
   var voices=speechSynthesis.getVoices().filter(function(v){return !ODD.test(v.name);});
   if(!voices.length||voices.length===built)return;
-  built=voices.length;list.textContent='';box.hidden=false;
+  built=voices.length;list.textContent='';box.hidden=!shown();
   wanted.forEach(function(code){if(!NAMES[code])return;
     var mine=voices.filter(function(v){return v.lang.slice(0,2).toLowerCase()===code;})
       .sort(function(a,b){return a.lang.localeCompare(b.lang)||a.name.localeCompare(b.name);});

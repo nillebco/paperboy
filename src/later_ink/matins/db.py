@@ -99,6 +99,8 @@ class Delivery:
     hidden_sources: str | None = None
     # The Reader's list order: "new" (publication date) or "foryou" (taste).
     reader_order: str | None = None
+    # Who reads aloud: "kokoro" (the browser), "server" or "device" voices.
+    listen_engine: str | None = None
 
 
 @dataclass(frozen=True)
@@ -330,6 +332,7 @@ class MatinsStore:
             _ensure_column(conn, "delivery", "voice", "TEXT")
             _ensure_column(conn, "delivery", "hidden_sources", "TEXT")
             _ensure_column(conn, "delivery", "reader_order", "TEXT")
+            _ensure_column(conn, "delivery", "listen_engine", "TEXT")
             # Articles the user took out of the next issue. Kept with their title
             # so the list can offer "put it back" without refetching the feed.
             conn.execute(
@@ -1381,6 +1384,10 @@ class MatinsStore:
         with self._conn() as conn:
             conn.execute("UPDATE delivery SET reader_order = ? WHERE secret = ?", (order, secret))
 
+    def set_listen_engine(self, secret: str, engine: str | None) -> None:
+        with self._conn() as conn:
+            conn.execute("UPDATE delivery SET listen_engine = ? WHERE secret = ?", (engine, secret))
+
     def set_voice(self, secret: str, voice: str | None) -> None:
         with self._conn() as conn:
             conn.execute("UPDATE delivery SET voice = ? WHERE secret = ?", (voice, secret))
@@ -1545,6 +1552,7 @@ def _delivery(row: sqlite3.Row, fernet: Fernet) -> Delivery:
         voice=row["voice"],
         hidden_sources=row["hidden_sources"],
         reader_order=row["reader_order"],
+        listen_engine=row["listen_engine"],
     )
 
 

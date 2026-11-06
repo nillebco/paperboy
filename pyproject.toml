@@ -16,6 +16,9 @@ dependencies = [
     "cryptography>=42.0",
     "pillow>=10.0",
     "numpy>=2.0",
+    # Server-side Listen (speech.py): Kokoro through onnxruntime, MP3 out.
+    "kokoro-onnx>=0.6.1",
+    "lameenc>=1.9",
 ]
 
 [project.urls]
