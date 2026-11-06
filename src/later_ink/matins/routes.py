@@ -884,8 +884,9 @@ def _drop_repeated_title(body: str | None, title: str) -> str | None:
     if first.findall(".//img"):
         return body
     root.remove(first)
-    rest = "".join(tostring(el, encoding="unicode") for el in root)
-    return ((root.text or "").strip() + rest) or body
+    rest = ((root.text or "").strip()) + "".join(tostring(el, encoding="unicode") for el in root)
+    # A short post is its own title: dropping it would leave nothing to read.
+    return rest if extract.word_count(rest) else body
 
 
 def _candidate_html(content: str) -> str:

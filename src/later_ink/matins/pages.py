@@ -215,7 +215,7 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .reader-list .listen-all { position: sticky; top: 0; z-index: 1; background: var(--card);
   margin: 0 0 .3rem; padding: .3rem .2rem; border-bottom: 1px solid var(--line); }
 .reader-list .row.speaking { background: var(--soft); box-shadow: inset 3px 0 0 var(--fg); }
-.article .speaking { background: var(--soft); border-radius: 4px; box-shadow: 0 0 0 .3em var(--soft); }
+.article .speaking, .reader-pane > h1.speaking { background: var(--soft); border-radius: 4px; box-shadow: 0 0 0 .3em var(--soft); }
 .article-toolbar form { margin: 0; }
 .reader-pane .card h1 { margin-top: 0; }
 .reader-pane .article { max-width: 42rem; }
@@ -1405,10 +1405,15 @@ function label(b,state){
   b.querySelector('[data-stop]').hidden=state==='idle';
   // The phone's voices only matter once something is playing.
   var picker=b.querySelector('[data-device-voice]');if(picker)picker.hidden=state==='idle';}
+// The title first, as Listen to all reads it, then the article's paragraphs.
 function leaves(){
-  var root=document.querySelector('.reader-pane .article'),sel='p,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption';
-  return root?Array.prototype.filter.call(root.querySelectorAll(sel),function(el){
-    return !el.querySelector(sel)&&!el.closest('pre')&&el.textContent.trim();}):[];}
+  var root=document.querySelector('.reader-pane .article'),title=document.querySelector('.reader-pane > h1'),
+      sel='p,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption';
+  var found=root?Array.prototype.filter.call(root.querySelectorAll(sel),function(el){
+    return !el.querySelector(sel)&&!el.closest('pre')&&el.textContent.trim();}):[];
+  // Text straight in the article, with no paragraph around it.
+  if(!found.length&&root&&root.textContent.trim())found=[root];
+  return title&&title.textContent.trim()?[title].concat(found):found;}
 function rows(){return Array.prototype.slice.call(
   document.querySelectorAll('.reader-list .row[data-id]:not(.archived)'));}
 function mark(i){
@@ -1432,10 +1437,14 @@ function speak(lines,voice,offset){
 // it cannot change between two paragraphs.
 var ODD=/^(Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Deranged|Eddy|Flo|Fred|Good News|Grandma|Grandpa|Hysterical|Jester|Junior|Kathy|Organ|Pipe Organ|Princess|Ralph|Reed|Rocko|Sandy|Shelley|Superstar|Trinoids|Whisper|Wobble|Zarvox)\\b/;
 var picked={};
+// The language's voices, its own accent first, then the other accents (a stock
+// iPhone has one en-US voice, but also en-GB, en-AU, en-IE…).
 function candidates(lang){
-  var voices=speechSynthesis.getVoices().filter(function(v){return !ODD.test(v.name);});
-  var mine=voices.filter(function(v){return v.lang.replace('_','-')===lang;});
-  return mine.length?mine:voices.filter(function(v){return v.lang.slice(0,2)===lang.slice(0,2);});}
+  var voices=speechSynthesis.getVoices().filter(function(v){return !ODD.test(v.name);}),
+      code=function(v){return v.lang.replace('_','-');};
+  var same=voices.filter(function(v){return code(v)===lang;}),
+      kin=voices.filter(function(v){return code(v)!==lang&&code(v).slice(0,2)===lang.slice(0,2);});
+  return same.concat(kin);}
 function systemVoice(lang){
   if(lang in picked)return picked[lang];
   if(!speechSynthesis.getVoices().length)return null;
@@ -1456,7 +1465,8 @@ function devicePicker(b,voice){
   if(mine.length<2)return;
   var select=document.createElement('select'),current=systemVoice(lang);
   select.className='tiny';select.dataset.deviceVoice='';select.setAttribute('aria-label','Voice');
-  mine.forEach(function(v){var o=document.createElement('option');o.value=o.textContent=v.name;
+  mine.forEach(function(v){var o=document.createElement('option');o.value=v.name;
+    o.textContent=v.lang.replace('_','-')===lang?v.name:v.name+' ('+v.lang.replace('_','-')+')';
     if(current&&v.name===current.name)o.selected=true;select.appendChild(o);});
   select.addEventListener('change',function(){
     try{localStorage.setItem('matins-device-voice:'+lang,select.value);}catch(e){}

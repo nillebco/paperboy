@@ -2449,6 +2449,8 @@ def test_a_first_line_that_repeats_the_title_is_dropped():
 
     body = "<h1>Local privilege escalation</h1><p>The article.</p>"
     assert _drop_repeated_title(body, "Local privilege escalation | Discussion") == "<p>The article.</p>"
+    alone = "<p>Local privilege escalation</p><figure><img src='https://x/y.png'></figure>"
+    assert _drop_repeated_title(alone, "Local privilege escalation") == alone
     other = "<p>Something else entirely.</p><p>More.</p>"
     assert _drop_repeated_title(other, "Local privilege escalation") == other
 
