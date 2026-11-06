@@ -1101,10 +1101,60 @@ def _kokoro_options(language: str, current: str) -> str:
     )
 
 
-@lru_cache(maxsize=1)
-def _timezone_options() -> str:
-    names = sorted(name for name in available_timezones() if "/" in name and not name.startswith("Etc/"))
-    return "".join(f'<option value="{escape(name)}">' for name in names)
+_TZ_REGIONS = {
+    "Europe": "Europe",
+    "America": "Americas",
+    "Africa": "Africa",
+    "Asia": "Asia",
+    "Australia": "Australia",
+    "Pacific": "Pacific",
+    "Atlantic": "Atlantic",
+    "Indian": "Indian Ocean",
+    "Antarctica": "Antarctica",
+}
+
+
+@lru_cache(maxsize=2)
+def _timezone_options(day: str) -> str:
+    """Every city, grouped by region, with today's UTC offset ("Paris (UTC+01:00)").
+
+    Keyed by day so a daylight-saving change shows the right offset. Aliases
+    (US/Eastern, Etc/GMT+3…) are left out: the cities cover them."""
+    from datetime import datetime
+
+    now = datetime.now(ZoneInfo("UTC"))
+    groups: dict[str, list[tuple[str, str]]] = {region: [] for region in _TZ_REGIONS}
+    for name in available_timezones():
+        region, _, rest = name.partition("/")
+        if region not in groups or not rest:
+            continue
+        parts = rest.replace("_", " ").split("/")
+        city = parts[-1] + (f", {parts[0]}" if len(parts) > 1 else "")
+        offset = now.astimezone(ZoneInfo(name)).strftime("%z")
+        groups[region].append((name, f"{city} (UTC{offset[:3]}:{offset[3:]})"))
+    return '<option value="UTC">UTC</option>' + "".join(
+        f'<optgroup label="{escape(_TZ_REGIONS[region])}">'
+        + "".join(
+            f'<option value="{escape(name)}">{escape(label)}</option>'
+            for name, label in sorted(members, key=lambda pair: pair[1])
+        )
+        + "</optgroup>"
+        for region, members in groups.items()
+        if members
+    )
+
+
+def _timezone_select(current: str) -> str:
+    from datetime import date
+
+    options = _timezone_options(date.today().isoformat())
+    marker = f'<option value="{escape(current)}">'
+    if marker in options:
+        options = options.replace(marker, f'<option value="{escape(current)}" selected>', 1)
+    elif current:
+        # Something older or unusual (an alias): keep it rather than silently change it.
+        options = f'<option value="{escape(current)}" selected>{escape(current)}</option>' + options
+    return f'<select id="timezone" name="timezone">{options}</select>'
 
 
 def _number(name: str, label: str, value, default: int, low: int, high: int) -> str:
@@ -1238,9 +1288,7 @@ def settings_page(
       <div><label for="schedule-time">At</label>
         <input type="time" id="schedule-time" name="schedule" value="{escape(schedule)}"></div>
       <div><label for="timezone">Timezone</label>
-        <input type="text" id="timezone" name="timezone" value="{escape(timezone)}"
-          list="timezones" placeholder="Europe/Paris" autocomplete="off">
-        <datalist id="timezones">{_timezone_options()}</datalist></div>
+        {_timezone_select(timezone)}</div>
     </div>
     {next_line}
   </div>

@@ -2602,6 +2602,15 @@ def test_score_is_empty_without_a_taste(client):
     assert client.post("/api/v1/score", headers=_api(secret), json={"items": "nope"}).status_code == 400
 
 
+def test_the_timezone_is_picked_from_a_list(client):
+    secret = _signup_without_readwise(client)
+    page = client.get(f"/{secret}/settings", headers=HTML).text
+    assert '<select id="timezone" name="timezone">' in page
+    assert '<optgroup label="Europe">' in page
+    assert re.search(r'<option value="Europe/Paris"( selected)?>Paris \(UTC\+0[12]:00\)</option>', page)
+    assert "US/Eastern" not in page
+
+
 # ------------------------------------------------------------------- listening
 
 
