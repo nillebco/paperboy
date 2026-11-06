@@ -12,6 +12,7 @@ of app.db cannot be used to forge deliveries to a user's endpoint.
 """
 
 import hashlib
+import json
 import os
 import secrets as pysecrets
 import sqlite3
@@ -92,8 +93,10 @@ class Delivery:
     # Automatic: compose from feeds + queue. Curated: print only the queue.
     auto_select: bool = True
     show_dates: bool = True
-    # The Reader's voice when a feed does not set its own. None = the default.
+    # The Reader's voices: JSON {language: voice id} (one bare id, before languages).
     voice: str | None = None
+    # Reader sources switched off, as a JSON list of source names.
+    hidden_sources: str | None = None
 
 
 @dataclass(frozen=True)
@@ -323,6 +326,7 @@ class MatinsStore:
             _ensure_column(conn, "delivery", "auto_select", "INTEGER NOT NULL DEFAULT 1")
             _ensure_column(conn, "delivery", "show_dates", "INTEGER NOT NULL DEFAULT 1")
             _ensure_column(conn, "delivery", "voice", "TEXT")
+            _ensure_column(conn, "delivery", "hidden_sources", "TEXT")
             # Articles the user took out of the next issue. Kept with their title
             # so the list can offer "put it back" without refetching the feed.
             conn.execute(
@@ -1363,6 +1367,13 @@ class MatinsStore:
                 (int(enabled), secret),
             )
 
+    def set_hidden_sources(self, secret: str, names: list[str]) -> None:
+        value = json.dumps(sorted(set(names))) if names else None
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE delivery SET hidden_sources = ? WHERE secret = ?", (value, secret)
+            )
+
     def set_voice(self, secret: str, voice: str | None) -> None:
         with self._conn() as conn:
             conn.execute("UPDATE delivery SET voice = ? WHERE secret = ?", (voice, secret))
@@ -1525,6 +1536,7 @@ def _delivery(row: sqlite3.Row, fernet: Fernet) -> Delivery:
         auto_select=bool(row["auto_select"]),
         show_dates=bool(row["show_dates"]),
         voice=row["voice"],
+        hidden_sources=row["hidden_sources"],
     )
 
 

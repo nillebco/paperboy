@@ -13,6 +13,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import logging
 import secrets as pysecrets
 from datetime import UTC, datetime
@@ -686,6 +687,11 @@ async def reader_index(
     if source:
         visible = [item for item in visible if _source_key(item) == source]
         archived_rows = [row for row in archived_rows if _archived_key(row) == source]
+    # Sources switched off stay listed (to switch them back on), their articles do not.
+    hidden = set() if issue or source else _hidden_sources(delivery)
+    if hidden:
+        visible = [item for item in visible if _source_key(item) not in hidden]
+        archived_rows = [row for row in archived_rows if _archived_key(row) not in hidden]
 
     counts = {
         "all": len(visible),
@@ -744,6 +750,7 @@ async def reader_index(
             view=view,
             sources=sources,
             source=source,
+            hidden=sorted(hidden),
             issue=issue,
             issue_title=issue_obj.title if issue_obj else None,
             selected=selected,
@@ -1156,6 +1163,43 @@ async def reader_archive(
     )
 
 
+def _hidden_sources(delivery) -> set[str]:
+    raw = delivery.hidden_sources if delivery else None
+    try:
+        names = json.loads(raw) if raw else []
+    except ValueError:
+        return set()
+    return {name for name in names if isinstance(name, str)}
+
+
+@router.post("/{secret}/read/sources")
+async def reader_sources(
+    secret: str,
+    request: Request,
+    csrf: str = Form(""),
+    toggle: str = Form(""),
+    view: str = Form("all"),
+):
+    """Switch one source off or back on; an empty toggle switches them all on.
+
+    Kept per catalogue, not per page, so a noisy source stays off on every
+    device until it is switched back on."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    _ensure_delivery(request, secret)
+    store = _store(request)
+    hidden = _hidden_sources(store.get_delivery(secret))
+    name = toggle.strip()[:200]
+    if not name:
+        hidden = set()
+    elif name in hidden:
+        hidden.discard(name)
+    else:
+        hidden.add(name)
+    store.set_hidden_sources(secret, sorted(hidden))
+    return RedirectResponse(_read_href(secret, view), status_code=303)
+
+
 @router.post("/{secret}/read/archive-all")
 async def reader_archive_all(
     secret: str,
@@ -1176,6 +1220,7 @@ async def reader_archive_all(
     urls = [getattr(entry[1], "url", "") or "" for entry in stream]
     liked = {url for url, rating in store.signals_for(secret, [u for u in urls if u]).items() if rating > 0}
     queued = {item.url for item in store.list_saved(secret)}
+    hidden = _hidden_sources(store.get_delivery(secret))
     rows = []
     for item_id, article, section, kind in stream:
         url = getattr(article, "url", "") or ""
@@ -1183,6 +1228,9 @@ async def reader_archive_all(
             continue
         name = "Bluesky" if kind == "candidate" else section
         if source and name != source:
+            continue
+        # What is switched off is not on screen: "Archive all" leaves it alone.
+        if not source and name in hidden:
             continue
         rows.append(
             {

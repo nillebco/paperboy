@@ -1303,8 +1303,8 @@ def test_reader_filters_by_source(client):
     assert "First story" not in bluesky.text
     assert 'class="source-filter"' in bluesky.text
     # Authors are not separate filter entries; Bluesky is one source.
-    assert bluesky.text.count(">Bluesky</a>") == 1
-    assert "@alice.example</a>" not in bluesky.text
+    assert bluesky.text.count(">Bluesky</button>") == 1
+    assert "@alice.example</button>" not in bluesky.text
 
     feed = client.get(f"/{secret}/read", params={"source": "Example Feed"})
     assert "First story" in feed.text
@@ -2483,6 +2483,28 @@ def test_a_teaser_is_replaced_only_by_a_longer_article(monkeypatch):
     long = asyncio.run(queue.linked_content(teaser.format("https://news.example/long")))
     assert "sentence, with enough text" in long
     assert asyncio.run(queue.linked_content(teaser.format("https://news.example/short"))) is None
+
+
+def test_a_source_can_be_switched_off_and_back_on(client):
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    client.post(
+        "/api/v1/candidates",
+        headers=_api(secret),
+        json={"items": [{"id": "sw1", "url": "https://bsky.app/profile/a/post/5", "title": "A Bluesky post",
+                         "source": "@a", "content": "<p>Body</p>", "published": datetime.now(UTC).timestamp()}]},
+    )
+    assert "A Bluesky post" in client.get(f"/{secret}/read").text
+    csrf = _csrf(client, secret)
+    client.post(f"/{secret}/read/sources", data={"csrf": csrf, "toggle": "Bluesky"}, follow_redirects=False)
+    page = client.get(f"/{secret}/read").text
+    assert "A Bluesky post" not in page
+    assert "First story" in page  # the feed is still on
+    assert 'aria-pressed="false"' in page  # and Bluesky is still listed, to switch back on
+    # Archive all leaves the hidden source alone.
+    client.post(f"/{secret}/read/archive-all", data={"csrf": csrf, "keep": "none"})
+    client.post(f"/{secret}/read/sources", data={"csrf": csrf, "toggle": ""}, follow_redirects=False)
+    assert "A Bluesky post" in client.get(f"/{secret}/read").text
 
 
 # ------------------------------------------------------------------- listening

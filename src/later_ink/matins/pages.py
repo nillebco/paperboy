@@ -171,6 +171,10 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .source-filter .label { font-size: .82rem; color: var(--muted); }
 .source-filter a { color: var(--muted); text-decoration: none; }
 .source-filter a:hover { color: var(--fg); }
+.source-filter form { margin: 0; display: inline; }
+.chip { font: inherit; font-size: .82rem; padding: .15rem .55rem; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--soft); color: var(--fg); cursor: pointer; }
+.chip.off { background: transparent; color: var(--muted); text-decoration: line-through; }
 .source-filter a[aria-current] { color: var(--fg); font-weight: 650; }
 .bulk-archive { margin: .4rem 0 .2rem; }
 .bulk-archive summary { cursor: pointer; font-size: .82rem; }
@@ -1865,6 +1869,7 @@ def reader_page(
     view: str,
     sources: list[str],
     source: str | None = None,
+    hidden: list[str] | None = None,
     issue: str | None = None,
     issue_title: str | None = None,
     selected: dict | None = None,
@@ -1887,15 +1892,18 @@ def reader_page(
         + f">{label} ({counts.get(key, 0)})</a>"
         for key, label in _READER_VIEWS
     )
-    all_link = (
-        f'<a href="{_reader_href(secret, view, issue=issue)}"'
-        + (' aria-current="page"' if not source else "")
-        + ">All</a>"
+    # Each source is a switch: tap to leave it out, tap again to bring it back.
+    off = set(hidden or [])
+    toggle = lambda name, label, on, title: (  # noqa: E731
+        f'<form method="post" action="{base}/read/sources">{_csrf(csrf)}'
+        f'<input type="hidden" name="toggle" value="{escape(name)}">'
+        f'<input type="hidden" name="view" value="{escape(view)}">'
+        f'<button type="submit" class="chip{"" if on else " off"}" aria-pressed="{"true" if on else "false"}" '
+        f'title="{escape(title)}">{escape(label)}</button></form>'
     )
+    all_link = toggle("", "All", not off, "Show every source") if off else ""
     source_links = "".join(
-        f'<a href="{_reader_href(secret, view, source=name, issue=issue)}"'
-        + (' aria-current="page"' if name == source else "")
-        + f">{escape(name)}</a>"
+        toggle(name, name, name not in off, f"{'Show' if name in off else 'Hide'} {name}")
         for name in sources
     )
     if issue:
@@ -1906,7 +1914,9 @@ def reader_page(
             f'<a href="{base}/read">All news</a></div>'
         )
     else:
-        scope = f" from {escape(source)}" if source else ""
+        scope = (
+            f" from {escape(source)}" if source else " from the sources shown" if hidden else ""
+        )
         bulk = "".join(
             _button(
                 f"{base}/read/archive-all",
@@ -1918,8 +1928,8 @@ def reader_page(
             for keep, label in (("liked", "Archive all not liked"), ("none", "Archive all"))
         )
         filter_form = (
-            f'<div class="source-filter"><span class="label">Source</span>'
-            f"{all_link}{source_links}</div>"
+            f'<div class="source-filter"><span class="label">Sources</span>'
+            f"{source_links}{all_link}</div>"
             # Folded away: one stray click should not empty the reader.
             f'<details class="bulk-archive"><summary class="meta">Archive in bulk{scope}…</summary>'
             f'<p class="meta">Queued articles stay. Archived articles stay under the Archived tab.</p>'
