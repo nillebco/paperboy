@@ -53,6 +53,18 @@ NPM = [
         },
     ),
     (
+        # The same onnxruntime-web, built without JSEP (WebGPU). Safari gets it:
+        # on iOS 26 WebKit's optimising WASM compiler can spin on the JSEP build
+        # (onnxruntime#26827, WebKit bug 304810).
+        "https://registry.npmjs.org/onnxruntime-web/-/onnxruntime-web-1.22.0-dev.20250409-89f8206ba4.tgz",
+        "sha512-0uS76OPgH0hWCPrFKlL8kYVV7ckM7t/36HfbgoFw6Nd0CZVVbQC4PkrR8mBX8LtNUFZO25IQBqV2Hx2ho3FlbQ==",
+        {
+            "package/dist/ort-wasm-simd-threaded.mjs": "ort-plain/ort-wasm-simd-threaded.mjs",
+            # MIT (package.json); the tarball ships no LICENSE file.
+            "package/dist/ort-wasm-simd-threaded.wasm": "ort-plain/ort-wasm-simd-threaded.wasm",
+        },
+    ),
+    (
         "https://registry.npmjs.org/ephone/-/ephone-1.0.2.tgz",
         "sha512-Ziw4PP2P2WkFOUwGk1g5ldkdGTZNFUjcrTfDS1+ltBk0qFlwM8nz8oYSykPBN1/TxOkZ63hGu6KXBQ1IGHRMgg==",
         {

@@ -2507,6 +2507,40 @@ def test_a_source_can_be_switched_off_and_back_on(client):
     assert "A Bluesky post" in client.get(f"/{secret}/read").text
 
 
+def test_safari_gets_require_corp_and_relayed_images(client, monkeypatch):
+    from later_ink.matins import routes
+
+    secret = _signup_without_readwise(client)
+    client.post(
+        "/api/v1/candidates",
+        headers=_api(secret),
+        json={"items": [{"id": "im1", "url": "https://bsky.app/profile/a/post/7", "title": "Picture post",
+                         "source": "@a", "content": "<p>Look at this long enough caption here.</p>"
+                         "<figure><img src='https://cdn.example/pic.jpg' srcset='https://cdn.example/pic2.jpg 2x'></figure>",
+                         "published": datetime.now(UTC).timestamp()}]},
+    )
+    safari = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 "
+              "(KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1"}
+    page = client.get(f"/{secret}/read", params={"article": "cand:im1"}, headers=safari)
+    assert page.headers["Cross-Origin-Embedder-Policy"] == "require-corp"
+    match = re.search(r'src="(/assets/img\?u=[^"]+)"', page.text)
+    assert match and "srcset" not in page.text.split('class="article"')[1]
+    relay = match.group(1).replace("&amp;", "&")
+
+    async def fake(client_, url, **kwargs):
+        assert url == "https://cdn.example/pic.jpg"
+        return b"\xff\xd8jpeg", "image/jpeg"
+
+    monkeypatch.setattr(routes, "fetch_bytes", fake)
+    got = client.get(relay)
+    assert got.status_code == 200 and got.headers["content-type"] == "image/jpeg"
+    # Only what the server signed is fetched.
+    assert client.get(relay.replace("pic.jpg", "other.jpg")).status_code == 404
+    chrome = client.get(f"/{secret}/read", params={"article": "cand:im1"})
+    assert chrome.headers["Cross-Origin-Embedder-Policy"] == "credentialless"
+    assert "https://cdn.example/pic.jpg" in chrome.text
+
+
 # ------------------------------------------------------------------- listening
 
 

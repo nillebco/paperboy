@@ -33,8 +33,20 @@ self.fetch = (input, init) => {
 // Imported, not awaited at the top: a module worker runs its event loop during
 // a top-level await, and the page's first messages would arrive before
 // onmessage is set and be dropped.
+// Safari (and every iOS browser) gets onnxruntime built without JSEP: on iOS 26
+// WebKit's optimising compiler can spin on the JSEP build until the tab is
+// killed (onnxruntime#26827). WebGPU needs JSEP, so Safari stays on WASM.
+const WEBKIT =
+  /iPhone|iPad|iPod/.test(self.navigator.userAgent) ||
+  (/Safari\//.test(self.navigator.userAgent) &&
+    !/Chrome\/|Chromium\/|Edg\/|Firefox\//.test(self.navigator.userAgent));
 const kokoro = import("./kokoro.web.js").then((module) => {
-  module.env.wasmPaths = new URL("./ort/", self.location.href).href;
+  module.env.wasmPaths = WEBKIT
+    ? {
+        mjs: new URL("./ort-plain/ort-wasm-simd-threaded.mjs", self.location.href).href,
+        wasm: new URL("./ort-plain/ort-wasm-simd-threaded.wasm", self.location.href).href,
+      }
+    : new URL("./ort/", self.location.href).href;
   return module;
 });
 
@@ -101,7 +113,7 @@ async function model() {
         status(percent < 100 ? `Downloading the voice… ${percent}%` : "Preparing the voice…");
       };
       status("Loading the voice…");
-      if (!mobile() && (await gpu())) {
+      if (!WEBKIT && !mobile() && (await gpu())) {
         try {
           return await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
             dtype: "fp32",

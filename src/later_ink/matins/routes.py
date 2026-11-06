@@ -15,12 +15,14 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets as pysecrets
 from datetime import UTC, datetime
 from html import escape as html_escape
 from types import SimpleNamespace
 from urllib.parse import quote, urlsplit
 
+import httpx
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from lxml.html import fragment_fromstring, tostring
@@ -28,6 +30,7 @@ from lxml.html import fragment_fromstring, tostring
 from .. import config as app_config
 from .. import opds
 from ..connectors.base import Article, ArticleUnavailable, UpstreamError
+from ..fetch import fetch_bytes
 from . import catalogues, config, extract, notify, pages, rss, voices, webhooks
 from .issues import (
     IssueLimits,
@@ -741,6 +744,9 @@ async def reader_index(
                 shown = [selected, *shown[: MAX_READER_ITEMS - 1]]
         selected["selected"] = True
 
+    strict = _needs_require_corp(request)
+    if body is not None and strict:
+        body = _relayed_images(request, body)
     return _html(
         pages.reader_page(
             secret=secret,
@@ -765,7 +771,7 @@ async def reader_index(
             error=error,
         ),
         csp=READER_CSP,
-        isolated=True,
+        isolated="require-corp" if strict else "credentialless",
     )
 
 
@@ -983,6 +989,69 @@ def _spoken_blocks(body: str) -> list[str]:
         if text:
             blocks.append(text)
     return blocks
+
+
+# --------------------------------------------------------- image relay
+#
+# Safari cannot load a cross-origin image into a page isolated with
+# "credentialless" (it does not know the value) and needs "require-corp", which
+# refuses any image whose server does not opt in: almost none do. For Safari the
+# Reader therefore shows an article's images through this relay. Only URLs the
+# server signed are fetched, only raster images are returned (an SVG can carry
+# script), and fetch_bytes refuses private addresses at every redirect.
+_RELAY_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"})
+_RELAY_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _relay_signature(request: Request, url: str) -> str:
+    return hmac.new(request.app.state.csrf_key, f"img:{url}".encode(), "sha256").hexdigest()[:32]
+
+
+def _relayed_images(request: Request, body: str) -> str:
+    """The article with its remote images pointed at the relay."""
+    try:
+        root = fragment_fromstring(body, create_parent="div")
+    except (ValueError, TypeError):
+        return body
+    for source in list(root.iter("source")):
+        source.getparent().remove(source)
+    for img in root.iter("img"):
+        img.attrib.pop("srcset", None)
+        src = (img.get("src") or "").strip()
+        if urlsplit(src).scheme in ("http", "https"):
+            img.set("src", f"/assets/img?u={quote(src, safe='')}&s={_relay_signature(request, src)}")
+    return (root.text or "") + "".join(tostring(el, encoding="unicode") for el in root)
+
+
+@router.get("/assets/img")
+async def image_relay(request: Request, u: str = "", s: str = ""):
+    if not u or not hmac.compare_digest(s, _relay_signature(request, u)):
+        raise HTTPException(404, "No such image")
+    async with httpx.AsyncClient() as client:
+        result = await fetch_bytes(
+            client, u, timeout=10.0, max_bytes=_RELAY_MAX_BYTES, allowed_types=_RELAY_TYPES
+        )
+    if result is None:
+        raise HTTPException(404, "No such image")
+    data, media_type = result
+    return Response(
+        data,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, max-age=86400",
+            "Content-Security-Policy": "default-src 'none'",
+            "X-Content-Type-Options": "nosniff",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        },
+    )
+
+
+def _needs_require_corp(request: Request) -> bool:
+    """Safari and every iOS browser (all WebKit): no COEP credentialless."""
+    ua = request.headers.get("user-agent", "")
+    if re.search(r"iPhone|iPad|iPod", ua):
+        return True
+    return "Safari/" in ua and not re.search(r"Chrome/|Chromium/|Edg/|Firefox/|OPR/", ua)
 
 
 @router.get("/{secret}/read/listen")
@@ -2133,7 +2202,7 @@ def _back(
 
 
 def _html(
-    body: str, *, status: int = 200, csp: str | None = None, isolated: bool = False
+    body: str, *, status: int = 200, csp: str | None = None, isolated: str | None = None
 ) -> HTMLResponse:
     response = HTMLResponse(body, status_code=status)
     if csp:
@@ -2144,10 +2213,10 @@ def _html(
         # Cross-origin isolation lets the Listen worker run WASM on several
         # threads; single-threaded, Kokoro is slower than speech on a machine
         # without WebGPU. "credentialless" rather than "require-corp", so the
-        # article's remote images still load (without cookies). Browsers that
-        # do not know it (Safari) stay single-threaded and work as before.
+        # article's remote images still load (without cookies). Safari does
+        # not know it: it gets "require-corp", with the images relayed.
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-        response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
+        response.headers["Cross-Origin-Embedder-Policy"] = isolated
     return response
 
 
