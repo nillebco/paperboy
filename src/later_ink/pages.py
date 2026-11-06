@@ -376,7 +376,8 @@ var NAMES={en:'English',fr:'French',it:'Italian',es:'Spanish',pt:'Portuguese'},
       it:'Buongiorno. Ecco il giornale di oggi.',es:'Buenos d\\u00edas. Aqu\\u00ed est\\u00e1 el peri\\u00f3dico de hoy.',
       pt:'Bom dia. Aqui est\\u00e1 o jornal de hoje.'},
     ODD=/^(Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Deranged|Eddy|Flo|Fred|Good News|Grandma|Grandpa|Hysterical|Jester|Junior|Kathy|Organ|Pipe Organ|Princess|Ralph|Reed|Rocko|Sandy|Shelley|Superstar|Trinoids|Whisper|Wobble|Zarvox)\\b/,
-    list=box.querySelector('[data-voice-list]'),built=0;
+    list=box.querySelector('[data-voice-list]'),built=0,
+    wanted=(box.dataset.languages||'en').split(',');
 function key(code){return 'matins-device-voice:'+code;}
 function get(code){try{return localStorage.getItem(key(code))||'';}catch(e){return '';}}
 function set(code,name){try{if(name)localStorage.setItem(key(code),name);
@@ -385,7 +386,7 @@ function build(){
   var voices=speechSynthesis.getVoices().filter(function(v){return !ODD.test(v.name);});
   if(!voices.length||voices.length===built)return;
   built=voices.length;list.textContent='';box.hidden=false;
-  Object.keys(NAMES).forEach(function(code){
+  wanted.forEach(function(code){if(!NAMES[code])return;
     var mine=voices.filter(function(v){return v.lang.slice(0,2).toLowerCase()===code;})
       .sort(function(a,b){return a.lang.localeCompare(b.lang)||a.name.localeCompare(b.name);});
     if(!mine.length)return;

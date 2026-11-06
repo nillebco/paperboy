@@ -686,20 +686,30 @@ def feed_page(
     items: list[dict],
     window_hours: int,
     max_per_feed: int,
-    account_voice: str = "af_heart",
+    languages: tuple[tuple[str, str], ...] = (),
     listening: bool = False,
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
     base = f"/{escape(secret)}"
     action = f"{base}/feeds/{escape(feed['id'])}"
+    from .voices import language_of, valid_voice
+
+    current = feed.get("voice") or ""
+    if valid_voice(current):  # a voice chosen before languages existed
+        current = language_of(current)
+    language_options = '<option value="">Automatic (from each article)</option>' + "".join(
+        f'<option value="{code}"{" selected" if code == current else ""}>{escape(name)}</option>'
+        for code, name in languages
+    )
     voice_form = (
-        f"""<label for="voice">Listening voice</label>
+        f"""<label for="voice">Language</label>
   <form class="inline-form" method="post" action="{action}/voice">
     {_csrf(csrf)}
-    <select id="voice" name="voice">{_voice_options(feed.get("voice"), inherit=_voice_label(account_voice))}</select>
+    <select id="voice" name="voice">{language_options}</select>
     <button class="btn" type="submit">Save</button>
-  </form>"""
+  </form>
+  <p class="hint">Listening reads this feed with your voice for its language.</p>"""
         if listening
         else ""
     )
@@ -1061,38 +1071,28 @@ def issue_page(
 # ------------------------------------------------------------- settings
 
 
-@lru_cache(maxsize=1)
-def _voice_options(current: str | None, *, inherit: str | None = None) -> str:
-    """Grouped by language; `inherit` adds a first "use the default" choice."""
-    from .voices import VOICES
+def _kokoro_options(language: str, current: str) -> str:
+    from .voices import VOICES, language_of
 
     groups: dict[str, list] = {}
     for voice in VOICES:
-        groups.setdefault(voice.language, []).append(voice)
-    head = (
-        f'<option value=""{" selected" if not current else ""}>Catalogue voice ({escape(inherit)})</option>'
-        if inherit is not None
-        else ""
+        if language_of(voice.id) == language:
+            groups.setdefault(voice.language, []).append(voice)
+    options = lambda members: "".join(  # noqa: E731
+        f'<option value="{voice.id}"{" selected" if voice.id == current else ""}>'
+        f"{escape(voice.name)}</option>"
+        for voice in members
     )
-    return head + "".join(
-        f'<optgroup label="{escape(language)}">'
-        + "".join(
-            f'<option value="{voice.id}"{" selected" if voice.id == current else ""}>'
-            f"{escape(voice.name)}</option>"
-            for voice in members
-        )
-        + "</optgroup>"
-        for language, members in groups.items()
+    if len(groups) == 1:
+        return options(next(iter(groups.values())))
+    # English: US and UK voices.
+    return "".join(
+        f'<optgroup label="{escape(label)}">{options(members)}</optgroup>'
+        for label, members in groups.items()
     )
 
 
-def _voice_label(voice_id: str) -> str:
-    from .voices import VOICES
-
-    voice = next((v for v in VOICES if v.id == voice_id), None)
-    return f"{voice.name}, {voice.language}" if voice else voice_id
-
-
+@lru_cache(maxsize=1)
 def _timezone_options() -> str:
     names = sorted(name for name in available_timezones() if "/" in name and not name.startswith("Etc/"))
     return "".join(f'<option value="{escape(name)}">' for name in names)
@@ -1106,17 +1106,39 @@ def _number(name: str, label: str, value, default: int, low: int, high: int) -> 
 </div>"""
 
 
-def _listening_card(voice: str) -> str:
+def _listening_card(secret: str, choices: dict[str, str]) -> str:
+    """A voice per language the catalogue reads, and a way to add one."""
+    from .voices import LANGUAGE_NAMES, LANGUAGES
+
+    action = f"/{escape(secret)}/settings/languages"
+    rows = "".join(
+        f"""<label for="voice_{lang}">{escape(LANGUAGE_NAMES[lang])}</label>
+    <div class="inline-form">
+      <select id="voice_{lang}" name="voice_{lang}">{_kokoro_options(lang, voice)}</select>
+      {"" if lang == "en" else f'<button class="btn" type="submit" formaction="{action}" name="remove_language" value="{lang}">Remove</button>'}
+    </div>"""
+        for lang, voice in choices.items()
+    )
+    missing = [(code, name) for code, name in LANGUAGES if code not in choices]
+    add = (
+        f"""<div class="inline-form" style="margin-top:.8rem">
+      <select name="add_language" aria-label="Language to add">{"".join(f'<option value="{code}">{escape(name)}</option>' for code, name in missing)}</select>
+      <button class="btn" type="submit" formaction="{action}" name="add" value="1">Add a language</button>
+    </div>"""
+        if missing
+        else ""
+    )
     return f"""
   <h2 id="listening">Listening</h2>
   <div class="card">
-    <label for="voice" style="margin-top:0">Voice</label>
-    <select id="voice" name="voice">{_voice_options(voice)}</select>
-    <p class="hint">Reads an article aloud from the Reader's ▶ Listen button. The voice
-    runs in your browser: the first time it downloads about 90 MB (330 MB on a computer
-    with a graphics card), then nothing leaves your device. A feed can have its own
-    voice, for a feed in another language.</p>
-    <div class="device-voices" data-device-voices hidden>
+    <p class="hint" style="margin-top:0">Reads an article aloud from the Reader's ▶ Listen
+    button, with the voice of the language it is written in. The voices run in your
+    browser: the first time they download about 90 MB (330 MB on a computer with a
+    graphics card), then nothing leaves your device. A language not listed here is read
+    with a default voice of its own.</p>
+    {rows}
+    {add}
+    <div class="device-voices" data-device-voices data-languages="{",".join(choices)}" hidden>
       <h3>This device's voices</h3>
       <p class="hint">On an iPhone or iPad, Matins reads with the device's own voices
       instead: pick one per language. The choice stays on this device. Better voices can
@@ -1141,7 +1163,7 @@ def settings_page(
     auto_select: bool,
     show_dates: bool,
     webhook_secret_set: bool,
-    voice: str = "af_heart",
+    voice_choices: dict[str, str] | None = None,
     listening: bool = False,
     limits: dict,
     defaults: dict,
@@ -1192,6 +1214,10 @@ def settings_page(
 
 <form method="post" action="{base}/settings" id="settings">
   {_csrf(csrf)}
+  <!-- Enter in a field submits with the first button: make that Save, not a
+       language's Remove. -->
+  <button type="submit" tabindex="-1" aria-hidden="true"
+    style="position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden">Save</button>
 
   <h2 id="schedule" style="margin-top:1.2rem">Schedule</h2>
   <div class="card">
@@ -1226,7 +1252,7 @@ def settings_page(
     <div class="grid2">{limit_fields}</div>
     <p class="hint">Blank uses the default shown. Nothing is printed twice.</p>
   </div>
-{_listening_card(voice) if listening else f'<input type="hidden" name="voice" value="{escape(voice)}">'}
+{_listening_card(secret, voice_choices or {"en": "af_heart"}) if listening else ""}
 
   <details id="account"{" open" if not email else ""}>
   <summary><h2 style="display:inline">Account and notifications</h2></summary>

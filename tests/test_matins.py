@@ -2531,7 +2531,7 @@ def test_listen_to_all_is_off_without_the_voice_files(client, monkeypatch, tmp_p
     assert client.get(f"/{secret}/read/listen", params={"article": "x"}).status_code == 404
 
 
-def test_listening_reads_with_the_feed_voice_then_the_catalogue_voice(client, tmp_path, monkeypatch):
+def test_listening_reads_each_language_with_its_voice(client, tmp_path, monkeypatch):
     _tts_dir(tmp_path, monkeypatch)
     secret = _signup_without_readwise(client)
     _add_feed(client, secret)
@@ -2544,23 +2544,31 @@ def test_listening_reads_with_the_feed_voice_then_the_catalogue_voice(client, tm
         return match and match.group(1)
 
     assert bar() == "af_heart"
+    settings = client.get(f"/{secret}/settings", headers=HTML).text
+    assert 'name="voice_en"' in settings and 'name="voice_it"' not in settings
+    # Add Italian, keeping the English voice picked meanwhile.
     client.post(
-        f"/{secret}/settings",
-        data={"csrf": _csrf(client, secret), "schedule": "07:00", "voice": "bm_george"},
+        f"/{secret}/settings/languages",
+        data={"csrf": _csrf(client, secret), "voice_en": "bm_george", "add_language": "it", "add": "1"},
         follow_redirects=False,
     )
-    assert store.get_delivery(secret).voice == "bm_george"
+    assert 'name="voice_it"' in client.get(f"/{secret}/settings", headers=HTML).text
+    client.post(
+        f"/{secret}/settings",
+        data={"csrf": _csrf(client, secret), "schedule": "07:00", "voice_en": "bm_george", "voice_it": "im_nicola"},
+        follow_redirects=False,
+    )
     assert bar() == "bm_george"
 
+    # The feed is Italian: its articles take the Italian voice.
     feed = store.list_feeds(secret)[0]
     saved = client.post(
         f"/{secret}/feeds/{feed.id}/voice",
-        data={"csrf": _csrf(client, secret), "voice": "ff_siwis"},
+        data={"csrf": _csrf(client, secret), "voice": "it"},
         follow_redirects=False,
     )
     assert saved.status_code == 303
-    assert bar() == "ff_siwis"
-    # Back to the catalogue's.
+    assert bar() == "im_nicola"
     client.post(
         f"/{secret}/feeds/{feed.id}/voice",
         data={"csrf": _csrf(client, secret), "voice": ""},
@@ -2569,22 +2577,40 @@ def test_listening_reads_with_the_feed_voice_then_the_catalogue_voice(client, tm
     assert store.get_feed(secret, feed.id).voice is None
     assert bar() == "bm_george"
 
+    client.post(
+        f"/{secret}/settings/languages",
+        data={"csrf": _csrf(client, secret), "voice_en": "bm_george", "voice_it": "im_nicola", "remove_language": "it"},
+        follow_redirects=False,
+    )
+    assert 'name="voice_it"' not in client.get(f"/{secret}/settings", headers=HTML).text
+
+
+def test_the_language_is_detected_from_the_text():
+    from later_ink.matins.voices import detect_language, parse_choices
+
+    assert detect_language("Il governo ha deciso che la legge della regione non è valida.") == "it"
+    assert detect_language("Le gouvernement a annoncé une conférence avec les syndicats.") == "fr"
+    assert detect_language("Hello") is None
+    # A catalogue that saved one voice before languages existed.
+    assert parse_choices("ff_siwis") == {"fr": "ff_siwis"}
+
 
 def test_an_unknown_voice_is_refused(client, tmp_path, monkeypatch):
     _tts_dir(tmp_path, monkeypatch)
     secret = _signup_without_readwise(client)
     _add_feed(client, secret)
     store = client.app.state.matins
-    bad = client.post(
-        f"/{secret}/settings",
-        data={"csrf": _csrf(client, secret), "schedule": "07:00", "voice": "../etc"},
-        follow_redirects=False,
-    )
-    assert bad.status_code == 400
+    for bad_voice in ("../etc", "ff_siwis"):  # unknown, or not English
+        bad = client.post(
+            f"/{secret}/settings",
+            data={"csrf": _csrf(client, secret), "schedule": "07:00", "voice_en": bad_voice},
+            follow_redirects=False,
+        )
+        assert bad.status_code == 400
     feed = store.list_feeds(secret)[0]
     client.post(
         f"/{secret}/feeds/{feed.id}/voice",
-        data={"csrf": _csrf(client, secret), "voice": "zz_nope"},
+        data={"csrf": _csrf(client, secret), "voice": "zz"},
         follow_redirects=False,
     )
     assert store.get_feed(secret, feed.id).voice is None
@@ -2597,7 +2623,7 @@ def test_without_the_tts_files_there_is_no_listen_button(client, tmp_path, monke
     article = _reader_article_id(client, secret, "First story")
     page = client.get(f"/{secret}/read", params={"article": article}, headers=HTML).text
     assert 'class="listen"' not in page
-    assert 'id="voice"' not in client.get(f"/{secret}/settings", headers=HTML).text
+    assert 'name="voice_en"' not in client.get(f"/{secret}/settings", headers=HTML).text
     assert client.get("/assets/tts/worker.js").status_code == 404
 
 

@@ -7,6 +7,8 @@ for the rest). Grades are hexgrad's, from the model card: they are why the
 default is af_heart and why the list leads with the better voices.
 """
 
+import json
+import re
 from dataclasses import dataclass
 
 
@@ -66,3 +68,73 @@ def valid_voice(value: str | None) -> str | None:
     """The voice id if Matins ships it, else None."""
     value = (value or "").strip()
     return value if value in VOICE_IDS else None
+
+
+# One voice per language. The first letter of a Kokoro voice id is its language
+# (a/b: US/UK English); a catalogue picks a voice for each language it reads,
+# and an article is read with the voice of the language it is written in.
+LANGUAGES: tuple[tuple[str, str], ...] = (
+    ("en", "English"),
+    ("fr", "French"),
+    ("it", "Italian"),
+    ("es", "Spanish"),
+    ("pt", "Portuguese"),
+)
+LANGUAGE_NAMES = dict(LANGUAGES)
+_PREFIX = {"a": "en", "b": "en", "f": "fr", "i": "it", "e": "es", "p": "pt"}
+# A language nobody chose a voice for still reads in that language.
+DEFAULTS = {"en": DEFAULT_VOICE, "fr": "ff_siwis", "it": "if_sara", "es": "ef_dora", "pt": "pf_dora"}
+
+
+def language_of(voice_id: str) -> str:
+    return _PREFIX.get(voice_id[:1], "en")
+
+
+def voices_for(language: str) -> list[Voice]:
+    return [voice for voice in VOICES if language_of(voice.id) == language]
+
+
+def parse_choices(raw: str | None) -> dict[str, str]:
+    """The stored per-language choices. An older catalogue stored one voice id:
+    that is its language's choice."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {language_of(raw): raw} if raw in VOICE_IDS else {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        lang: voice
+        for lang, voice in data.items()
+        if lang in LANGUAGE_NAMES and voice in VOICE_IDS and language_of(voice) == lang
+    }
+
+
+def dump_choices(choices: dict[str, str]) -> str | None:
+    return json.dumps(choices, sort_keys=True) if choices else None
+
+
+def voice_for(language: str, choices: dict[str, str]) -> str:
+    return choices.get(language) or DEFAULTS.get(language, DEFAULT_VOICE)
+
+
+# The most frequent short words of each language, minus the ones they share.
+# A news article has dozens of them in its first paragraphs; that is enough.
+_MARKERS = {
+    "en": set("the and of to is that with for was on are this have from be by it".split()),
+    "fr": set("le les des est une dans pour du qui avec pas sur au ce sont aux leur".split()),
+    "it": set("il che di della sono gli per non una nel alla anche dei delle è ha".split()),
+    "es": set("el los las del por que una con para es como más pero sus fue ha".split()),
+    "pt": set("não uma do da os em para com ao mais são também foi pelo pela".split()),
+}
+_WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def detect_language(text: str) -> str | None:
+    """en, fr, it, es or pt, or None when the text is too short to tell."""
+    words = [w.casefold() for w in _WORD.findall(text[:4000])]
+    scores = {lang: sum(1 for w in words if w in marks) for lang, marks in _MARKERS.items()}
+    best = max(scores, key=lambda lang: scores[lang])
+    return best if scores[best] >= 3 else None

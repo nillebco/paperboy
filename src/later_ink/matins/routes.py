@@ -435,7 +435,7 @@ async def feed_detail(
             csrf=_csrf_token(secret),
             feed=_feed_row(store.get_feed(secret, feed_id)),
             items=rows,
-            account_voice=_account_voice(store.get_delivery(secret)),
+            languages=voices.LANGUAGES,
             listening=config.get_tts_assets_dir() is not None,
             window_hours=limits.window_hours,
             max_per_feed=limits.max_per_feed,
@@ -467,12 +467,14 @@ async def feed_voice(
 ):
     _resolve(secret, request)
     _require_csrf(secret, csrf)
-    chosen = voices.valid_voice(voice)
+    # The feed's language, which picks the catalogue's voice for it; empty is
+    # "detect it from each article".
+    chosen = voice.strip() if voice.strip() in voices.LANGUAGE_NAMES else None
     if voice.strip() and chosen is None:
-        return _back(secret, to=f"feeds/{feed_id}", error="Unknown voice.")
+        return _back(secret, to=f"feeds/{feed_id}", error="Unknown language.")
     if not _store(request).set_feed_voice(secret, feed_id, chosen):
         raise HTTPException(404, "No such feed")
-    return _back(secret, to=f"feeds/{feed_id}", notice="Voice saved.")
+    return _back(secret, to=f"feeds/{feed_id}", notice="Language saved.")
 
 
 @router.post("/{secret}/feeds/{feed_id}/pause")
@@ -746,7 +748,11 @@ async def reader_index(
             issue_title=issue_obj.title if issue_obj else None,
             selected=selected,
             body=body,
-            voice=_listen_voice(store, secret, selected, delivery) if body else None,
+            voice=(
+                _listen_voice(store, secret, selected, delivery, extract.visible_text(body))
+                if body
+                else None
+            ),
             list_voice=_listen_voice(store, secret, {}, delivery),
             notice=notice,
             error=error,
@@ -756,22 +762,26 @@ async def reader_index(
     )
 
 
-def _listen_voice(store, secret: str, item: dict, delivery) -> str | None:
+def _listen_voice(store, secret: str, item: dict, delivery, text: str = "") -> str | None:
     """The voice to read this article with, or None when listening is off.
 
-    A feed's own voice wins (Il Post reads in Italian), then the catalogue's.
-    Saved links and Bluesky posts have no feed, so they use the catalogue's."""
+    The catalogue has a voice per language. The language is the feed's, when
+    set (Il Post is Italian), else whatever the article's text is written in."""
     if config.get_tts_assets_dir() is None:
         return None
-    fallback = (delivery.voice if delivery else None) or voices.DEFAULT_VOICE
+    choices = _account_voices(delivery)
     item_id = item.get("id") or ""
     # By id, not kind: an issue's row for a feed article has kind "issue".
     if item_id.startswith("feeds:"):
         feed_id, _, _digest = item_id.removeprefix("feeds:").rpartition("-")
         feed = store.get_feed(secret, feed_id) if feed_id else None
         if feed is not None and feed.voice:
-            return feed.voice
-    return fallback
+            if feed.voice in voices.LANGUAGE_NAMES:
+                return voices.voice_for(feed.voice, choices)
+            if voices.valid_voice(feed.voice):  # chosen before languages existed
+                return feed.voice
+    language = voices.detect_language(text) if text else None
+    return voices.voice_for(language or "en", choices)
 
 
 def _issue_item(entry, ratings: dict[str, int], queued: dict, read: set[str]) -> dict:
@@ -993,7 +1003,9 @@ async def reader_listen(secret: str, request: Request, article: str):
         {
             "id": item["id"],
             "title": item["title"],
-            "voice": _listen_voice(store, secret, item, store.get_delivery(secret)),
+            "voice": _listen_voice(
+                store, secret, item, store.get_delivery(secret), " ".join(blocks)
+            ),
             "blocks": [item["title"], *blocks] if blocks else [],
         },
         headers={"Cache-Control": "no-store"},
@@ -1436,11 +1448,12 @@ async def settings_post(
     max_saved: str = Form(""),
     auto_select: str = Form("1"),
     show_dates: str = Form(""),
-    voice: str = Form(""),
 ):
     """Schedule, limits and notifications. Sources have their own page."""
     _resolve(secret, request)
     _require_csrf(secret, csrf)
+    form = await request.form()
+    chosen = _posted_voices(form)
 
     curated = auto_select == "0"
     overrides = {
@@ -1451,7 +1464,7 @@ async def settings_post(
         "enabled": bool(enabled),
         "auto_select": not curated,
         "show_dates": bool(show_dates),
-        "voice": voice,
+        "voices": chosen if chosen is not None else _account_voices(_store(request).get_delivery(secret)),
         "limits": {
             "max_articles": max_articles,
             "max_per_feed": max_per_feed,
@@ -1472,7 +1485,8 @@ async def settings_post(
             ),
             status=400,
         )
-    if voice.strip() and voices.valid_voice(voice) is None:
+    if chosen is False:
+        overrides["voices"] = _account_voices(_store(request).get_delivery(secret))
         return _html(
             _render_settings(request, secret, error="Unknown voice.", overrides=overrides),
             status=400,
@@ -1530,8 +1544,47 @@ async def settings_post(
     _store(request).set_issue_limits(secret, **limits)
     _store(request).set_auto_select(secret, not curated)
     _store(request).set_show_dates(secret, bool(show_dates))
-    _store(request).set_voice(secret, voices.valid_voice(voice))
+    if chosen is not None:
+        _store(request).set_voice(secret, voices.dump_choices(chosen))
     return RedirectResponse(f"/{secret}/settings?saved=1", status_code=303)
+
+
+def _posted_voices(form) -> dict[str, str] | None | bool:
+    """voice_<language> fields as choices; None when the form has none (listening
+    off), False when one names a voice Matins does not ship for that language."""
+    chosen: dict[str, str] = {}
+    seen = False
+    for lang in voices.LANGUAGE_NAMES:
+        raw = str(form.get(f"voice_{lang}") or "").strip()
+        if not raw:
+            continue
+        seen = True
+        if voices.valid_voice(raw) is None or voices.language_of(raw) != lang:
+            return False
+        chosen[lang] = raw
+    return chosen if seen else None
+
+
+@router.post("/{secret}/settings/languages")
+async def settings_languages(secret: str, request: Request):
+    """Add or remove a reading language. The Listening card's buttons post the
+    whole settings form here, so voices picked meanwhile are kept."""
+    _resolve(secret, request)
+    form = await request.form()
+    _require_csrf(secret, str(form.get("csrf") or ""))
+    store = _store(request)
+    _ensure_delivery(request, secret)
+    chosen = _posted_voices(form)
+    if not chosen:
+        chosen = _account_voices(store.get_delivery(secret))
+    add = str(form.get("add_language") or "")
+    remove = str(form.get("remove_language") or "")
+    if add in voices.LANGUAGE_NAMES and "add" in form:
+        chosen.setdefault(add, voices.voice_for(add, {}))
+    if remove in chosen and remove != "en":
+        del chosen[remove]
+    store.set_voice(secret, voices.dump_choices(chosen))
+    return RedirectResponse(f"/{secret}/settings#listening", status_code=303)
 
 
 @router.post("/{secret}/schedule")
@@ -1957,8 +2010,10 @@ def _feed_row(feed) -> dict:
     }
 
 
-def _account_voice(delivery) -> str:
-    return (delivery.voice if delivery else None) or voices.DEFAULT_VOICE
+def _account_voices(delivery) -> dict[str, str]:
+    """The catalogue's voice per language; English is always there."""
+    choices = voices.parse_choices(delivery.voice if delivery else None)
+    return {"en": voices.voice_for("en", choices), **choices}
 
 
 def _feed_rows(request: Request, secret: str) -> list[dict]:
@@ -2092,7 +2147,7 @@ def _render_settings(
         "enabled": bool(delivery.enabled) if delivery else True,
         "auto_select": delivery.auto_select if delivery else True,
         "show_dates": delivery.show_dates if delivery else True,
-        "voice": _account_voice(delivery),
+        "voices": _account_voices(delivery),
         "limits": {
             key: getattr(delivery, key, None) if delivery else None for key in LIMIT_BOUNDS
         },
@@ -2110,7 +2165,7 @@ def _render_settings(
         enabled=values["enabled"],
         auto_select=values["auto_select"],
         show_dates=values["show_dates"],
-        voice=values["voice"],
+        voice_choices=values["voices"],
         listening=config.get_tts_assets_dir() is not None,
         webhook_secret_set=bool(delivery and delivery.webhook_secret),
         limits=values["limits"],
