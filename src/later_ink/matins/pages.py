@@ -1402,7 +1402,9 @@ function say(t){if(bar)bar.querySelector('[data-status]').textContent=t;}
 function label(b,state){
   b.querySelector('[data-listen]').textContent=state==='playing'?'❚❚ Pause':
     state==='paused'?'▶ Resume':(b===all?'▶ Listen to all':'▶ Listen');
-  b.querySelector('[data-stop]').hidden=state==='idle';}
+  b.querySelector('[data-stop]').hidden=state==='idle';
+  // The phone's voices only matter once something is playing.
+  var picker=b.querySelector('[data-device-voice]');if(picker)picker.hidden=state==='idle';}
 function leaves(){
   var root=document.querySelector('.reader-pane .article'),sel='p,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption';
   return root?Array.prototype.filter.call(root.querySelectorAll(sel),function(el){
@@ -1425,14 +1427,56 @@ function speak(lines,voice,offset){
   run++;pending=0;ended=false;
   worker.postMessage({type:'speak',run:run,voice:voice,blocks:lines,offset:offset});
   request();return run;}
+// Apple ships robotic (Eddy, Reed, Rocko…) and novelty (Fred, Albert…) voices
+// beside the real ones: never pick those. One voice per language per page, so
+// it cannot change between two paragraphs.
+var ODD=/^(Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Deranged|Eddy|Flo|Fred|Good News|Grandma|Grandpa|Hysterical|Jester|Junior|Kathy|Organ|Pipe Organ|Princess|Ralph|Reed|Rocko|Sandy|Shelley|Superstar|Trinoids|Whisper|Wobble|Zarvox)\\b/;
+var picked={};
+function candidates(lang){
+  var voices=speechSynthesis.getVoices().filter(function(v){return !ODD.test(v.name);});
+  var mine=voices.filter(function(v){return v.lang.replace('_','-')===lang;});
+  return mine.length?mine:voices.filter(function(v){return v.lang.slice(0,2)===lang.slice(0,2);});}
 function systemVoice(lang){
-  var all=speechSynthesis.getVoices().filter(function(v){return v.lang.replace('_','-')===lang;});
-  if(!all.length)all=speechSynthesis.getVoices().filter(function(v){return v.lang.slice(0,2)===lang.slice(0,2);});
-  return all.filter(function(v){return /enhanced|premium/i.test(v.name);})[0]||
-    all.filter(function(v){return v.localService;})[0]||all[0]||null;}
+  if(lang in picked)return picked[lang];
+  if(!speechSynthesis.getVoices().length)return null;
+  var mine=candidates(lang),wanted='';
+  try{wanted=localStorage.getItem('matins-device-voice:'+lang)||'';}catch(e){}
+  picked[lang]=mine.filter(function(v){return v.name===wanted;})[0]||mine.filter(function(v){return /premium/i.test(v.name);})[0]||
+    mine.filter(function(v){return /enhanced/i.test(v.name);})[0]||
+    mine.filter(function(v){return v.default;})[0]||
+    mine.filter(function(v){return v.localService;})[0]||mine[0]||null;
+  return picked[lang];}
+// The phone's voices for the bar's language, chosen in the bar itself: a page
+// cannot list them anywhere else. The choice is kept per language.
+function devicePicker(b,voice){
+  var lang=LANG[(voice||b.dataset.voice||'a')[0]]||'en-US',mine=candidates(lang),
+      old=b.querySelector('[data-device-voice]');
+  if(old&&old.dataset.lang===lang)return;
+  if(old)old.remove();
+  if(mine.length<2)return;
+  var select=document.createElement('select'),current=systemVoice(lang);
+  select.className='tiny';select.dataset.deviceVoice='';select.setAttribute('aria-label','Voice');
+  mine.forEach(function(v){var o=document.createElement('option');o.value=o.textContent=v.name;
+    if(current&&v.name===current.name)o.selected=true;select.appendChild(o);});
+  select.addEventListener('change',function(){
+    try{localStorage.setItem('matins-device-voice:'+lang,select.value);}catch(e){}
+    delete picked[lang];
+    document.querySelectorAll('[data-device-voice]').forEach(function(o){
+      if(o!==select&&o.dataset.lang===lang)o.value=select.value;});});
+  select.dataset.lang=lang;
+  b.insertBefore(select,b.querySelector('[data-status]'));}
+// The list arrives after the page loads (empty at first on iOS): wait for it,
+// at most two seconds, rather than speak the first sentences in a stray voice.
+function voicesReady(then){
+  if(speechSynthesis.getVoices().length){then();return;}
+  var done=false;function go(){if(!done){done=true;then();}}
+  speechSynthesis.addEventListener('voiceschanged',go,{once:true});setTimeout(go,2000);}
 function talk(lines,voice,offset){
-  var mine=session,lang=LANG[(voice||'a')[0]]||'en-US',chosen=systemVoice(lang),i=0;
-  ended=false;
+  var mine=session;ended=false;
+  voicesReady(function(){if(mine!==session)return;
+    if(bar)devicePicker(bar,voice);say_(lines,voice,offset,mine);});}
+function say_(lines,voice,offset,mine){
+  var lang=LANG[(voice||'a')[0]]||'en-US',chosen=systemVoice(lang),i=0;
   function next(){
     if(mine!==session)return;
     if(i>=lines.length){ended=true;spoken();return;}
@@ -1562,6 +1606,7 @@ document.addEventListener('click',function(ev){
 bars.forEach(function(b){b.querySelector('[data-speed]').addEventListener('change',function(ev){
   bars.forEach(function(o){o.querySelector('[data-speed]').value=ev.target.value;});
   try{localStorage.setItem('matins-listen-speed',ev.target.value);}catch(e){}});});
+if(SYSTEM)speechSynthesis.getVoices();
 window.addEventListener('pagehide',function(){if(worker)worker.terminate();});
 }());"""
 
