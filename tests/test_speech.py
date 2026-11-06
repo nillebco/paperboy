@@ -79,12 +79,19 @@ def server_speech(tmp_path, monkeypatch):
     made = []
     service = _speech(tmp_path, made)
     monkeypatch.setattr(speech, "service", lambda: service)
+    monkeypatch.setenv("SPEECH_USERS", "Reader@Example.com, other@example.com")
     return made
+
+
+def _allowed(client) -> str:
+    secret = _signup_without_readwise(client)
+    client.app.state.matins.link_email(secret, "reader@example.com")
+    return secret
 
 
 def test_reader_posts_paragraphs_and_plays_their_mp3(client, tmp_path, monkeypatch, server_speech):
     _tts_dir(tmp_path, monkeypatch)
-    secret = _signup_without_readwise(client)
+    secret = _allowed(client)
     keys = client.post(
         f"/{secret}/read/speech", json={"voice": "af_heart", "blocks": ["A title", "A  paragraph."]}
     ).json()["keys"]
@@ -112,13 +119,25 @@ def test_server_speech_is_off_without_the_model(client, monkeypatch):
     assert response.status_code == 404
 
 
-def test_settings_choose_the_voice_engine(client, tmp_path, monkeypatch, server_speech):
+def test_server_speech_is_only_for_the_chosen_accounts(client, tmp_path, monkeypatch, server_speech):
     _tts_dir(tmp_path, monkeypatch)
     secret = _signup_without_readwise(client)
+    response = client.post(f"/{secret}/read/speech", json={"voice": "af_heart", "blocks": ["x"]})
+    assert response.status_code == 404
+    assert 'value="server"' not in client.get(f"/{secret}/settings").text
+    form = {"csrf": _csrf(client, secret), "schedule": "07:00", "timezone": "Europe/Paris", "enabled": "1"}
+    client.post(f"/{secret}/settings", data={**form, "listen_engine": "server"})
+    assert client.app.state.matins.get_delivery(secret).listen_engine is None
+
+
+def test_settings_choose_the_voice_engine(client, tmp_path, monkeypatch, server_speech):
+    _tts_dir(tmp_path, monkeypatch)
+    secret = _allowed(client)
     page = client.get(f"/{secret}/settings").text
     assert '<option value="kokoro" selected>Kokoro, in your browser</option>' in page
     assert 'value="server"' in page
-    form = {"csrf": _csrf(client, secret), "schedule": "07:00", "timezone": "Europe/Paris", "enabled": "1"}
+    form = {"csrf": _csrf(client, secret), "schedule": "07:00", "timezone": "Europe/Paris",
+            "enabled": "1", "email": "reader@example.com"}
     client.post(f"/{secret}/settings", data={**form, "listen_engine": "server"})
     assert client.app.state.matins.get_delivery(secret).listen_engine == "server"
     assert '<option value="server" selected>' in client.get(f"/{secret}/settings").text
@@ -128,7 +147,8 @@ def test_settings_choose_the_voice_engine(client, tmp_path, monkeypatch, server_
 
 def test_server_engine_falls_back_to_kokoro_when_the_server_cannot_speak(monkeypatch):
     monkeypatch.setattr(speech, "service", lambda: None)
+    store = type("S", (), {"email_for_secret": lambda self, secret: "reader@example.com"})()
     delivery = type("D", (), {"listen_engine": "server"})()
-    assert routes._listen_engine(delivery) == "kokoro"
-    assert routes._listen_engine(type("D", (), {"listen_engine": "device"})()) == "device"
-    assert routes._listen_engine(None) == "kokoro"
+    assert routes._listen_engine(store, "s", delivery) == "kokoro"
+    assert routes._listen_engine(store, "s", type("D", (), {"listen_engine": "device"})()) == "device"
+    assert routes._listen_engine(store, "s", None) == "kokoro"

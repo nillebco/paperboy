@@ -776,7 +776,7 @@ async def reader_index(
                 else None
             ),
             list_voice=_listen_voice(store, secret, {}, delivery),
-            listen_engine=_listen_engine(delivery),
+            listen_engine=_listen_engine(store, secret, delivery),
             notice=notice,
             error=error,
         ),
@@ -810,10 +810,22 @@ def _listen_voice(store, secret: str, item: dict, delivery, text: str = "") -> s
 ENGINES = ("kokoro", "server", "device")
 
 
-def _listen_engine(delivery) -> str:
+def _server_speech(store, secret: str):
+    """The speech service, for the catalogues allowed it (SPEECH_USERS), else None.
+
+    The server's two cores are shared by everyone; reading aloud is for the
+    accounts the operator picked."""
+    service = speech.service()
+    if service is None:
+        return None
+    email = (store.email_for_secret(secret) or "").strip().lower()
+    return service if email and email in config.get_speech_users() else None
+
+
+def _listen_engine(store, secret: str, delivery) -> str:
     """Who reads aloud: Kokoro in the browser unless the reader chose otherwise."""
     engine = getattr(delivery, "listen_engine", None) or "kokoro"
-    if engine == "server" and speech.service() is None:
+    if engine == "server" and _server_speech(store, secret) is None:
         return "kokoro"
     return engine if engine in ENGINES else "kokoro"
 
@@ -1138,7 +1150,7 @@ async def reader_speech(secret: str, request: Request):
     The paragraphs are queued at once, the first first, ahead of any older
     listen; each one's MP3 is then at /read/speech/<key>.mp3."""
     _resolve(secret, request)
-    service = speech.service()
+    service = _server_speech(_store(request), secret)
     if service is None:
         raise HTTPException(404, "The server does not read aloud")
     try:
@@ -1163,7 +1175,7 @@ async def reader_speech(secret: str, request: Request):
 @router.get("/{secret}/read/speech/{key}.mp3")
 async def reader_speech_audio(secret: str, key: str, request: Request):
     _resolve(secret, request)
-    service = speech.service()
+    service = _server_speech(_store(request), secret)
     if service is None or not re.fullmatch(r"[0-9a-f]{32}", key):
         raise HTTPException(404, "No such audio")
     path = await service.audio(key)
@@ -1773,6 +1785,8 @@ async def settings_post(
     _store(request).set_show_dates(secret, bool(show_dates))
     if chosen is not None:
         _store(request).set_voice(secret, voices.dump_choices(chosen))
+    if listen_engine == "server" and _server_speech(_store(request), secret) is None:
+        listen_engine = "kokoro"
     if listen_engine in ENGINES:
         _store(request).set_listen_engine(secret, None if listen_engine == "kokoro" else listen_engine)
     return RedirectResponse(f"/{secret}/settings?saved=1", status_code=303)
@@ -2384,7 +2398,7 @@ def _render_settings(
     }
     values.update({k: v for k, v in (overrides or {}).items() if k != "listen_engine" or v})
     if not values["listen_engine"]:
-        values["listen_engine"] = _listen_engine(delivery)
+        values["listen_engine"] = _listen_engine(store, secret, delivery)
     defaults = limits_for(None)
     return pages.settings_page(
         secret=secret,
@@ -2400,7 +2414,7 @@ def _render_settings(
         voice_choices=values["voices"],
         listening=config.get_tts_assets_dir() is not None,
         listen_engine=values["listen_engine"],
-        server_speech=speech.service() is not None,
+        server_speech=_server_speech(store, secret) is not None,
         webhook_secret_set=bool(delivery and delivery.webhook_secret),
         limits=values["limits"],
         defaults={key: getattr(defaults, key) for key in LIMIT_BOUNDS},

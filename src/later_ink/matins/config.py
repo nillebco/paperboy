@@ -179,3 +179,9 @@ def get_speech_cache_dir() -> Path:
 
 def get_speech_cache_max_bytes() -> int:
     return _int("SPEECH_CACHE_MAX_MB", 2048, minimum=16) * 1024 * 1024
+
+
+def get_speech_users() -> frozenset[str]:
+    """The accounts (emails, comma-separated) the server reads aloud for."""
+    raw = os.environ.get("SPEECH_USERS", "")
+    return frozenset(e.strip().lower() for e in raw.split(",") if e.strip())
