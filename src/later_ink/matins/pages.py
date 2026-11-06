@@ -1486,7 +1486,7 @@ var apple=/iPhone|iPad|iPod/.test(navigator.userAgent)||
 var SYSTEM='speechSynthesis' in window&&(forced?forced==='system':apple&&!window.crossOriginIsolated);
 var AHEAD=3,worker=null,ctx=null,run=0,pending=0,ended=true,playing=false,nextAt=0,sources=[],
     bar=null,session=0,blocks=[],current=-1,list=[],at=-1,articleOf={},texts={},row=null,
-    watch=0,heard=false;
+    watch=0,heard=false,hold=null;
 try{var saved=localStorage.getItem('matins-listen-speed');
   if(saved)bars.forEach(function(b){b.querySelector('[data-speed]').value=saved;});}catch(e){}
 function speed(){return +(bar||bars[0]).querySelector('[data-speed]').value||1;}
@@ -1580,6 +1580,17 @@ function begin(b){
   if(SYSTEM){speechSynthesis.cancel();
     // Like audio, speech must start inside the tap; later articles follow it.
     speechSynthesis.speak(new SpeechSynthesisUtterance(' '));}
+  // Web Audio on an iPhone is "ambient": the silent switch mutes it, while the
+  // highlight goes on. Ask for playback, and on iOS before 17 hold a silent
+  // <audio> loop, which moves the page into the playback session too.
+  try{if(navigator.audioSession)navigator.audioSession.type='playback';}catch(e){}
+  if(apple&&!SYSTEM){if(!hold){var n=8000,w=new DataView(new ArrayBuffer(44+n*2)),
+      put=function(o,t){for(var j=0;j<t.length;j++)w.setUint8(o+j,t.charCodeAt(j));};
+    put(0,'RIFF');w.setUint32(4,36+n*2,true);put(8,'WAVEfmt ');w.setUint32(16,16,true);
+    w.setUint16(20,1,true);w.setUint16(22,1,true);w.setUint32(24,8000,true);w.setUint32(28,16000,true);
+    w.setUint16(32,2,true);w.setUint16(34,16,true);put(36,'data');w.setUint32(40,n*2,true);
+    hold=new Audio(URL.createObjectURL(new Blob([w],{type:'audio/wav'})));hold.loop=true;}
+    try{var q=hold.play();if(q&&q.catch)q.catch(function(){});}catch(e){}}
   if(!ctx)ctx=new AC();
   ctx.resume();
   // iOS only lets a page make sound once it has started one inside the tap.
@@ -1588,7 +1599,7 @@ function begin(b){
   nextAt=ctx.currentTime;playing=true;heard=false;label(b,'playing');}
 function stop(){
   session++;run++;ended=true;playing=false;clearTimeout(watch);
-  silence();if(ctx)ctx.suspend();if(SYSTEM)speechSynthesis.cancel();mark(-1);markRow(-1);
+  silence();if(ctx)ctx.suspend();if(hold)hold.pause();if(SYSTEM)speechSynthesis.cancel();mark(-1);markRow(-1);
   if(bar){say('');label(bar,'idle');}
   bar=null;at=-1;}
 function startOne(from){

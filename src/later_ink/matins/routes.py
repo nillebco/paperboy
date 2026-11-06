@@ -99,7 +99,7 @@ def _reader_csp() -> str:
     return (
         "default-src 'none'; img-src https: http: data:; "
         "style-src 'unsafe-inline'; "
-        f"script-src {hashes}; connect-src 'self'; worker-src 'self'; "
+        f"script-src {hashes}; connect-src 'self'; worker-src 'self'; media-src blob:; "
         "base-uri 'none'; form-action 'self'"
     )
 
