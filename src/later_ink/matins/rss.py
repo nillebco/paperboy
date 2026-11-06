@@ -11,7 +11,7 @@ import asyncio
 import hashlib
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -81,6 +81,10 @@ _cache: OrderedDict[str, tuple[float, ParsedFeed]] = OrderedDict()
 # A feed that just failed is not retried for a while: one dead publisher must not
 # cost its full timeout on every page that walks the feeds.
 _FAILURE_TTL = 300.0
+
+# An item that appears in its feed this long after its date was not just
+# published: it arrived (a front page). Longer than any fetch interval.
+_LATE_ARRIVAL = timedelta(minutes=45)
 _failures: dict[str, tuple[float, str]] = {}
 
 _FEED_TYPES = ("application/rss+xml", "application/atom+xml", "application/rdf+xml")
@@ -483,6 +487,7 @@ class RssConnector(Connector):
             _failures[key] = (now, str(e))
             raise
         _failures.pop(key, None)
+        parsed = self._dated_by_arrival(feed, parsed)
         dates = [item.published for item in parsed.items if item.published]
         self._store.record_feed_fetch(
             self._secret,
@@ -499,6 +504,25 @@ class RssConnector(Connector):
         if not feed.title and parsed.title:
             self._store.rename_feed(self._secret, feed.id, parsed.title[:120])
         return parsed
+
+    def _dated_by_arrival(self, feed: Feed, parsed: ParsedFeed) -> ParsedFeed:
+        """Items dated when they showed up in the feed, when that is much later.
+
+        A front page (Hacker News) carries stories dated when they were posted,
+        hours before they reached it: by that date they would sit far down the
+        Reader, under the news of the last hour, and never look new. Hacker News
+        records no time a story reached the front page, so the first fetch that
+        finds it stands in for that."""
+        seen = self._store.first_seen(feed.id, [item.id for item in parsed.items])
+        items = []
+        for item in parsed.items:
+            arrived = seen.get(item.id) or 0.0
+            if arrived:
+                arrival = datetime.fromtimestamp(arrived, UTC).replace(tzinfo=None)
+                if item.published is None or arrival - item.published > _LATE_ARRIVAL:
+                    item = replace(item, published=arrival)
+            items.append(item)
+        return ParsedFeed(title=parsed.title, items=items)
 
     async def lede_for(self, url: str) -> str | None:
         """The summary a subscribed feed carries for this article link."""

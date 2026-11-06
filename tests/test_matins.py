@@ -2,7 +2,7 @@ import asyncio
 import io
 import re
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import quote, unquote
 
 import httpx
@@ -2773,3 +2773,43 @@ def test_tts_files_are_served_with_a_worker_policy_and_nothing_else(client, tmp_
     assert client.get("/assets/tts/../secret.txt").status_code == 404
     assert client.get("/assets/tts/%2e%2e/secret.txt").status_code == 404
     assert client.get("/assets/tts/model/voices/nope.bin").status_code == 404
+
+
+def _hn_xml(*stories):
+    items = "".join(
+        f"<item><title>{title}</title><link>https://example.com/{title}</link>"
+        f"<pubDate>{posted}</pubDate></item>"
+        for title, posted in stories
+    )
+    return f"<rss version='2.0'><channel><title>Hacker News</title>{items}</channel></rss>".encode()
+
+
+def test_a_story_reaching_the_front_page_is_dated_when_it_arrived(tmp_path, monkeypatch):
+    from later_ink.matins import rss as rss_module
+
+    store = MatinsStore(f"{tmp_path}/app.db", Fernet(Fernet.generate_key()))
+    feed = store.add_feed("cat", "https://news.ycombinator.com/rss")
+    old = "Thu, 05 Nov 2026 08:00:00 +0000"
+    served = {"xml": _hn_xml(("first", old))}
+
+    async def fake_fetch(url, *, timeout, max_bytes):
+        return served["xml"]
+
+    monkeypatch.setattr(rss_module, "fetch_feed", fake_fetch)
+
+    def items():
+        clear_cache()
+        parsed = asyncio.run(rss_module.RssConnector(store, "cat")._load(feed))
+        return {item.title: item.published for item in parsed.items}
+
+    # What the feed carried when Matins first read it keeps its own date.
+    assert items()["first"] == datetime(2026, 11, 5, 8, 0)
+    # A story posted yesterday that reaches the front page now is dated now.
+    served["xml"] = _hn_xml(("first", old), ("risen", "Thu, 05 Nov 2026 09:00:00 +0000"))
+    dated = items()
+    assert dated["first"] == datetime(2026, 11, 5, 8, 0)
+    assert dated["risen"] > datetime(2026, 11, 6)
+    # A story fetched minutes after it was posted keeps its own date.
+    just = datetime.now(UTC).replace(microsecond=0, tzinfo=None) - timedelta(minutes=5)
+    served["xml"] = _hn_xml(("fresh", just.strftime("%a, %d %b %Y %H:%M:%S +0000")))
+    assert items()["fresh"] == just

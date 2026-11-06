@@ -422,6 +422,18 @@ class MatinsStore:
                 )
                 """
             )
+            # When an item first showed up in its feed. 0 for what the feed
+            # already carried when Matins first read it.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feed_seen (
+                    feed_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    first_seen REAL NOT NULL,
+                    PRIMARY KEY (feed_id, item_id)
+                )
+                """
+            )
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -522,7 +534,41 @@ class MatinsStore:
             cur = conn.execute(
                 "DELETE FROM feeds WHERE secret = ? AND id = ?", (secret, fid)
             )
+            if cur.rowcount:
+                conn.execute("DELETE FROM feed_seen WHERE feed_id = ?", (fid,))
         return cur.rowcount > 0
+
+    # How long an item that left its feed is remembered: one that comes back
+    # (a story back on a front page) within that time is not new again.
+    SEEN_KEEP = 14 * 86400
+
+    def first_seen(self, fid: str, item_ids: list[str], now: float | None = None) -> dict[str, float]:
+        """When each item was first seen in this feed, recording the new ones.
+
+        The first time a feed is read, everything it carries counts as seen at
+        0 (no later arrival to report); afterwards a new item is seen now."""
+        now = now if now is not None else time.time()
+        with self._conn() as conn:
+            known = {
+                row["item_id"]: row["first_seen"]
+                for row in conn.execute(
+                    "SELECT item_id, first_seen FROM feed_seen WHERE feed_id = ?", (fid,)
+                )
+            }
+            stamp = now if known else 0.0
+            fresh = [(fid, item, stamp) for item in item_ids if item not in known]
+            conn.executemany(
+                "INSERT OR IGNORE INTO feed_seen (feed_id, item_id, first_seen) VALUES (?, ?, ?)",
+                fresh,
+            )
+            gone = [item for item in known if item not in set(item_ids)]
+            if gone:
+                conn.execute(
+                    "DELETE FROM feed_seen WHERE feed_id = ? AND first_seen < ? AND item_id IN"
+                    f" ({','.join('?' * len(gone))})",
+                    (fid, now - self.SEEN_KEEP, *gone),
+                )
+        return {**known, **{item: stamp for _, item, stamp in fresh}}
 
     # -------------------------------------------------------- saved queue
 
