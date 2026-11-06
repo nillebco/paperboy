@@ -1597,7 +1597,13 @@ function onMessage(ev){
       say('The voice loaded but is too slow on this device to start.');},40000);
     return;}
   if(m.type==='error'){var b=bar;stop();bar=b;
-    say(m.text+(m.detail?' ('+m.detail+')':''));bar=null;return;}
+    // Kokoro could not start on this device: offer its own voices instead. The
+    // next tap starts them (speech, like audio, has to begin inside a tap).
+    if(!heard&&!SYSTEM&&'speechSynthesis' in window){SYSTEM=true;
+      say('This device could not start the voice'+(m.detail?' ('+m.detail+')':'')+
+        '. Tap \u25b6 again to listen with its own voice.');}
+    else say(m.text+(m.detail?' ('+m.detail+')':''));
+    bar=null;return;}
   if(m.run!==run)return;
   if(m.type==='end'){
     if(ended)return;ended=true;pending=0;
@@ -1611,7 +1617,11 @@ function ensureWorker(b){
   worker=new Worker(b.dataset.worker,{type:'module'});
   worker.onmessage=onMessage;
   worker.onerror=function(e){var x=bar;stop();bar=x;
-    say('Listening is not available in this browser'+(e&&e.message?' ('+e.message+')':'')+'.');bar=null;};}
+    if(!SYSTEM&&'speechSynthesis' in window){SYSTEM=true;
+      say('This device could not start the voice'+(e&&e.message?' ('+e.message+')':'')+
+        '. Tap \u25b6 again to listen with its own voice.');}
+    else say('Listening is not available in this browser'+(e&&e.message?' ('+e.message+')':'')+'.');
+    bar=null;};}
 document.addEventListener('click',function(ev){
   var b=ev.target.closest('.listen');
   if(b&&ev.target.closest('[data-stop]')){stop();return;}

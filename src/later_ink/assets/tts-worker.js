@@ -64,8 +64,11 @@ let run = 0;
 let voice = "af_heart";
 let work = Promise.resolve();
 
+// Enough to locate the failure: the message, then where it happened.
 function describe(error) {
-  return String((error && error.message) || error || "").slice(0, 160);
+  const message = String((error && error.message) || error || "");
+  const where = String((error && error.stack) || "").split("\n").find((line) => line.trim()) || "";
+  return (where && !message.includes(where) ? `${message} @ ${where}` : message).slice(0, 300);
 }
 
 // A failure outside a request (loading the model, a WASM abort) would otherwise
