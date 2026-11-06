@@ -2465,6 +2465,40 @@ def _tts_dir(tmp_path, monkeypatch):
     return root
 
 
+def test_listen_to_all_reads_each_listed_article_title_first(client, tmp_path, monkeypatch):
+    _tts_dir(tmp_path, monkeypatch)
+    secret = _signup_without_readwise(client)
+    client.post(
+        "/api/v1/candidates",
+        headers=_api(secret),
+        json={
+            "items": [
+                {
+                    "id": "p1",
+                    "url": "https://bsky.app/profile/a/post/1",
+                    "title": "A post",
+                    "source": "@a",
+                    "content": "<p>First paragraph.</p><ul><li>One point</li></ul><pre><p>code</p></pre>",
+                    "published": datetime.now(UTC).timestamp(),
+                }
+            ]
+        },
+    )
+    page = client.get(f"/{secret}/read").text
+    assert "▶ Listen to all" in page
+    assert f'data-source="/{secret}/read/listen"' in page
+    spoken = client.get(f"/{secret}/read/listen", params={"article": "cand:p1"}).json()
+    assert spoken["blocks"] == ["A post", "First paragraph.", "One point"]
+    assert spoken["voice"] == "af_heart"
+    assert client.get(f"/{secret}/read/listen", params={"article": "cand:nope"}).status_code == 404
+
+
+def test_listen_to_all_is_off_without_the_voice_files(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("TTS_ASSETS_DIR", str(tmp_path / "none"))
+    secret = _signup_without_readwise(client)
+    assert client.get(f"/{secret}/read/listen", params={"article": "x"}).status_code == 404
+
+
 def test_listening_reads_with_the_feed_voice_then_the_catalogue_voice(client, tmp_path, monkeypatch):
     _tts_dir(tmp_path, monkeypatch)
     secret = _signup_without_readwise(client)

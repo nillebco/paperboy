@@ -747,6 +747,7 @@ async def reader_index(
             selected=selected,
             body=body,
             voice=_listen_voice(store, secret, selected, delivery) if body else None,
+            list_voice=_listen_voice(store, secret, {}, delivery),
             notice=notice,
             error=error,
         ),
@@ -764,7 +765,8 @@ def _listen_voice(store, secret: str, item: dict, delivery) -> str | None:
         return None
     fallback = (delivery.voice if delivery else None) or voices.DEFAULT_VOICE
     item_id = item.get("id") or ""
-    if item.get("kind") == "rss" and item_id.startswith("feeds:"):
+    # By id, not kind: an issue's row for a feed article has kind "issue".
+    if item_id.startswith("feeds:"):
         feed_id, _, _digest = item_id.removeprefix("feeds:").rpartition("-")
         feed = store.get_feed(secret, feed_id) if feed_id else None
         if feed is not None and feed.voice:
@@ -942,6 +944,59 @@ async def _find_reader_item(
         "source": entry.section,
         "kind": "issue",
     }
+
+
+# What "Listen to all" reads: the same blocks the page player highlights.
+_SPOKEN = ("p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption")
+
+
+def _spoken_blocks(body: str) -> list[str]:
+    try:
+        root = fragment_fromstring(body, create_parent="div")
+    except (ValueError, TypeError):
+        return []
+    blocks = []
+    for el in root.iter(*_SPOKEN):
+        if any(True for _ in el.iterdescendants(*_SPOKEN)):
+            continue
+        if any(a.tag == "pre" for a in el.iterancestors()):
+            continue
+        text = " ".join(el.text_content().split())
+        if text:
+            blocks.append(text)
+    return blocks
+
+
+@router.get("/{secret}/read/listen")
+async def reader_listen(secret: str, request: Request, article: str):
+    """One article as text blocks, title first, for "Listen to all".
+
+    The page fetches these one after another while the previous article plays.
+    Listening is reading: the article is marked read."""
+    _resolve(secret, request)
+    if config.get_tts_assets_dir() is None:
+        raise HTTPException(404, "Listening is off")
+    item = await _find_reader_item(request, secret, article)
+    if item is None:
+        raise HTTPException(404, "No such article")
+    reader = await _reader(request, secret)
+    try:
+        body = await _reader_body(request, secret, reader, item)
+    except (ArticleUnavailable, UpstreamError, KeyError):
+        body = None
+    store = _store(request)
+    blocks = _spoken_blocks(body) if body else []
+    if blocks:
+        store.mark_read(secret, item["id"])
+    return JSONResponse(
+        {
+            "id": item["id"],
+            "title": item["title"],
+            "voice": _listen_voice(store, secret, item, store.get_delivery(secret)),
+            "blocks": [item["title"], *blocks] if blocks else [],
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.get("/{secret}/read/open")

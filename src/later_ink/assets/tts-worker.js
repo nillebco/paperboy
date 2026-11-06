@@ -52,6 +52,16 @@ let run = 0;
 let voice = "af_heart";
 let work = Promise.resolve();
 
+function describe(error) {
+  return String((error && error.message) || error || "").slice(0, 160);
+}
+
+// A failure outside a request (loading the model, a WASM abort) would otherwise
+// leave the page on its last status forever.
+self.addEventListener("unhandledrejection", (event) => {
+  self.postMessage({ type: "error", text: "The voice could not start.", detail: describe(event.reason) });
+});
+
 function status(text) {
   self.postMessage({ type: "status", text });
 }
@@ -85,7 +95,10 @@ async function model() {
           ([a, b], [c, d]) => [a + c, b + d],
           [0, 0],
         );
-        if (size > 5e6) status(`Downloading the voice… ${Math.round((100 * done) / size)}%`);
+        if (size < 5e6) return;
+        const percent = Math.round((100 * done) / size);
+        // The last step, building the model in memory, is the slow one on a phone.
+        status(percent < 100 ? `Downloading the voice… ${percent}%` : "Preparing the voice…");
       };
       status("Loading the voice…");
       if (!mobile() && (await gpu())) {
@@ -107,6 +120,8 @@ async function model() {
     })();
   }
   tts = await loading;
+  status("");
+  self.postMessage({ type: "ready" });
   return tts;
 }
 
@@ -188,7 +203,7 @@ async function next(asked, speed) {
     }
   } catch (error) {
     console.error(error);
-    self.postMessage({ type: "error", run: asked, text: "Could not read this article aloud." });
+    self.postMessage({ type: "error", run: asked, text: "Could not read this article aloud.", detail: describe(error) });
   }
 }
 
@@ -208,7 +223,8 @@ self.onmessage = (event) => {
         ...rest,
       ];
     }
-    // Start loading while the page asks for the first chunks.
+    // Start loading while the page asks for the first chunks; a failure here is
+    // reported once, by the first request.
     model().catch(() => {});
   } else if (message.type === "next") {
     // One synthesis at a time: the model is not reentrant.

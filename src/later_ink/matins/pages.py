@@ -212,6 +212,9 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .article-toolbar { display: flex; gap: .4rem; flex-wrap: wrap; margin: 0 0 1rem; }
 .listen { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; margin: -.4rem 0 1rem; }
 .listen select { width: auto; min-height: 0; margin: 0; padding: .2rem .4rem; font-size: .85rem; }
+.reader-list .listen-all { position: sticky; top: 0; z-index: 1; background: var(--card);
+  margin: 0 0 .3rem; padding: .3rem .2rem; border-bottom: 1px solid var(--line); }
+.reader-list .row.speaking { background: var(--soft); box-shadow: inset 3px 0 0 var(--fg); }
 .article .speaking { background: var(--soft); border-radius: 4px; box-shadow: 0 0 0 .3em var(--soft); }
 .article-toolbar form { margin: 0; }
 .reader-pane .card h1 { margin-top: 0; }
@@ -1363,93 +1366,202 @@ split.addEventListener('submit',function(ev){
 }());"""
 
 
-# Listen: reads the open article aloud, synthesised in the reader's own browser
-# by Kokoro in a worker (/assets/tts/worker.js). The page pulls audio one chunk
-# at a time, a few ahead of what is playing, so a long article never piles up in
-# memory and the first sentence plays as soon as it is ready. Clicking a
-# paragraph while listening jumps there. Delegated from the document, because the
-# background row actions replace the toolbar's buttons after every tap.
+# Listen: reads aloud, synthesised in the reader's own browser by Kokoro in a
+# worker (/assets/tts/worker.js). Two players share one worker and one audio
+# clock: the pane's ▶ Listen reads the open article and highlights paragraphs
+# (click one to jump there); the list's ▶ Listen to all reads every listed
+# article in order, fetching each one's text while the previous plays, with a
+# chime between two articles (click a row to jump to it). Audio is pulled one
+# chunk at a time, a few ahead of what is playing, so the first sentence plays
+# as soon as it is ready. Delegated from the document, because the background
+# row actions replace buttons after every tap.
+#
+# An iPhone or iPad cannot run Kokoro fast enough: Safari gives the page no
+# cross-origin isolation, so the WASM build runs on one thread, several times
+# slower than speech. There the players use the device's own voices (Web Speech,
+# offline, instant), in the language of the Kokoro voice. localStorage
+# 'matins-listen-engine' = 'system' | 'kokoro' overrides the choice.
 READER_LISTEN_JS = """(function(){
-var box=document.querySelector('.reader-pane .listen');
-if(!box||!window.Worker||!(window.AudioContext||window.webkitAudioContext))return;
-box.hidden=false;
-var button=box.querySelector('[data-listen]'),stopper=box.querySelector('[data-stop]'),
-    status=box.querySelector('[data-status]'),speed=box.querySelector('[data-speed]');
-var AHEAD=3,worker=null,ctx=null,run=0,blocks=[],pending=0,ended=false,
-    playing=false,nextAt=0,sources=[],current=-1;
-try{var saved=localStorage.getItem('matins-listen-speed');if(saved)speed.value=saved;}catch(e){}
-function say(t){status.textContent=t;}
-function texts(){
+var bars=Array.prototype.slice.call(document.querySelectorAll('.listen'));
+var AC=window.AudioContext||window.webkitAudioContext;
+if(!bars.length||!window.Worker||!AC)return;
+bars.forEach(function(b){b.hidden=false;});
+var one=document.querySelector('.reader-pane .listen'),all=document.querySelector('.reader-list .listen');
+var LANG={a:'en-US',b:'en-GB',f:'fr-FR',i:'it-IT',e:'es-ES',p:'pt-BR'},forced='';
+try{forced=localStorage.getItem('matins-listen-engine')||'';}catch(e){}
+var apple=/iPhone|iPad|iPod/.test(navigator.userAgent)||
+  (/Macintosh/.test(navigator.userAgent)&&navigator.maxTouchPoints>1);
+var SYSTEM='speechSynthesis' in window&&(forced?forced==='system':apple&&!window.crossOriginIsolated);
+var AHEAD=3,worker=null,ctx=null,run=0,pending=0,ended=true,playing=false,nextAt=0,sources=[],
+    bar=null,session=0,blocks=[],current=-1,list=[],at=-1,articleOf={},texts={},row=null,
+    watch=0,heard=false;
+try{var saved=localStorage.getItem('matins-listen-speed');
+  if(saved)bars.forEach(function(b){b.querySelector('[data-speed]').value=saved;});}catch(e){}
+function speed(){return +(bar||bars[0]).querySelector('[data-speed]').value||1;}
+function say(t){if(bar)bar.querySelector('[data-status]').textContent=t;}
+function label(b,state){
+  b.querySelector('[data-listen]').textContent=state==='playing'?'❚❚ Pause':
+    state==='paused'?'▶ Resume':(b===all?'▶ Listen to all':'▶ Listen');
+  b.querySelector('[data-stop]').hidden=state==='idle';}
+function leaves(){
   var root=document.querySelector('.reader-pane .article'),sel='p,h1,h2,h3,h4,h5,h6,li,blockquote,figcaption';
-  return Array.prototype.filter.call(root.querySelectorAll(sel),function(el){
-    return !el.querySelector(sel)&&!el.closest('pre')&&el.textContent.trim();});
-}
+  return root?Array.prototype.filter.call(root.querySelectorAll(sel),function(el){
+    return !el.querySelector(sel)&&!el.closest('pre')&&el.textContent.trim();}):[];}
+function rows(){return Array.prototype.slice.call(
+  document.querySelectorAll('.reader-list .row[data-id]:not(.archived)'));}
 function mark(i){
   if(current>=0&&blocks[current])blocks[current].classList.remove('speaking');
   current=i;
   if(i>=0&&blocks[i]){blocks[i].classList.add('speaking');
-    blocks[i].scrollIntoView({block:'nearest',behavior:'smooth'});}
-}
+    blocks[i].scrollIntoView({block:'nearest',behavior:'smooth'});}}
+function markRow(k){
+  if(row)row.classList.remove('speaking');row=null;
+  if(k>=0&&list[k]){row=list[k];row.classList.add('speaking');
+    row.scrollIntoView({block:'nearest',behavior:'smooth'});}}
+function silence(){sources.forEach(function(s){try{s.onended=null;s.stop();}catch(e){}});sources=[];}
 function request(){while(!ended&&pending<AHEAD){pending++;
-  worker.postMessage({type:'next',run:run,speed:+speed.value});}}
-function start(from){
+  worker.postMessage({type:'next',run:run,speed:speed()});}}
+function speak(lines,voice,offset){
   run++;pending=0;ended=false;
-  sources.forEach(function(s){try{s.onended=null;s.stop();}catch(e){}});sources=[];
-  if(!ctx)ctx=new (window.AudioContext||window.webkitAudioContext)();
-  ctx.resume();nextAt=ctx.currentTime;playing=true;
-  button.textContent='❚❚ Pause';stopper.hidden=false;
-  worker.postMessage({type:'speak',run:run,voice:box.dataset.voice,
-    blocks:blocks.slice(from).map(function(el){return el.textContent.replace(/\s+/g,' ').trim();}),
-    offset:from});
-  request();
-}
+  worker.postMessage({type:'speak',run:run,voice:voice,blocks:lines,offset:offset});
+  request();return run;}
+function systemVoice(lang){
+  var all=speechSynthesis.getVoices().filter(function(v){return v.lang.replace('_','-')===lang;});
+  if(!all.length)all=speechSynthesis.getVoices().filter(function(v){return v.lang.slice(0,2)===lang.slice(0,2);});
+  return all.filter(function(v){return /enhanced|premium/i.test(v.name);})[0]||
+    all.filter(function(v){return v.localService;})[0]||all[0]||null;}
+function talk(lines,voice,offset){
+  var mine=session,lang=LANG[(voice||'a')[0]]||'en-US',chosen=systemVoice(lang),i=0;
+  ended=false;
+  function next(){
+    if(mine!==session)return;
+    if(i>=lines.length){ended=true;spoken();return;}
+    var u=new SpeechSynthesisUtterance(lines[i]),block=offset+i;i++;
+    u.lang=lang;if(chosen)u.voice=chosen;u.rate=speed();
+    u.onstart=function(){if(mine!==session)return;heard=true;say('');
+      if(bar===all)markRow(at);else mark(block);};
+    u.onend=next;
+    u.onerror=function(e){if(e.error!=='interrupted'&&e.error!=='canceled')next();};
+    speechSynthesis.speak(u);}
+  next();}
+function spoken(){
+  if(bar!==all){stop();return;}
+  if(at+1>=list.length){stop();return;}
+  var mine=session;nextAt=ctx.currentTime;chime();
+  setTimeout(function(){if(mine===session)advance();},1300);}
+function begin(b){
+  if(bar&&bar!==b)stop();
+  bar=b;session++;silence();
+  if(SYSTEM){speechSynthesis.cancel();
+    // Like audio, speech must start inside the tap; later articles follow it.
+    speechSynthesis.speak(new SpeechSynthesisUtterance(' '));}
+  if(!ctx)ctx=new AC();
+  ctx.resume();
+  // iOS only lets a page make sound once it has started one inside the tap.
+  try{var s=ctx.createBufferSource();s.buffer=ctx.createBuffer(1,1,22050);
+    s.connect(ctx.destination);s.start(0);}catch(e){}
+  nextAt=ctx.currentTime;playing=true;heard=false;label(b,'playing');}
 function stop(){
-  run++;ended=true;playing=false;
-  sources.forEach(function(s){try{s.onended=null;s.stop();}catch(e){}});sources=[];
-  if(ctx)ctx.suspend();mark(-1);button.textContent='▶ Listen';stopper.hidden=true;say('');
-}
-function onMessage(ev){
-  var m=ev.data;
-  if(m.type==='status'){say(m.text);return;}
-  if(m.type==='error'){stop();say(m.text);return;}
-  if(m.run!==run)return;
-  if(m.type==='end'){ended=true;pending=0;
-    var last=sources[sources.length-1];
-    if(last)last.addEventListener('ended',function(){if(m.run===run)stop();});else stop();
-    return;}
-  if(m.type!=='audio')return;
-  pending--;
+  session++;run++;ended=true;playing=false;clearTimeout(watch);
+  silence();if(ctx)ctx.suspend();if(SYSTEM)speechSynthesis.cancel();mark(-1);markRow(-1);
+  if(bar){say('');label(bar,'idle');}
+  bar=null;at=-1;}
+function startOne(from){
+  begin(one);
+  (SYSTEM?talk:speak)(blocks.slice(from).map(function(el){return el.textContent.replace(/\\s+/g,' ').trim();}),
+    one.dataset.voice,from);}
+function load(k){
+  var r=list[k],id=r&&r.dataset.id;
+  if(!id)return Promise.resolve(null);
+  if(!texts[id])texts[id]=fetch(all.dataset.source+'?article='+encodeURIComponent(id),
+    {credentials:'same-origin'}).then(function(res){return res.ok?res.json():null;})
+    .catch(function(){return null;});
+  return texts[id];}
+function advance(){
+  var mine=session;at++;
+  if(at>=list.length){finish();return;}
+  load(at).then(function(d){
+    if(mine!==session)return;
+    if(!d||!d.blocks||!d.blocks.length){advance();return;}
+    if(SYSTEM)talk(d.blocks,d.voice||all.dataset.voice,0);
+    else articleOf[speak(d.blocks,d.voice||all.dataset.voice,0)]=at;
+    load(at+1);});}
+function startAll(k){begin(all);markRow(-1);list=rows();at=k-1;advance();}
+function finish(){
+  ended=true;var last=sources[sources.length-1],mine=session;
+  if(last)last.addEventListener('ended',function(){if(mine===session)stop();});else stop();}
+// Two soft notes between two articles, with a breath either side.
+function chime(){
+  var rate=ctx.sampleRate,n=Math.floor(rate*0.7),buffer=ctx.createBuffer(1,n,rate),d=buffer.getChannelData(0);
+  for(var i=0;i<n;i++){var t=i/rate,second=t>=0.16,u=second?t-0.16:t;
+    d[i]=0.16*Math.sin(2*Math.PI*(second?1046.5:784)*t)*Math.exp(-u*(second?6:14));}
+  var src=ctx.createBufferSource();src.buffer=buffer;src.connect(ctx.destination);
+  var when=Math.max(nextAt,ctx.currentTime+0.05)+0.35;src.start(when);
+  nextAt=when+buffer.duration+0.35;sources.push(src);
+  src.onended=function(){var i=sources.indexOf(src);if(i>=0)sources.splice(i,1);};}
+function play(m){
   var buffer=ctx.createBuffer(1,m.samples.length,m.rate);
   buffer.copyToChannel(m.samples,0);
   var src=ctx.createBufferSource();src.buffer=buffer;src.connect(ctx.destination);
-  var at=Math.max(nextAt,ctx.currentTime+0.05);src.start(at);nextAt=at+buffer.duration;
+  var when=Math.max(nextAt,ctx.currentTime+0.05);src.start(when);nextAt=when+buffer.duration;
   sources.push(src);
-  var block=m.block,wait=Math.max(0,(at-ctx.currentTime)*1000),mine=run;
-  setTimeout(function(){if(mine===run&&playing)mark(block);},wait);
-  src.onended=function(){sources.splice(sources.indexOf(src),1);if(mine===run)request();};
-  say('');
-}
+  var mine=session,block=m.block,k=articleOf[m.run],wait=Math.max(0,(when-ctx.currentTime)*1000);
+  setTimeout(function(){if(mine!==session||!playing)return;
+    if(bar===all)markRow(k);else mark(block);},wait);
+  src.onended=function(){var i=sources.indexOf(src);if(i>=0)sources.splice(i,1);
+    if(mine===session)request();};}
+function onMessage(ev){
+  var m=ev.data;
+  if(m.type==='status'){say(m.text);return;}
+  if(m.type==='ready'){
+    // Loaded but silent for this long: say so rather than spin forever.
+    clearTimeout(watch);
+    watch=setTimeout(function(){if(bar&&!heard)
+      say('The voice loaded but is too slow on this device to start.');},40000);
+    return;}
+  if(m.type==='error'){var b=bar;stop();bar=b;
+    say(m.text+(m.detail?' ('+m.detail+')':''));bar=null;return;}
+  if(m.run!==run)return;
+  if(m.type==='end'){
+    if(ended)return;ended=true;pending=0;
+    if(bar===all){if(at+1<list.length)chime();advance();}else finish();
+    return;}
+  if(m.type!=='audio')return;
+  pending--;heard=true;clearTimeout(watch);say('');
+  try{play(m);}catch(e){say('Could not play the audio ('+e.message+').');}}
+function ensureWorker(b){
+  if(worker)return;
+  worker=new Worker(b.dataset.worker,{type:'module'});
+  worker.onmessage=onMessage;
+  worker.onerror=function(e){var x=bar;stop();bar=x;
+    say('Listening is not available in this browser'+(e&&e.message?' ('+e.message+')':'')+'.');bar=null;};}
 document.addEventListener('click',function(ev){
-  if(ev.target.closest('[data-stop]')){stop();return;}
-  if(ev.target.closest('[data-listen]')){
-    if(!worker){worker=new Worker(box.dataset.worker,{type:'module'});
-      worker.onmessage=onMessage;
-      worker.onerror=function(){stop();say('Listening is not available in this browser.');};}
-    if(!blocks.length)blocks=texts();
-    if(!blocks.length){say('Nothing to read.');return;}
-    if(sources.length||pending){
-      if(playing){ctx.suspend();playing=false;button.textContent='▶ Resume';}
-      else{ctx.resume();playing=true;button.textContent='❚❚ Pause';}
+  var b=ev.target.closest('.listen');
+  if(b&&ev.target.closest('[data-stop]')){stop();return;}
+  if(b&&ev.target.closest('[data-listen]')){
+    if(!SYSTEM)ensureWorker(b);
+    if(bar===b){
+      if(playing){if(SYSTEM)speechSynthesis.pause();else ctx.suspend();playing=false;label(b,'paused');}
+      else{if(SYSTEM)speechSynthesis.resume();else ctx.resume();playing=true;label(b,'playing');}
       return;}
-    start(Math.max(0,current));return;}
-  var para=worker&&!stopper.hidden&&ev.target.closest('.reader-pane .article *');
-  if(para&&!ev.target.closest('a')){
-    var i=blocks.findIndex(function(el){return el===para||el.contains(para);});
-    if(i>=0){mark(i);start(i);}
-  }
+    if(b===one){blocks=leaves();
+      if(!blocks.length){b.querySelector('[data-status]').textContent='Nothing to read.';return;}
+      startOne(Math.max(0,current));}
+    else{if(!rows().length)return;startAll(0);}
+    return;}
+  if(bar===one){
+    var para=ev.target.closest('.reader-pane .article *');
+    if(para&&!ev.target.closest('a')){
+      var i=blocks.findIndex(function(el){return el===para||el.contains(para);});
+      if(i>=0){mark(i);startOne(i);}}
+    return;}
+  if(bar===all){
+    var link=ev.target.closest('.reader-list a.row-title'),k=link?list.indexOf(link.closest('.row')):-1;
+    if(k>=0){ev.preventDefault();startAll(k);}}
 });
-speed.addEventListener('change',function(){
-  try{localStorage.setItem('matins-listen-speed',speed.value);}catch(e){}});
+bars.forEach(function(b){b.querySelector('[data-speed]').addEventListener('change',function(ev){
+  bars.forEach(function(o){o.querySelector('[data-speed]').value=ev.target.value;});
+  try{localStorage.setItem('matins-listen-speed',ev.target.value);}catch(e){}});});
 window.addEventListener('pagehide',function(){if(worker)worker.terminate();});
 }());"""
 
@@ -1649,17 +1761,22 @@ def _reader_pane(
 </div>"""
 
 
-def _listen_bar(voice: str | None) -> str:
-    """The player, hidden until its script finds a browser that can run it."""
+def _listen_bar(voice: str | None, *, source: str | None = None) -> str:
+    """The player, hidden until its script finds a browser that can run it.
+
+    With `source` it is the list's "Listen to all", which fetches each article's
+    text from there."""
     if not voice:
         return ""
     speeds = "".join(
         f'<option value="{value}"{" selected" if value == "1" else ""}>{label}</option>'
         for value, label in (("0.8", "0.8×"), ("1", "1×"), ("1.2", "1.2×"), ("1.4", "1.4×"))
     )
+    origin = f' data-source="{escape(source)}"' if source else ""
     return (
-        f'<div class="listen" hidden data-voice="{escape(voice)}" data-worker="/assets/tts/worker.js">'
-        '<button class="btn tiny" type="button" data-listen>▶ Listen</button>'
+        f'<div class="listen{" listen-all" if source else ""}" hidden data-voice="{escape(voice)}" '
+        f'data-worker="/assets/tts/worker.js"{origin}>'
+        f'<button class="btn tiny" type="button" data-listen>▶ Listen{" to all" if source else ""}</button>'
         '<button class="btn tiny" type="button" data-stop hidden>■ Stop</button>'
         f'<select class="tiny" data-speed aria-label="Speed">{speeds}</select>'
         '<span class="meta" data-status aria-live="polite"></span></div>'
@@ -1680,6 +1797,7 @@ def reader_page(
     selected: dict | None = None,
     body: str | None = None,
     voice: str | None = None,
+    list_voice: str | None = None,
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
@@ -1749,6 +1867,8 @@ def reader_page(
         )
         for item in items
     ) or f'<p class="meta">{empty}</p>'
+    if items and view != "archived":
+        rows = _listen_bar(list_voice, source=f"{base}/read/listen") + rows
     if selected and body is not None:
         pane = _reader_pane(
             secret=secret,
