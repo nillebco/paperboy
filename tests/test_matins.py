@@ -2541,6 +2541,67 @@ def test_safari_gets_require_corp_and_relayed_images(client, monkeypatch):
     assert "https://cdn.example/pic.jpg" in chrome.text
 
 
+def _fake_taste(monkeypatch, topics=("eink", "azure", "football", "battery")):
+    """Embeddings from topic words, so similarity is predictable."""
+    import numpy as np
+
+    from later_ink.matins import embed, taste
+
+    def vector(text):
+        words = text.casefold().replace("-", "").split()
+        v = np.array([sum(w.startswith(t) for w in words) for t in topics], dtype=np.float32) + 0.01
+        return v / np.linalg.norm(v)
+
+    monkeypatch.setattr(embed, "embedder", lambda: object())
+    monkeypatch.setattr(embed, "vector", vector)
+    taste._cache.clear()
+
+
+def test_taste_ranks_what_is_closest_to_what_was_liked(client, monkeypatch):
+    from later_ink.matins import taste
+
+    _fake_taste(monkeypatch)
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    assert taste.taste_for(store, secret) is None  # nothing to learn from yet
+    for i, title in enumerate(["E-ink tablet review", "Kindle e-ink news", "Azure outage report"]):
+        store.record_event(secret, f"https://x.test/{i}", article_id=None, title=title, source="s", kind="opened")
+    store.record_event(secret, "https://x.test/f", article_id=None, title="Football results", source="s", kind="read")
+    store.set_signal(secret, "https://x.test/f", -1, title="Football results", source="s")
+    profile = taste.taste_for(store, secret)
+    assert profile is not None
+    assert profile.score("New e-ink phone") > profile.score("Battery chemistry")
+    assert profile.score("Battery chemistry") > profile.score("Football transfer news")
+
+    scored = client.post(
+        "/api/v1/score",
+        headers=_api(secret),
+        json={"items": [{"id": "a", "title": "e-ink reader"}, {"id": "b", "title": "football derby"}]},
+    ).json()
+    assert scored["scores"]["a"] > scored["scores"]["b"]
+
+
+def test_an_automatic_issue_prefers_what_the_reader_likes(client, monkeypatch):
+    _fake_taste(monkeypatch, topics=("first", "second"))
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    _add_feed(client, secret)
+    store.set_issue_limits(secret, max_articles=None, max_per_feed=1, max_words=None, window_hours=None)
+    preview = client.get(f"/{secret}/issues/preview").text
+    assert "First story" in preview and "Second story" not in preview  # feed order
+    for i in range(3):
+        store.record_event(secret, f"https://x.test/{i}", title=f"Second thoughts {i}", source="s", kind="opened")
+    preview = client.get(f"/{secret}/issues/preview").text
+    assert "Second story" in preview and "First story" not in preview
+
+
+def test_score_is_empty_without_a_taste(client):
+    secret = _signup_without_readwise(client)
+    scored = client.post("/api/v1/score", headers=_api(secret), json={"items": [{"id": "a", "title": "x"}]})
+    assert scored.json() == {"scores": {}, "signals": 0}
+    assert client.post("/api/v1/score", headers=_api(secret), json={"items": "nope"}).status_code == 400
+
+
 # ------------------------------------------------------------------- listening
 
 

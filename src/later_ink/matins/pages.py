@@ -175,6 +175,7 @@ details.confirm[open] { display: block; flex-basis: 100%; }
 .chip { font: inherit; font-size: .82rem; padding: .15rem .55rem; border-radius: 999px;
   border: 1px solid var(--line); background: var(--soft); color: var(--fg); cursor: pointer; }
 .chip.off { background: transparent; color: var(--muted); text-decoration: line-through; }
+.chip.off-plain { background: transparent; color: var(--muted); }
 .source-filter a[aria-current] { color: var(--fg); font-weight: 650; }
 .bulk-archive { margin: .4rem 0 .2rem; }
 .bulk-archive summary { cursor: pointer; font-size: .82rem; }
@@ -1860,6 +1861,24 @@ def _listen_bar(voice: str | None, *, source: str | None = None) -> str:
     )
 
 
+def _order_switch(secret: str, csrf: str, view: str, order: str) -> str:
+    """Newest first, or "For you": what this reader's likes and reading predict."""
+    def option(value: str, label: str) -> str:
+        on = value == order
+        return (
+            f'<form method="post" action="/{escape(secret)}/read/order">{_csrf(csrf)}'
+            f'<input type="hidden" name="order" value="{value}">'
+            f'<input type="hidden" name="view" value="{escape(view)}">'
+            f'<button type="submit" class="chip{"" if on else " off-plain"}" aria-pressed="{"true" if on else "false"}">'
+            f"{label}</button></form>"
+        )
+
+    return (
+        '<div class="source-filter"><span class="label">Order</span>'
+        f'{option("new", "Newest")}{option("foryou", "For you")}</div>'
+    )
+
+
 def reader_page(
     *,
     secret: str,
@@ -1870,6 +1889,7 @@ def reader_page(
     sources: list[str],
     source: str | None = None,
     hidden: list[str] | None = None,
+    order: str | None = None,
     issue: str | None = None,
     issue_title: str | None = None,
     selected: dict | None = None,
@@ -1994,6 +2014,7 @@ def reader_page(
 <p class="lede" style="margin-bottom:0">{lede}</p>
 <div class="tabs">{tabs}</div>
 {filter_form}
+{_order_switch(secret, csrf, view, order) if order and not issue else ""}
 <div class="reader-split">
   <div class="card reader-list">{rows}</div>
   {pane_col}

@@ -49,12 +49,22 @@ COPY scripts/vendor_tts.py scripts/vendor_tts.sha256 /vendor/
 RUN python /vendor/vendor_tts.py /tts-assets
 
 
+# The embedding model behind "For you" and taste-ranked issues (~530 MB,
+# potion-multilingual-128M), pinned by sha256 in the script itself.
+FROM python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36 AS embed
+
+COPY scripts/vendor_embed.py /vendor/
+RUN python /vendor/vendor_embed.py /embed-model
+
+
 FROM python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
 
 WORKDIR /app
 
 COPY --from=tts /tts-assets /app/tts-assets
 ENV TTS_ASSETS_DIR=/app/tts-assets
+COPY --from=embed /embed-model /app/embed-model
+ENV EMBED_MODEL_DIR=/app/embed-model
 
 # Dependencies first, from the lockfile, so this layer is cached until the pins
 # actually change — and so the image runs the exact versions CI tested rather

@@ -156,3 +156,13 @@ def get_tts_assets_dir() -> Path | None:
     raw = os.environ.get("TTS_ASSETS_DIR", "").strip()
     path = Path(raw) if raw else Path.cwd() / "tts-assets"
     return path if (path / "kokoro.web.js").is_file() else None
+
+
+def get_embed_model_dir() -> Path | None:
+    """The vendored embedding model (scripts/vendor_embed.py), or None.
+
+    Without it there is no "For you" order and issues keep their plain order."""
+    raw = os.environ.get("EMBED_MODEL_DIR", "").strip()
+    path = Path(raw) if raw else Path.cwd() / "embed-model"
+    ok = (path / "model.safetensors").is_file() and (path / "tokenizer.json").is_file()
+    return path if ok else None

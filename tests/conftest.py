@@ -24,3 +24,10 @@ _CONNECTOR_ENV = (
 def _isolate_connector_env(monkeypatch):
     for var in _CONNECTOR_ENV:
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_embedding_model(monkeypatch, tmp_path_factory):
+    # A development checkout may have the real model in ./embed-model; tests that
+    # want a taste install a small fake one instead.
+    monkeypatch.setenv("EMBED_MODEL_DIR", str(tmp_path_factory.getbasetemp() / "no-embed-model"))

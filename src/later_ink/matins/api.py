@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ..connectors.base import ArticleUnavailable, UpstreamError
-from . import config, extract, routes, rss
+from . import config, extract, routes, rss, taste
 from .issues import limits_for, local_day
 
 logger = logging.getLogger(__name__)
@@ -169,6 +169,37 @@ async def list_candidates(request: Request, limit: int = 100):
     }
 
 
+# --------------------------------------------------------------------- score
+
+
+_MAX_SCORE_ITEMS = 500
+
+
+@router.post("/score")
+async def score_items(request: Request):
+    """How close each item is to what this catalogue's reader liked and read.
+
+    For an external curator ranking articles Matins has not seen. `scores` is
+    empty when there is no taste yet (too few signals, or no model): rank as if
+    this endpoint did not exist."""
+    secret = _secret(request)
+    items = (await _json(request)).get("items")
+    if not isinstance(items, list) or len(items) > _MAX_SCORE_ITEMS:
+        raise HTTPException(400, f"Expected items: a list of at most {_MAX_SCORE_ITEMS}")
+    profile = taste.taste_for(_store(request), secret)
+    if profile is None:
+        return {"scores": {}, "signals": 0}
+    scores = {}
+    for item in items:
+        if not isinstance(item, dict) or not item.get("id") or not item.get("title"):
+            continue
+        text = taste.article_text(str(item["title"])[:1000], str(item.get("summary") or "")[:400])
+        value = profile.score(text)
+        if value is not None:
+            scores[str(item["id"])[:200]] = round(value, 4)
+    return {"scores": scores, "signals": profile.signals}
+
+
 # ------------------------------------------------------------------- signals
 
 
@@ -181,43 +212,7 @@ async def list_signals(request: Request, limit: int = 500):
     `weight` is what a curator should aggregate; `rating` stays for clients that
     only know up/down.
     """
-    secret = _secret(request)
-    store = _store(request)
-    rows: dict[str, dict] = {}
-    for signal in store.list_signals(secret, limit=2000):
-        positive = signal.rating > 0
-        rows[signal.url] = {
-            "url": signal.url,
-            "title": signal.title,
-            "source": signal.source,
-            "rating": "interesting" if positive else "not_interested",
-            "weight": 1.0 if positive else -1.0,
-            "kind": "like" if positive else "dislike",
-            "updated_at": int(signal.updated_at),
-        }
-
-    best: dict[str, tuple[float, object]] = {}
-    for event in store.list_events(secret, limit=3000):
-        weight = {"read": 0.35, "opened": 0.7}.get(event.kind, 0.0)
-        if weight <= 0:
-            continue
-        current = best.get(event.url)
-        if current is None or weight > current[0]:
-            best[event.url] = (weight, event)
-    for url, (weight, event) in best.items():
-        if url in rows:
-            continue
-        rows[url] = {
-            "url": url,
-            "title": getattr(event, "title", ""),
-            "source": getattr(event, "source", ""),
-            "rating": "interesting",
-            "weight": weight,
-            "kind": getattr(event, "kind", "read"),
-            "updated_at": int(getattr(event, "created_at", 0)),
-        }
-
-    ordered = sorted(rows.values(), key=lambda row: row["updated_at"], reverse=True)
+    ordered = taste.weighted_signals(_store(request), _secret(request))
     return {"signals": ordered[: max(1, min(limit, 2000))]}
 
 

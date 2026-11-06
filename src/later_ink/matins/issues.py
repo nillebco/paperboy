@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 from .. import config as app_config
 from ..connectors.base import ArticleUnavailable, UpstreamError
 from ..epub import BuildResult
-from . import config, notify, webhooks
+from . import config, notify, taste, webhooks
 from .db import Issue, MatinsStore
 from .issue_epub import IssueItem, build_issue
 
@@ -358,6 +358,11 @@ class IssueService:
                 budget -= cost
 
         feeds = None if only == "queue" else reader.sources.get("rss")
+        # With a taste (enough likes and reads, and the embedding model), the
+        # feeds' fresh articles compete on how close they are to it, across
+        # feeds; without one, each feed gives its newest, in feed order.
+        profile = taste.taste_for(self.store, secret) if feeds is not None else None
+        pool: list[tuple[float, Candidate, int]] = []
         if feeds is not None:
             try:
                 folders = await feeds.list_folders()
@@ -398,6 +403,15 @@ class IssueService:
                     and a.url not in archived
                     and _fresh(a, now, limits.window_hours)
                 ]
+                if profile is not None:
+                    scored = sorted(
+                        ((profile.score(a.title or "") or -1.0, a) for a in fresh),
+                        key=lambda pair: -pair[0],
+                    )
+                    for score, article in scored[: limits.max_per_feed]:
+                        cost = article.word_count or DEFAULT_ITEM_WORDS
+                        pool.append((score, Candidate("rss", article, section), cost))
+                    continue
                 per_feed = 0
                 for article in fresh:
                     if per_feed >= limits.max_per_feed:
@@ -410,6 +424,14 @@ class IssueService:
                     selected.append(Candidate("rss", article, section))
                     budget -= cost
                     per_feed += 1
+
+        for _score, candidate, cost in sorted(pool, key=lambda entry: -entry[0]):
+            if len(selected) >= max_articles:
+                break
+            if budget - cost < 0:
+                continue
+            selected.append(candidate)
+            budget -= cost
 
         return selected
 

@@ -31,7 +31,7 @@ from .. import config as app_config
 from .. import opds
 from ..connectors.base import Article, ArticleUnavailable, UpstreamError
 from ..fetch import fetch_bytes
-from . import catalogues, config, extract, notify, pages, rss, voices, webhooks
+from . import catalogues, config, extract, notify, pages, rss, taste, voices, webhooks
 from .issues import (
     IssueLimits,
     IssueService,
@@ -709,6 +709,14 @@ async def reader_index(
     else:
         shown = _filter_reader(visible, view)
 
+    # "For you": closest to what this reader liked and read first. Only once
+    # there is a taste to rank by; until then the switch is not offered.
+    profile = taste.taste_for(store, secret) if view != "archived" else None
+    order = (delivery.reader_order if delivery else None) or "new"
+    if profile is not None and order == "foryou":
+        scores = {item["id"]: profile.score(item["title"]) for item in shown}
+        shown = sorted(shown, key=lambda item: -(scores.get(item["id"]) or -1.0))
+
     selected = (
         next((item for item in visible if item["id"] == article), None)
         if view != "archived"
@@ -757,6 +765,7 @@ async def reader_index(
             sources=sources,
             source=source,
             hidden=sorted(hidden),
+            order=order if profile is not None else None,
             issue=issue,
             issue_title=issue_obj.title if issue_obj else None,
             selected=selected,
@@ -1239,6 +1248,22 @@ def _hidden_sources(delivery) -> set[str]:
     except ValueError:
         return set()
     return {name for name in names if isinstance(name, str)}
+
+
+@router.post("/{secret}/read/order")
+async def reader_order(
+    secret: str,
+    request: Request,
+    csrf: str = Form(""),
+    order: str = Form("new"),
+    view: str = Form("all"),
+):
+    """Newest first, or closest to this reader's taste first. Kept per catalogue."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    _ensure_delivery(request, secret)
+    _store(request).set_reader_order(secret, "foryou" if order == "foryou" else None)
+    return RedirectResponse(_read_href(secret, view), status_code=303)
 
 
 @router.post("/{secret}/read/sources")

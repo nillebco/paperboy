@@ -23,3 +23,6 @@ fnox.toml
 
 # Text-to-speech files fetched by scripts/vendor_tts.py (~420 MB)
 /tts-assets/
+
+# Embedding model fetched by scripts/vendor_embed.py (~530 MB)
+/embed-model/
