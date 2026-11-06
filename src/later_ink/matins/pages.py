@@ -747,11 +747,6 @@ def feed_page(
 </div>
 {status}
 
-<h2>Recent articles</h2>
-<p class="meta">An issue takes items from the last {_plural(window_hours, "hour")},
-at most {max_per_feed} per feed.</p>
-{listing}
-
 <h2>Manage</h2>
 <div class="card">
   <label for="title" style="margin-top:0">Name in your issues</label>
@@ -770,7 +765,15 @@ at most {max_per_feed} per feed.</p>
   </div>
 </div>
 
-<h2>Subscriber access</h2>
+<details id="recent">
+<summary><h2 style="display:inline">Recent articles</h2> <span class="meta">({len(items)})</span></summary>
+<p class="meta">An issue takes items from the last {_plural(window_hours, "hour")},
+at most {max_per_feed} per feed.</p>
+{listing}
+</details>
+
+<details id="access"{" open" if feed["auth_cookie_set"] else ""}>
+<summary><h2 style="display:inline">Subscriber access</h2></summary>
 <div class="card">
   <p class="hint">For paywalled publishers: paste the <code>Cookie</code> request header from a
   logged-in browser tab. It is stored encrypted and never shown again; it is used only
@@ -786,6 +789,7 @@ at most {max_per_feed} per feed.</p>
     {_button(f"{action}/auth", csrf, "Remove", style="tiny", fields={"cookie": "-"}) if feed["auth_cookie_set"] else ""}
   </div>
 </div>
+</details>
 """
     return _shell(secret, "feeds", feed["title"], body, notice=notice, error=error)
 
