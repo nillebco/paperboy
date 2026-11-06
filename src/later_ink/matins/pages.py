@@ -1644,7 +1644,7 @@ function onMessage(ev){
     watch=setTimeout(function(){if(bar&&!heard)
       say('The voice loaded but is too slow on this device to start.');},40000);
     return;}
-  if(m.type==='error'){var b=bar;stop();bar=b;
+  if(m.type==='error'){var b=bar;stop();bar=b;report((m.text||'')+' '+(m.detail||''));
     // Kokoro could not start on this device: offer its own voices instead. The
     // next tap starts them (speech, like audio, has to begin inside a tap).
     if(!heard&&!SYSTEM&&'speechSynthesis' in window){SYSTEM=true;
@@ -1660,11 +1660,22 @@ function onMessage(ev){
   if(m.type!=='audio')return;
   pending--;heard=true;clearTimeout(watch);say('');
   try{play(m);}catch(e){say('Could not play the audio ('+e.message+').');}}
+// A failure on someone's phone is invisible from here: send it to the server
+// log (message, file:line and browser only), once per page.
+var reported=false;
+function report(detail){
+  if(reported||!detail)return;reported=true;
+  try{fetch(location.pathname.replace(/\\/read.*$/,'/read/listen-error'),{method:'POST',
+    credentials:'same-origin',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({detail:String(detail).slice(0,800),ua:navigator.userAgent.slice(0,300),
+      isolated:!!window.crossOriginIsolated})});}catch(e){}}
 function ensureWorker(b){
   if(worker)return;
   worker=new Worker(b.dataset.worker,{type:'module'});
   worker.onmessage=onMessage;
   worker.onerror=function(e){var x=bar;stop();bar=x;
+    var where=e&&e.filename?' @ '+e.filename.split('/').pop()+':'+e.lineno+':'+e.colno:'';
+    e={message:((e&&e.message)||'worker error')+where};report('worker.onerror '+e.message);
     if(!SYSTEM&&'speechSynthesis' in window){SYSTEM=true;
       say('This device could not start the voice'+(e&&e.message?' ('+e.message+')':'')+
         '. Tap \u25b6 again to listen with its own voice.');}

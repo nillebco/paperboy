@@ -1063,6 +1063,28 @@ def _needs_require_corp(request: Request) -> bool:
     return "Safari/" in ua and not re.search(r"Chrome/|Chromium/|Edg/|Firefox/|OPR/", ua)
 
 
+@router.post("/{secret}/read/listen-error")
+async def reader_listen_error(secret: str, request: Request):
+    """A Listen failure in the reader's browser, written to the server log.
+
+    Phones fail in ways no desktop reproduces, and their consoles are out of
+    reach. Logged only: no state changes, a few hundred characters at most."""
+    _resolve(secret, request)
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    logger.warning(
+        "listen failed in a browser: %s | isolated=%s | %s",
+        str(body.get("detail", ""))[:800].replace("\n", " "),
+        bool(body.get("isolated")),
+        str(body.get("ua", ""))[:300],
+    )
+    return Response(status_code=204)
+
+
 @router.get("/{secret}/read/listen")
 async def reader_listen(secret: str, request: Request, article: str):
     """One article as text blocks, title first, for "Listen to all".

@@ -64,6 +64,24 @@ let run = 0;
 let voice = "af_heart";
 let work = Promise.resolve();
 
+// kokoro-js unpacks its English dictionary with `for await (… of stream)`;
+// Safari before 26 cannot iterate a ReadableStream ("undefined is not a
+// function"). Read it chunk by chunk instead.
+if (typeof ReadableStream !== "undefined" && !ReadableStream.prototype[Symbol.asyncIterator]) {
+  ReadableStream.prototype[Symbol.asyncIterator] = async function* () {
+    const reader = this.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        yield value;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  };
+}
+
 // Enough to locate the failure: the message, then where it happened.
 function describe(error) {
   const message = String((error && error.message) || error || "");
