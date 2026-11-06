@@ -360,10 +360,57 @@ _COPY_JS = (
     "});}());"
 )
 
+# Matins settings: the voices this device offers, one choice per language, kept
+# in this browser (each phone has its own). The Reader's player reads the same
+# keys. Apple's robotic and novelty voices are left out, as the player does.
+_DEVICE_VOICES_JS = """(function(){
+var box=document.querySelector('[data-device-voices]');
+if(!box||!('speechSynthesis' in window))return;
+// Only where the Reader uses them: an iPhone or iPad (or an explicit override).
+var forced='';try{forced=localStorage.getItem('matins-listen-engine')||'';}catch(e){}
+var apple=/iPhone|iPad|iPod/.test(navigator.userAgent)||
+  (/Macintosh/.test(navigator.userAgent)&&navigator.maxTouchPoints>1);
+if(forced?forced!=='system':!apple)return;
+var NAMES={en:'English',fr:'French',it:'Italian',es:'Spanish',pt:'Portuguese'},
+    SAMPLE={en:'Good morning. Here is today\\u2019s paper.',fr:'Bonjour. Voici le journal du jour.',
+      it:'Buongiorno. Ecco il giornale di oggi.',es:'Buenos d\\u00edas. Aqu\\u00ed est\\u00e1 el peri\\u00f3dico de hoy.',
+      pt:'Bom dia. Aqui est\\u00e1 o jornal de hoje.'},
+    ODD=/^(Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Deranged|Eddy|Flo|Fred|Good News|Grandma|Grandpa|Hysterical|Jester|Junior|Kathy|Organ|Pipe Organ|Princess|Ralph|Reed|Rocko|Sandy|Shelley|Superstar|Trinoids|Whisper|Wobble|Zarvox)\\b/,
+    list=box.querySelector('[data-voice-list]'),built=0;
+function key(code){return 'matins-device-voice:'+code;}
+function get(code){try{return localStorage.getItem(key(code))||'';}catch(e){return '';}}
+function set(code,name){try{if(name)localStorage.setItem(key(code),name);
+  else localStorage.removeItem(key(code));}catch(e){}}
+function build(){
+  var voices=speechSynthesis.getVoices().filter(function(v){return !ODD.test(v.name);});
+  if(!voices.length||voices.length===built)return;
+  built=voices.length;list.textContent='';box.hidden=false;
+  Object.keys(NAMES).forEach(function(code){
+    var mine=voices.filter(function(v){return v.lang.slice(0,2).toLowerCase()===code;})
+      .sort(function(a,b){return a.lang.localeCompare(b.lang)||a.name.localeCompare(b.name);});
+    if(!mine.length)return;
+    var label=document.createElement('label'),row=document.createElement('div'),
+        sel=document.createElement('select'),test=document.createElement('button'),saved=get(code);
+    label.textContent=NAMES[code];label.htmlFor=sel.id='device-voice-'+code;
+    row.className='inline-form';
+    var auto=document.createElement('option');auto.value='';auto.textContent='Automatic';sel.appendChild(auto);
+    mine.forEach(function(v){var o=document.createElement('option');o.value=v.name;
+      o.textContent=v.name+' ('+v.lang.replace('_','-')+')';o.selected=v.name===saved;sel.appendChild(o);});
+    sel.addEventListener('change',function(){set(code,sel.value);});
+    test.type='button';test.className='btn';test.textContent='\\u25b6 Test';
+    test.addEventListener('click',function(){
+      speechSynthesis.cancel();
+      var u=new SpeechSynthesisUtterance(SAMPLE[code]),v=mine.filter(function(x){return x.name===sel.value;})[0];
+      if(v){u.voice=v;u.lang=v.lang;}else u.lang=code;
+      speechSynthesis.speak(u);});
+    row.appendChild(sel);row.appendChild(test);list.appendChild(label);list.appendChild(row);});}
+build();speechSynthesis.addEventListener('voiceschanged',build);
+}());"""
+
 _INLINE_SCRIPTS = (_THEME_HEAD_JS, _THEME_TOGGLE_JS, _CLOCK_JS)
 # Every script any page may emit, including the ones only the Matins pages put
 # on a page themselves (the copy-address button). The CSP hashes all of them.
-_CSP_SCRIPTS = (*_INLINE_SCRIPTS, _COPY_JS)
+_CSP_SCRIPTS = (*_INLINE_SCRIPTS, _COPY_JS, _DEVICE_VOICES_JS)
 
 _THEME_HEAD_SCRIPT = f"<script>{_THEME_HEAD_JS}</script>"
 _THEME_TOGGLE_SCRIPT = f"<script>{_THEME_TOGGLE_JS}</script>"

@@ -16,6 +16,7 @@ from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, available_timezones
 
 from ..pages import _COPY_JS as COPY_JS
+from ..pages import _DEVICE_VOICES_JS as DEVICE_VOICES_JS
 
 REPO_URL = "https://github.com/nillebco/paperboy"
 
@@ -1115,7 +1116,15 @@ def _listening_card(voice: str) -> str:
     runs in your browser: the first time it downloads about 90 MB (330 MB on a computer
     with a graphics card), then nothing leaves your device. A feed can have its own
     voice, for a feed in another language.</p>
+    <div class="device-voices" data-device-voices hidden>
+      <h3>This device's voices</h3>
+      <p class="hint">On an iPhone or iPad, Matins reads with the device's own voices
+      instead: pick one per language. The choice stays on this device. Better voices can
+      be downloaded in the device's Settings → Accessibility → Spoken Content → Voices.</p>
+      <div data-voice-list></div>
+    </div>
   </div>
+<script>{DEVICE_VOICES_JS}</script>
 """
 
 
@@ -1402,9 +1411,7 @@ function say(t){if(bar)bar.querySelector('[data-status]').textContent=t;}
 function label(b,state){
   b.querySelector('[data-listen]').textContent=state==='playing'?'❚❚ Pause':
     state==='paused'?'▶ Resume':(b===all?'▶ Listen to all':'▶ Listen');
-  b.querySelector('[data-stop]').hidden=state==='idle';
-  // The phone's voices only matter once something is playing.
-  var picker=b.querySelector('[data-device-voice]');if(picker)picker.hidden=state==='idle';}
+  b.querySelector('[data-stop]').hidden=state==='idle';}
 // The title first, as Listen to all reads it, then the article's paragraphs.
 function leaves(){
   var root=document.querySelector('.reader-pane .article'),title=document.querySelector('.reader-pane > h1'),
@@ -1449,32 +1456,13 @@ function systemVoice(lang){
   if(lang in picked)return picked[lang];
   if(!speechSynthesis.getVoices().length)return null;
   var mine=candidates(lang),wanted='';
-  try{wanted=localStorage.getItem('matins-device-voice:'+lang)||'';}catch(e){}
+  // Chosen in Settings, one per language.
+  try{wanted=localStorage.getItem('matins-device-voice:'+lang.slice(0,2))||'';}catch(e){}
   picked[lang]=mine.filter(function(v){return v.name===wanted;})[0]||mine.filter(function(v){return /premium/i.test(v.name);})[0]||
     mine.filter(function(v){return /enhanced/i.test(v.name);})[0]||
     mine.filter(function(v){return v.default;})[0]||
     mine.filter(function(v){return v.localService;})[0]||mine[0]||null;
   return picked[lang];}
-// The phone's voices for the bar's language, chosen in the bar itself: a page
-// cannot list them anywhere else. The choice is kept per language.
-function devicePicker(b,voice){
-  var lang=LANG[(voice||b.dataset.voice||'a')[0]]||'en-US',mine=candidates(lang),
-      old=b.querySelector('[data-device-voice]');
-  if(old&&old.dataset.lang===lang)return;
-  if(old)old.remove();
-  if(mine.length<2)return;
-  var select=document.createElement('select'),current=systemVoice(lang);
-  select.className='tiny';select.dataset.deviceVoice='';select.setAttribute('aria-label','Voice');
-  mine.forEach(function(v){var o=document.createElement('option');o.value=v.name;
-    o.textContent=v.lang.replace('_','-')===lang?v.name:v.name+' ('+v.lang.replace('_','-')+')';
-    if(current&&v.name===current.name)o.selected=true;select.appendChild(o);});
-  select.addEventListener('change',function(){
-    try{localStorage.setItem('matins-device-voice:'+lang,select.value);}catch(e){}
-    delete picked[lang];
-    document.querySelectorAll('[data-device-voice]').forEach(function(o){
-      if(o!==select&&o.dataset.lang===lang)o.value=select.value;});});
-  select.dataset.lang=lang;
-  b.insertBefore(select,b.querySelector('[data-status]'));}
 // The list arrives after the page loads (empty at first on iOS): wait for it,
 // at most two seconds, rather than speak the first sentences in a stray voice.
 function voicesReady(then){
@@ -1484,7 +1472,7 @@ function voicesReady(then){
 function talk(lines,voice,offset){
   var mine=session;ended=false;
   voicesReady(function(){if(mine!==session)return;
-    if(bar)devicePicker(bar,voice);say_(lines,voice,offset,mine);});}
+    say_(lines,voice,offset,mine);});}
 function say_(lines,voice,offset,mine){
   var lang=LANG[(voice||'a')[0]]||'en-US',chosen=systemVoice(lang),i=0;
   function next(){
