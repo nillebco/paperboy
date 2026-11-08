@@ -2037,6 +2037,10 @@ def _prose(words: int = 300) -> str:
 
 def _serve_pages(monkeypatch, pages=None):
     async def fake(url):
+        # No archive copy unless the test puts one in `pages`: otherwise every
+        # failed fetch would "succeed" through the Wayback fallback.
+        if url.startswith("https://web.archive.org/"):
+            return (pages or {}).get(url)
         return (pages or {}).get(url, _prose())
 
     monkeypatch.setattr("later_ink.matins.queue._fetch_page", fake)
@@ -2104,14 +2108,21 @@ def test_a_blocked_queue_item_prints_the_lede_not_the_wall(client, monkeypatch):
     _serve_pages(monkeypatch, {"https://lemonde.example/a": wall, "https://lemonde.example/b": wall})
     secret = _signup_without_readwise(client)
     store = client.app.state.matins
-    store.save_url(secret, "https://lemonde.example/a", "A", lede="The real lede.")
+    # A lede worth printing: a real sentence, not the "Comments" Hacker News
+    # ships as its description.
+    store.save_url(
+        secret,
+        "https://lemonde.example/a",
+        "A",
+        lede="The real lede, the one the publisher put above the link on its own page.",
+    )
     store.save_url(secret, "https://lemonde.example/b", "B")
     reader = asyncio.run(main._tenant_connector(secret))
     queue = reader.sources["later"]
     items = {i.title: i for i in store.list_saved(secret)}
 
     _, html = asyncio.run(queue.get_article_html(str(items["A"].id)))
-    assert "The real lede." in html and "required part" not in html
+    assert "The real lede" in html and "required part" not in html
 
     from later_ink.connectors.base import ArticleUnavailable
 
@@ -2124,6 +2135,126 @@ def test_a_long_article_quoting_a_block_phrase_is_not_a_wall():
 
     assert not looks_blocked("<p>" + "word " * 500 + "access denied</p>")
     assert looks_blocked("<p>Access denied</p>")
+
+
+def test_is_stub_tells_a_pointer_from_a_short_article():
+    from later_ink.matins.extract import is_stub
+
+    # Hacker News' description of every story is one link labelled "Comments".
+    assert is_stub('<p><a href="https://news.ycombinator.com/item?id=1">Comments</a></p>')
+    # A teaser that only says where the article is.
+    assert is_stub('<p><a href="https://lemonde.fr/a">Read the full article on Le Monde</a></p>')
+    assert is_stub("")
+    assert is_stub("   ")
+    # Short is not the same as empty: a brief prints.
+    assert not is_stub("<p>Two people died in a crash on the M20 this morning near Kent.</p>")
+    # An image with no words is still a post.
+    assert not is_stub('<figure><img src="/comic.jpg" alt="a comic"/></figure>')
+    assert not is_stub(ARTICLE_HTML)
+
+
+def test_a_queued_link_whose_lede_is_a_comments_label_is_not_printed(client, monkeypatch):
+    """The 8 November issue printed a page whose whole body was "Comments"."""
+    _serve_pages(monkeypatch, {"https://science.example/brain": None})
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.ensure_delivery(secret, schedule="07:00", timezone="UTC", email=None)
+    store.save_url(secret, "https://x.example/good", "A real one")
+    store.save_url(secret, "https://science.example/brain", "Brain data", lede="Comments")
+
+    payload = client.post("/api/v1/issues?only=queue", headers=_api(secret)).json()
+
+    assert payload["articles"] == 1
+    assert [row["title"] for row in payload["skipped"]] == ["Brain data"]
+    assert "no text to print" in payload["skipped"][0]["reason"]
+    # Dropped for good: out of the queue, and out of the curator's shortlist.
+    assert [item.title for item in store.list_saved(secret)] == []
+    assert store.archived_urls(secret, ["https://science.example/brain"]) == {
+        "https://science.example/brain"
+    }
+
+
+def test_a_curator_recap_prints_on_its_own_when_there_is_no_body(client, monkeypatch):
+    _serve_pages(monkeypatch, {"https://science.example/brain": None})
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.save_url(secret, "https://science.example/brain", "Brain data", lede="Comments")
+    item = store.list_saved(secret)[0]
+    assert client.put(
+        f"/api/v1/items/{item.id}/recap",
+        json={"recap": "Headset makers sell brain data to AI trainers."},
+        headers=_api(secret),
+    ).status_code == 204
+
+    reader = asyncio.run(main._tenant_connector(secret))
+    _article, html = asyncio.run(reader.sources["later"].get_article_html(str(item.id)))
+
+    assert "Headset makers sell brain data to AI trainers." in html
+    assert "Recap" in html
+    # No body under the recap, so no rule pointing at nothing.
+    assert "<hr/>" not in html
+
+
+def test_the_archive_copy_stands_in_when_the_publisher_refuses(client, monkeypatch):
+    url = "https://science.example/brain"
+    _serve_pages(
+        monkeypatch,
+        {
+            # What a datacenter IP gets from Cloudflare: a challenge, not a page.
+            url: "<html><body><h1>Just a moment...</h1></body></html>",
+            f"https://web.archive.org/web/2id_/{url}": _prose(),
+        },
+    )
+    secret = _signup_without_readwise(client)
+    store = client.app.state.matins
+    store.save_url(secret, url, "Brain data")
+    reader = asyncio.run(main._tenant_connector(secret))
+    item = store.list_saved(secret)[0]
+
+    _article, html = asyncio.run(reader.sources["later"].get_article_html(str(item.id)))
+
+    assert "enough text to count as a paragraph" in html
+    assert "Just a moment" not in html
+
+
+def test_a_feed_item_that_is_only_a_link_to_itself_is_not_printed(client, monkeypatch):
+    xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Hacker News</title>
+  <item>
+    <title>Consumer brain wave headsets threaten privacy</title>
+    <link>https://science.example/brain</link>
+    <guid>https://science.example/brain</guid>
+    <pubDate>Fri, 30 Oct 2026 06:00:00 GMT</pubDate>
+    <description>&lt;a href="https://news.ycombinator.com/item?id=1"&gt;Comments&lt;/a&gt;</description>
+  </item>
+</channel></rss>
+"""
+
+    async def feed(_url, *, timeout, max_bytes):
+        return xml
+
+    monkeypatch.setattr("later_ink.matins.rss.fetch_feed", feed)
+    secret = _signup_without_readwise(client)
+    _add_feed(client, secret)
+    store = client.app.state.matins
+    store.ensure_delivery(secret, schedule="07:00", timezone="UTC", email=None)
+
+    async def unreachable(_self, _url, *, cookie=None):
+        return None
+
+    monkeypatch.setattr("later_ink.matins.rss.RssConnector._fetch_page", unreachable)
+
+    payload = client.post("/api/v1/issues", headers=_api(secret)).json()
+
+    # Nothing to print, so no issue at all — and the story is not offered again.
+    assert payload["issue"] is None
+    assert [row["title"] for row in payload["skipped"]] == [
+        "Consumer brain wave headsets threaten privacy"
+    ]
+    assert "no text to print" in payload["skipped"][0]["reason"]
+    assert "https://science.example/brain" in store.archived_urls(
+        secret, ["https://science.example/brain"]
+    )
 
 
 def test_a_forum_page_prints_the_post_and_the_first_replies_only():
@@ -2813,3 +2944,4 @@ def test_a_story_reaching_the_front_page_is_dated_when_it_arrived(tmp_path, monk
     just = datetime.now(UTC).replace(microsecond=0, tzinfo=None) - timedelta(minutes=5)
     served["xml"] = _hn_xml(("fresh", just.strftime("%a, %d %b %Y %H:%M:%S +0000")))
     assert items()["fresh"] == just
+

@@ -7,6 +7,7 @@ its own: a table of links, filled from the settings page, a share shortcut, or
 builder exactly like a feed does.
 """
 
+import math
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -87,17 +88,25 @@ class QueueConnector(Connector):
             # Supplied by the caller (API/agent): trust it as text, but it still
             # goes through the same sanitising EPUB path as fetched HTML.
             return _article(item), _with_recap(item.recap, item.content)
-        page = await _fetch_page(item.url)
-        # A wall (paywall, consent shell, JS challenge) is not an article.
-        blocked = page is not None and extract.looks_blocked(page)
-        content = extract.html_to_content(page, item.url) if page and not blocked else None
+        content = await _article_text(item.url)
         if not content:
+            # Feeds carry a lede for most links; Hacker News carries "Comments".
             lede = item.lede or await self.lede_for(item.url)
-            if not lede:
-                raise ArticleUnavailable(
-                    "Could not extract that page; open it at the source", 422
-                )
-            content = f"<p>{escape(extract.visible_text(lede))}</p>"
+            if lede and not extract.is_stub(lede):
+                content = f"<p>{escape(extract.visible_text(lede))}</p>"
+            elif item.recap:
+                # The page is a link and its lede is a label: a recap the curator
+                # wrote is still the article's point, and prints on its own.
+                return _article(item), _with_recap(item.recap, "")
+            elif lede:
+                # Thin, but it is all there is: the reader may show it, and the
+                # issue builder refuses it rather than printing a page with no
+                # article on it.
+                content = f"<p>{escape(extract.visible_text(lede))}</p>"
+        if not content:
+            raise ArticleUnavailable(
+                "Could not extract that page; open it at the source", 422
+            )
         return _article(item), _with_recap(item.recap, content)
 
 
@@ -107,7 +116,8 @@ def _with_recap(recap: str | None, html: str) -> str:
     paragraphs = "".join(
         f"<p>{escape(line.strip())}</p>" for line in recap.splitlines() if line.strip()
     )
-    return f"<blockquote><p><strong>Recap</strong></p>{paragraphs}</blockquote><hr/>{html}"
+    block = f"<blockquote><p><strong>Recap</strong></p>{paragraphs}</blockquote>"
+    return f"{block}<hr/>{html}" if html else block
 
 
 def _article(item: SavedItem) -> Article:
@@ -168,24 +178,41 @@ async def linked_content(html: str) -> str | None:
     if hit and now - hit[0] < (_LINKED_TTL if hit[1] else 600):
         return hit[1]
     teaser = extract.word_count(html)
-    content = None
-    # Some publishers refuse servers outright (openai.com answers 403 behind
-    # Cloudflare). The Wayback Machine's raw copy (id_: no toolbar, original
-    # markup) is then the article as published.
-    for url in (link, f"{_WAYBACK}{link}"):
-        page = await _fetch_page(url)
-        if page and not extract.looks_blocked(page):
-            content = extract.html_to_content(page, link)
-            # Only an article clearly longer than the teaser replaces it: an
-            # extraction that found a cookie notice must not.
-            if content and extract.word_count(content) < 1.5 * teaser:
-                content = None
-            if content:
-                break
+    # Only an article clearly longer than the teaser replaces it: an extraction
+    # that found a cookie notice must not.
+    content = await _article_text(link, min_words=math.ceil(1.5 * teaser))
     if len(_linked) >= _LINKED_MAX:
         _linked.pop(next(iter(_linked)))
     _linked[link] = (now, content)
     return content
+
+
+async def _article_text(url: str, *, min_words: int = 0) -> str | None:
+    """The article at `url`, from the publisher or, failing that, the archive.
+
+    Some publishers refuse servers outright (science.org answers a datacenter IP
+    with a Cloudflare challenge, openai.com with a 403). The Wayback Machine's
+    raw copy (id_: no toolbar, original markup) is then the article as
+    published — when a crawler got through where we could not."""
+    for target in (url, f"{_WAYBACK}{url}"):
+        content = await _fetch_rendered(target, base=url, min_words=min_words)
+        if content:
+            return content
+    return None
+
+
+async def _fetch_rendered(url: str, *, base: str | None = None, min_words: int = 0) -> str | None:
+    """One page as an article body, or None when it is a wall, a stub, or short.
+
+    `base` resolves relative links against the original URL when the page came
+    from the archive."""
+    page = await _fetch_page(url)
+    if not page or extract.looks_blocked(page):
+        return None
+    content = extract.html_to_content(page, base or url)
+    if not content or extract.is_stub(content):
+        return None
+    return content if extract.word_count(content) >= min_words else None
 
 
 async def _fetch_page(url: str) -> str | None:

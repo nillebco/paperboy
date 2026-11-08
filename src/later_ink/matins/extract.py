@@ -70,6 +70,13 @@ _MAX_DISCUSSION_BODY_WORDS = 300
 # the wider heuristic found, trust the heuristic.
 _MIN_READABLE_SHARE = 0.2
 
+# Below this many words of its own, a fragment has no article in it. Hacker
+# News' feed description of every story is a single "Comments" link, and a page
+# that answers with a "Read more" card has nothing but its label: printing
+# either gives the reader a page with a title and a link on it, which is what
+# the 8 November issue did.
+_MIN_PROSE_WORDS = 10
+
 _WS = re.compile(r"[ \t\r\f\v]+")
 _BLANK_LINES = re.compile(r"\n{3,}")
 
@@ -190,6 +197,44 @@ def visible_text(html: str) -> str:
 
 def word_count(html: str) -> int:
     return len(visible_text(html).split())
+
+
+def prose_words(html: str) -> int:
+    """Words that are text, not the labels of links.
+
+    "Comments" and "Read the full article on Le Monde" are one and five words,
+    and all of them are anchor text: the page is navigation, not writing."""
+    try:
+        doc = document_fromstring(html)
+    except (ValueError, TypeError):
+        return 0
+    link_words = sum(
+        len(" ".join(anchor.text_content().split()).split())
+        for anchor in doc.iter("a")
+        # Nested anchors are rare; counting them once keeps the total honest.
+        if not any(isinstance(parent.tag, str) and parent.tag == "a" for parent in anchor.iterancestors())
+    )
+    return max(0, len(visible_text(html).split()) - link_words)
+
+
+def is_stub(html: str) -> bool:
+    """True when a fragment is a pointer to an article rather than the article.
+
+    A stub is short and made of link labels. A one-line news brief, a poem or a
+    caption is short too, but its words are text and it still prints; an
+    image-only post has no words at all and is still a post. Callers use this to
+    refuse a page that would print nothing, and to fall back to the feed's lede
+    or the linked article instead."""
+    if not html or not html.strip():
+        return True
+    try:
+        doc = document_fromstring(html)
+    except (ValueError, TypeError):
+        return True
+    if any(True for _ in doc.iter("img")):
+        return False
+    return prose_words(html) < _MIN_PROSE_WORDS
+
 
 
 def html_to_content(raw: str, base_url: str) -> str | None:

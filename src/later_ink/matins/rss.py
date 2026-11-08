@@ -431,6 +431,9 @@ class RssConnector(Connector):
             teaser = extract.word_count(item.content_html) if item.content_html else 0
             if extracted and (not more or extract.word_count(extracted) >= 1.5 * teaser):
                 return article, extracted
+        # The feed's own text is the fallback of last resort, even when it is only
+        # a pointer to the article ("Comments" for Hacker News): the reader shows
+        # it, and the issue builder refuses to print a page with no article on it.
         if item.content_html:
             return article, item.content_html
         raise ArticleUnavailable(

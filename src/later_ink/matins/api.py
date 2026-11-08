@@ -431,10 +431,18 @@ async def compose_issue(request: Request, force: int = 0, only: str | None = Non
     reader = await request.app.state.tenant_reader(secret)
     # Explicit here (build repeats it) so the caller learns what was dropped.
     expired = service.expire_queue(secret)
-    issue = await service.build(secret=secret, reader=reader, local_day=day, only=only)
+    skipped: list[dict] = []
+    issue = await service.build(
+        secret=secret, reader=reader, local_day=day, only=only, skipped=skipped
+    )
     if issue is None:
         return JSONResponse(
-            {"issue": None, "reason": "nothing new to compose", "expired": expired},
+            {
+                "issue": None,
+                "reason": "nothing new to compose",
+                "expired": expired,
+                "skipped": skipped,
+            },
             status_code=200,
         )
     await service.deliver(secret, issue)
@@ -445,6 +453,7 @@ async def compose_issue(request: Request, force: int = 0, only: str | None = Non
         "words": issue.word_count,
         "download": f"/{secret}/issues/{issue.id}.epub",
         "expired": expired,
+        "skipped": skipped,
     }
 
 

@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 from .. import config as app_config
 from ..connectors.base import ArticleUnavailable, UpstreamError
 from ..epub import BuildResult
-from . import config, notify, taste, webhooks
+from . import config, extract, notify, taste, webhooks
 from .db import Issue, MatinsStore
 from .issue_epub import IssueItem, build_issue
 
@@ -98,7 +98,15 @@ class IssueService:
         local_day: str,
         now: datetime | None = None,
         only: str | None = None,
+        skipped: list[dict] | None = None,
     ) -> Issue | None:
+        """Compose one issue, and say what did not print.
+
+        `skipped` is filled with the candidates that planned into the issue and
+        then did not print, with the reason: a dead link, a page that is only a
+        pointer to the article, or an issue already at its word budget. A
+        curator reports them instead of the reader wondering why a pick is
+        missing."""
         now = now or datetime.now(UTC)
         limits = limits_for(self.store.get_delivery(secret))
         self.expire_queue(secret, now)
@@ -111,11 +119,13 @@ class IssueService:
 
         items: list[IssueItem] = []
         printed: list[Candidate] = []
+        stubs: list[Candidate] = []
         saved_printed = 0
         words_left = limits.max_words
         for candidate in candidates:
             source_name, article, section = candidate.source, candidate.article, candidate.section
             if source_name == "later" and saved_printed >= limits.max_saved:
+                _note(skipped, article, "no slot left in this issue")
                 continue
             try:
                 _article, html = await reader.get_article_html(
@@ -125,6 +135,16 @@ class IssueService:
                 # One dead link does not cancel the edition. The scheduled run
                 # is the only chance the user gets today.
                 logger.info("skipping %r for %s: %s", article.title, local_day, e)
+                _note(skipped, article, str(e))
+                continue
+            # A page whose whole body is a link ("Comments" for a Hacker News
+            # story) has no article on it: printing it wastes a page of the
+            # paper. It is dropped rather than left queued, because the page is
+            # not going to have text tomorrow either.
+            if extract.is_stub(html):
+                logger.info("dropping %r for %s: only a link, no text", article.title, local_day)
+                _note(skipped, article, "only a link to the article; there is no text to print")
+                stubs.append(candidate)
                 continue
             # Feeds rarely say how long an article is, so the word budget can only
             # be honest once the text is here. What does not fit waits in the queue.
@@ -132,6 +152,7 @@ class IssueService:
             delivery = self.store.get_delivery(secret)
             if items and words > words_left:
                 logger.info("%r does not fit in %s's word budget", article.title, local_day)
+                _note(skipped, article, "does not fit in the word budget")
                 continue
             words_left -= words
             saved_printed += source_name == "later"
@@ -152,6 +173,8 @@ class IssueService:
                 )
             )
             printed.append(candidate)
+
+        self._drop_stubs(secret, reader, stubs)
 
         if not items:
             logger.info(
@@ -435,6 +458,35 @@ class IssueService:
 
         return selected
 
+    def _drop_stubs(self, secret: str, reader, stubs: list[Candidate]) -> None:
+        """Discard pages that were only a link to the article.
+
+        A queued one leaves the queue — it would otherwise be planned, skipped
+        and planned again every morning — and both kinds are archived, which is
+        also what keeps the curator from picking them again."""
+        if not stubs:
+            return
+        for candidate in stubs:
+            if candidate.source != "later":
+                continue
+            try:
+                self.store.delete_saved(secret, int(candidate.article.id))
+            except (TypeError, ValueError):
+                logger.debug("stub %r is not a queue id", candidate.article.id)
+        self.store.archive_many(
+            secret,
+            [
+                {
+                    "url": candidate.article.url,
+                    "article_id": reader.decorate_id(candidate.source, candidate.article.id),
+                    "title": candidate.article.title,
+                    "source": candidate.section,
+                    "kind": "stub",
+                }
+                for candidate in stubs
+            ],
+        )
+
     def _write(self, secret: str, issue_id: str, result: BuildResult) -> Path:
         directory = self._directory(secret)
         directory.mkdir(parents=True, exist_ok=True)
@@ -531,9 +583,20 @@ def _queued_fresh(article, now: datetime, hours: int) -> bool:
 
 
 def _words(html: str) -> int:
-    from .extract import word_count
+    return extract.word_count(html)
 
-    return word_count(html)
+
+def _note(skipped: list[dict] | None, article, reason: str) -> None:
+    """Record why one candidate did not print, when the caller asked for it."""
+    if skipped is None:
+        return
+    skipped.append(
+        {
+            "title": getattr(article, "title", "") or getattr(article, "url", ""),
+            "url": getattr(article, "url", ""),
+            "reason": reason,
+        }
+    )
 
 
 def _language(items: list[IssueItem]) -> str:
