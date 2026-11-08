@@ -187,6 +187,26 @@ cookie expires and the reader falls back to the feed's lede until a new one is
 pasted. Some publishers also challenge non-browser clients independently of the
 subscription (Le Monde's JS wall); a cookie cannot defeat that.
 
+### Pages that are only a link to the article
+
+Some feeds carry no article text at all: Hacker News ships `<a href="…">Comments</a>`
+as the description of every story, and a teaser says "Read the full article on …".
+Printing one gives the reader a page with a title and a link on it — the 8
+November issue opened with exactly that.
+
+`extract.is_stub()` decides: fewer than 10 words of text that are not link labels,
+and no image. The issue builder drops such a candidate, removes it from the queue
+and archives it (a page that has no text today will not have text tomorrow), and
+reports it in the compose response's `skipped` list with a reason, so a curator
+can say what is missing instead of leaving the reader to wonder. The reader still
+shows the feed's thin summary; only the paper refuses it, and a recap the curator
+wrote prints on its own when there is no body.
+
+The fetch-side counterpart is on the curator's side of the fence, in
+`matins-curate`: publishers that refuse the server's address (Cloudflare scores
+datacenter IPs) are read from the reader's own machine and the text is sent as
+the queued item's `content`.
+
 `GET /api/v1/signals` returns `{url, title, source, rating, weight, kind}`. An
 explicit like/dislike is `kind: like|dislike`, `weight: ±1`, and wins over
 implicit events. Otherwise opening an article in the reader is `kind: read`,
@@ -208,7 +228,7 @@ the feeds, so its own API is the honest integration point.
 ## Known limits
 
 - No full-text extraction from paywalled or JS-only pages; those fall back to
-  the feed summary.
+  the feed summary, and a summary that is only a link is not printed at all.
 - A feed that dates nothing is always considered fresh (it would otherwise never
   be printed), so a static page can reappear if its link changes.
 - Search across sources is capped, not paginated.
