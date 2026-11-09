@@ -32,6 +32,7 @@ from .. import opds
 from ..connectors.base import Article, ArticleUnavailable, UpstreamError
 from ..fetch import fetch_bytes
 from . import catalogues, config, extract, notify, pages, rss, speech, taste, voices, webhooks
+from .identity import identity_key
 from .issues import (
     IssueLimits,
     IssueService,
@@ -175,8 +176,23 @@ async def signin_request(request: Request, email: str = Form("")):
     if address is None:
         return _html(pages.signin_page(error="That does not look like an email address."))
 
+    # Per connection first: a script that rotates the spelling of one mailbox
+    # defeats a per-address budget, but not a per-IP one.
+    from ..main import _client_ip
+
+    signin_limiter = request.app.state.signin_limiter
+    if not signin_limiter.try_record(_client_ip(request)):
+        logger.warning("sign-in rate limited by address of the caller")
+        return _html(
+            pages.signin_page(
+                error="Too many codes requested from this connection; try again later."
+            ),
+            status=429,
+        )
+
+    identity = identity_key(address)
     limiter = request.app.state.otp_limiter
-    if not limiter.try_record(f"email:{address}"):
+    if not limiter.try_record(f"email:{identity}"):
         return _html(
             pages.code_page(
                 email=address,
@@ -186,16 +202,16 @@ async def signin_request(request: Request, email: str = Form("")):
         )
 
     store = _store(request)
-    if not store.otp_cooldown_ok(address, cooldown=config.get_otp_cooldown()):
+    if not store.otp_cooldown_ok(identity, cooldown=config.get_otp_cooldown()):
         return _html(
             pages.code_page(email=address, error="A code was just sent — check your inbox.")
         )
 
     code = f"{pysecrets.randbelow(1_000_000):06d}"
-    store.set_otp(address, _code_hash(request, address, code), ttl=OTP_TTL)
+    store.set_otp(identity, address, _code_hash(request, identity, code), ttl=OTP_TTL)
     if not await notify.send_code(address, code):
         # Do not leave a live challenge behind that nobody can be told about.
-        store.clear_otp(address)
+        store.clear_otp(identity)
         return _html(
             pages.signin_page(
                 error="Could not send the email. Try again in a minute, or use the token form."
@@ -214,7 +230,10 @@ async def signin_verify(
         return _html(pages.signin_page(error="That does not look like an email address."))
 
     store = _store(request)
-    state = store.otp_state(address)
+    # Keyed by the mailbox, and hashed with it: the same code works whether the
+    # reader retypes their address with the dot or the +tag they used earlier.
+    identity = identity_key(address)
+    state = store.otp_state(identity)
     if state is None or state["expires_at"] < datetime.now(UTC).timestamp():
         return _html(pages.code_page(email=address, error="That code has expired. Ask for another."))
     if state["attempts"] >= OTP_MAX_ATTEMPTS:
@@ -222,11 +241,11 @@ async def signin_verify(
             pages.code_page(email=address, error="Too many attempts. Ask for a new code."),
             status=429,
         )
-    if not hmac.compare_digest(state["code_hash"], _code_hash(request, address, code.strip())):
-        store.bump_otp_attempts(address)
+    if not hmac.compare_digest(state["code_hash"], _code_hash(request, identity, code.strip())):
+        store.bump_otp_attempts(identity)
         return _html(pages.code_page(email=address, error="That code is not right."), status=400)
 
-    store.clear_otp(address)
+    store.clear_otp(identity)
     secret = store.secret_for_email(address)
     if secret is None or request.app.state.store.get_token(secret) is None:
         secret = request.app.state.store.create_user("")
@@ -247,9 +266,11 @@ def _normalize_email(raw: str) -> str | None:
     return address
 
 
-def _code_hash(request: Request, email: str, code: str) -> str:
+def _code_hash(request: Request, identity: str, code: str) -> str:
+    """The code, bound to one mailbox: a code issued for one spelling of an
+    address verifies for any other spelling of it, and for nothing else."""
     key = request.app.state.csrf_key
-    return hmac.new(key, f"otp:{email}:{code}".encode(), "sha256").hexdigest()
+    return hmac.new(key, f"otp:{identity}:{code}".encode(), "sha256").hexdigest()
 
 
 # ------------------------------------------------------------------ sources

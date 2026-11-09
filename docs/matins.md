@@ -131,17 +131,50 @@ SQLite, same file as the users table (WAL), disjoint tables:
   not-for-me (−1), keyed by URL so a curator can consume them.
 - `issue_skips (secret, article_id, title, section, url, skipped_at)` — articles
   taken out of the next issue.
+- `emails (email, email_key, secret, linked_at)` — the address a catalogue signs
+  in with and is notified at. `email` is what the reader typed (that is where
+  mail goes); `email_key` is the mailbox behind it, unique, and the only thing
+  lookups use — see *One mailbox, one identity* below.
+- `otp (identity, address, code_hash, expires_at, attempts, sent_at)` — one live
+  sign-in challenge per mailbox. `identity` is the key, `address` is where the
+  code is sent, and `code_hash` is an HMAC of the code *and* the identity.
 
 Issue files: `ISSUES_DIR/<sha1(secret)[:16]>/<issue-id>.epub`, written to a temp
 name then renamed. The download route looks the path up in the database and
 never builds one from the request.
+
+### One mailbox, one identity
+
+An address has two lives: the spelling the reader chose (`email`, `address`,
+used for delivery) and the mailbox behind it (`email_key`, `otp.identity`, used
+for lookups and limits). Gmail ignores dots in the local part and subaddressing
+(`+tag`) is ignored wherever it is supported, so `a.b+matins@gmail.com` and
+`ab@gmail.com` are one inbox. Keyed on the spelling, a per-address limit is a
+suggestion: on 6-7 November 2026 the `otp` table collected
+`af.u.c.aj.a.xor.5.84@gmail.com` and `niy.i.ce.bit.a.g0.1@gmail.com`, which is
+what a script sends when it wants an unlimited budget from one address.
+
+So `matins/identity.py` normalises (lowercase, no `+tag`, no dots for
+gmail/googlemail) and everything a limit or lookup keys on uses that. Delivery
+does not: the code goes to the address as typed, and re-signing in with another
+spelling keeps the address already on file, because a `+tag` is a filing rule
+rather than a typo.
+
+Two limits sit on `/signin`: `OTP_PER_HOUR` per mailbox (the durable limiter)
+and `SIGNIN_PER_IP_HOUR` per connection (default 6, `0` disables). The second
+one is the bound that a rotating spelling cannot walk around.
+
+An abandoned challenge is swept a day after it expires — `purge_expired_otp()`
+runs at startup and on every new challenge — so a stranger's address does not
+outlive the dose of SMTP it cost.
 
 ## Configuration
 
 See `deploy/oci/env.example` for the annotated list. The ones that change
 behaviour meaningfully: `ISSUE_WINDOW_HOURS` (how far back a feed item may be),
 `ISSUE_MAX_ARTICLES` / `ISSUE_MAX_PER_FEED` / `ISSUE_MAX_WORDS`,
-`ISSUE_RETENTION`, `ADMIN_TOKEN`, and the SMTP group.
+`ISSUE_RETENTION`, `ADMIN_TOKEN`, `OTP_PER_HOUR` / `SIGNIN_PER_IP_HOUR`, and the
+SMTP group.
 
 ## API
 

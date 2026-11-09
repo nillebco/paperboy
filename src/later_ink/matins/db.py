@@ -21,6 +21,8 @@ from dataclasses import dataclass
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from .identity import identity_key
+
 
 @dataclass(frozen=True)
 class Feed:
@@ -182,6 +184,11 @@ def feed_id(secret: str, url: str) -> str:
     return hashlib.sha1(f"{secret}\x00{url}".encode()).hexdigest()[:12]
 
 
+# An expired challenge is worthless, but the row is the only thing holding the
+# address a stranger typed, so it is swept a day after the code stopped working.
+_OTP_RETENTION = 86_400.0
+
+
 class MatinsStore:
     def __init__(self, path: str, fernet: Fernet):
         self.path = path
@@ -286,12 +293,21 @@ class MatinsStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS emails_by_secret ON emails (secret)"
             )
+            # The mailbox behind the address: gmail dots and +tags collapse here,
+            # so one mailbox cannot become several catalogues (or several hourly
+            # budgets). See matins/identity.py.
+            _ensure_column(conn, "emails", "email_key", "TEXT")
+            _backfill_email_keys(conn)
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS emails_by_key ON emails (email_key)"
+            )
             # One live challenge per address. Only a hash is stored: a database
             # copy must not be enough to replay a code that is still valid.
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS otp (
-                    email TEXT PRIMARY KEY,
+                    identity TEXT PRIMARY KEY,
+                    address TEXT NOT NULL,
                     code_hash TEXT NOT NULL,
                     expires_at REAL NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -299,6 +315,7 @@ class MatinsStore:
                 )
                 """
             )
+            _migrate_otp_identity(conn)
             # Read state for the in-browser reader. Separate from issues: having
             # printed an article is not the same as having read it, and one must
             # not imply the other in the unread count.
@@ -687,23 +704,32 @@ class MatinsStore:
         whoever controls the other mailbox.
         """
         with self._conn() as conn:
+            key = identity_key(email)
             existing = conn.execute(
-                "SELECT secret FROM emails WHERE email = ?", (email,)
+                "SELECT secret, email FROM emails WHERE email_key = ?", (key,)
             ).fetchone()
             if existing is not None and existing["secret"] != secret:
                 raise ValueError("that email already opens another catalogue")
-            conn.execute("DELETE FROM emails WHERE secret = ?", (secret,))
+            # Signing in again with another spelling of the same mailbox keeps the
+            # address already on file: a +tag is a filing rule, not a typo.
+            address = (
+                existing["email"]
+                if existing is not None and existing["secret"] == secret
+                else email
+            )
             conn.execute(
-                "INSERT INTO emails (email, secret, linked_at) VALUES (?, ?, ?)"
-                " ON CONFLICT (email) DO UPDATE SET secret = excluded.secret,"
-                " linked_at = excluded.linked_at",
-                (email, secret, time.time()),
+                "DELETE FROM emails WHERE secret = ? OR email_key = ?", (secret, key)
+            )
+            conn.execute(
+                "INSERT INTO emails (email, secret, linked_at, email_key)"
+                " VALUES (?, ?, ?, ?)",
+                (address, secret, time.time(), key),
             )
 
     def secret_for_email(self, email: str) -> str | None:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT secret FROM emails WHERE email = ?", (email,)
+                "SELECT secret FROM emails WHERE email_key = ?", (identity_key(email),)
             ).fetchone()
         return row["secret"] if row else None
 
@@ -718,38 +744,71 @@ class MatinsStore:
         with self._conn() as conn:
             conn.execute("DELETE FROM emails WHERE secret = ?", (secret,))
 
-    def set_otp(self, email: str, code_hash: str, *, ttl: float) -> None:
+    def set_otp(
+        self, identity: str, address: str, code_hash: str, *, ttl: float
+    ) -> None:
+        """Start a challenge for a mailbox, addressed as the user wrote it.
+
+        `identity` is what the row is keyed on (see identity_key): two spellings
+        of one mailbox overwrite each other rather than each getting a budget."""
         now = time.time()
         with self._conn() as conn:
+            self._purge_expired_otp(conn, now)
             conn.execute(
-                "INSERT INTO otp (email, code_hash, expires_at, attempts, sent_at)"
-                " VALUES (?, ?, ?, 0, ?)"
-                " ON CONFLICT (email) DO UPDATE SET code_hash = excluded.code_hash,"
-                " expires_at = excluded.expires_at, attempts = 0, sent_at = excluded.sent_at",
-                (email, code_hash, now + ttl, now),
+                "INSERT INTO otp (identity, address, code_hash, expires_at, attempts, sent_at)"
+                " VALUES (?, ?, ?, ?, 0, ?)"
+                " ON CONFLICT (identity) DO UPDATE SET address = excluded.address,"
+                " code_hash = excluded.code_hash, expires_at = excluded.expires_at,"
+                " attempts = 0, sent_at = excluded.sent_at",
+                (identity, address, code_hash, now + ttl, now),
             )
 
-    def otp_state(self, email: str) -> dict | None:
+    def purge_expired_otp(self, keep_seconds: float = _OTP_RETENTION) -> int:
+        """Drop challenges that expired a while ago.
+
+        A used code is deleted on the spot, but an abandoned one is not: the row
+        is the only thing holding the address, and nothing needs it once the code
+        has expired. Left alone it keeps a stranger's address forever."""
         with self._conn() as conn:
-            row = conn.execute("SELECT * FROM otp WHERE email = ?", (email,)).fetchone()
+            return self._purge_expired_otp(conn, time.time(), keep_seconds)
+
+    def _purge_expired_otp(
+        self, conn: sqlite3.Connection, now: float, keep_seconds: float = _OTP_RETENTION
+    ) -> int:
+        cursor = conn.execute(
+            "DELETE FROM otp WHERE expires_at < ?", (now - keep_seconds,)
+        )
+        return cursor.rowcount or 0
+
+    def otp_state(self, identity: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM otp WHERE identity = ?", (identity,)
+            ).fetchone()
         return dict(row) if row else None
 
-    def bump_otp_attempts(self, email: str) -> int:
+    def bump_otp_attempts(self, identity: str) -> int:
         with self._conn() as conn:
-            conn.execute("UPDATE otp SET attempts = attempts + 1 WHERE email = ?", (email,))
-            row = conn.execute("SELECT attempts FROM otp WHERE email = ?", (email,)).fetchone()
+            conn.execute(
+                "UPDATE otp SET attempts = attempts + 1 WHERE identity = ?", (identity,)
+            )
+            row = conn.execute(
+                "SELECT attempts FROM otp WHERE identity = ?", (identity,)
+            ).fetchone()
         return row["attempts"] if row else 0
 
-    def clear_otp(self, email: str) -> None:
+    def clear_otp(self, identity: str) -> None:
         with self._conn() as conn:
-            conn.execute("DELETE FROM otp WHERE email = ?", (email,))
+            conn.execute("DELETE FROM otp WHERE identity = ?", (identity,))
 
-    def otp_cooldown_ok(self, email: str, *, cooldown: float) -> bool:
-        """One send per address per cooldown. The hourly cap is a durable
-        limiter keyed by the address (see routes), not a row count — the row is
+    def otp_cooldown_ok(self, identity: str, *, cooldown: float) -> bool:
+        """One send per mailbox per cooldown. The hourly cap is a durable
+        limiter keyed by the identity (see routes), not a row count — the row is
         overwritten in place, so counting it would always say "one"."""
         with self._conn() as conn:
-            row = conn.execute("SELECT sent_at FROM otp WHERE email = ?", (email,)).fetchone()
+            row = conn.execute(
+                "SELECT sent_at FROM otp WHERE identity = ?", (identity,)
+            ).fetchone()
         return row is None or time.time() - row["sent_at"] >= cooldown
 
     # ------------------------------------------------------------- reading
@@ -1473,6 +1532,70 @@ class MatinsStore:
         with self._conn() as conn:
             rows = conn.execute("SELECT * FROM delivery WHERE enabled = 1").fetchall()
         return [_delivery(r, self._fernet) for r in rows]
+
+
+def _backfill_email_keys(conn: sqlite3.Connection) -> None:
+    """Give every linked address the key of the mailbox behind it.
+
+    Also collapses rows that turn out to be the same mailbox (two spellings of
+    one address), keeping the most recently linked: the unique index below can
+    only be built once they agree."""
+    rows = conn.execute(
+        "SELECT email, secret, linked_at FROM emails"
+    ).fetchall()
+    seen: dict[str, tuple[float, str]] = {}
+    for row in rows:
+        key = identity_key(row["email"])
+        linked = float(row["linked_at"] or 0)
+        if key in seen and seen[key][0] >= linked:
+            conn.execute("DELETE FROM emails WHERE email = ?", (row["email"],))
+            continue
+        if key in seen:
+            conn.execute("DELETE FROM emails WHERE email = ?", (seen[key][1],))
+        seen[key] = (linked, row["email"])
+        conn.execute(
+            "UPDATE emails SET email_key = ? WHERE email = ?", (key, row["email"])
+        )
+
+
+def _migrate_otp_identity(conn: sqlite3.Connection) -> None:
+    """Rebuild the pre-identity otp table, keyed by address spelling.
+
+    The rows are ten-minute challenges, but rebuilding rather than dropping keeps
+    an in-flight sign-in alive across the upgrade."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(otp)")}
+    if "identity" in columns or "email" not in columns:
+        return
+    conn.execute(
+        """
+        CREATE TABLE otp_by_identity (
+            identity TEXT PRIMARY KEY,
+            address TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            expires_at REAL NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            sent_at REAL NOT NULL
+        )
+        """
+    )
+    for row in conn.execute(
+        "SELECT email, code_hash, expires_at, attempts, sent_at FROM otp"
+    ).fetchall():
+        conn.execute(
+            "INSERT OR REPLACE INTO otp_by_identity"
+            " (identity, address, code_hash, expires_at, attempts, sent_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                identity_key(row["email"]),
+                row["email"],
+                row["code_hash"],
+                row["expires_at"],
+                row["attempts"],
+                row["sent_at"],
+            ),
+        )
+    conn.execute("DROP TABLE otp")
+    conn.execute("ALTER TABLE otp_by_identity RENAME TO otp")
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:

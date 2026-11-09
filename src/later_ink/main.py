@@ -148,6 +148,14 @@ async def lifespan(app: FastAPI):
         limit=matins_config.get_otp_per_hour(),
         window=3600.0,
     )
+    # The per-address budget can be walked around by respelling one mailbox
+    # (gmail dots, +tags); this one is per connection and does not move.
+    app.state.signin_limiter = DurableLimiter(
+        app.state.store,
+        bucket="signin",
+        limit=matins_config.get_signin_per_ip_hour(),
+        window=3600.0,
+    )
     app.state.feed_limiter = MemoryLimiter(
         limit=config.get_feed_rate_limit(), window=60.0
     )
@@ -170,6 +178,9 @@ async def lifespan(app: FastAPI):
     # store; its tables are disjoint, so the two classes never contend over
     # schema.
     app.state.matins = MatinsStore(config.get_database_path(), fernet)
+    # An abandoned sign-in challenge keeps the address a stranger typed; a day
+    # after the code expired it has no purpose at all.
+    app.state.matins.purge_expired_otp()
     app.state.issues = IssueService(
         app.state.matins,
         matins_config.get_issues_dir(config.get_database_path()),

@@ -852,7 +852,9 @@ def test_signin_codes_expire_and_are_rate_limited(client):
     code = client.sent_codes["ivo@example.com"]
 
     with client.app.state.matins._conn() as conn:
-        conn.execute("UPDATE otp SET expires_at = 0 WHERE email = ?", ("ivo@example.com",))
+        conn.execute(
+            "UPDATE otp SET expires_at = 0 WHERE identity = ?", ("ivo@example.com",)
+        )
     expired = client.post("/signin/code", data={"email": "ivo@example.com", "code": code})
     assert "expired" in expired.text
 
@@ -861,13 +863,105 @@ def test_signin_codes_expire_and_are_rate_limited(client):
 
     with client.app.state.matins._conn() as conn:
         conn.execute(
-            "UPDATE otp SET expires_at = ?, attempts = 5 WHERE email = ?",
+            "UPDATE otp SET expires_at = ?, attempts = 5 WHERE identity = ?",
             (_time.time() + 600, "ivo@example.com"),
         )
     blocked = client.post(
         "/signin/code", data={"email": "ivo@example.com", "code": "111111"}
     )
     assert blocked.status_code == 429
+
+
+def test_one_mailbox_is_one_identity_however_it_is_spelled():
+    from later_ink.matins.identity import identity_key
+
+    # Gmail ignores dots; every provider that supports subaddressing ignores +tag.
+    assert identity_key("A.B+matins@Gmail.com") == identity_key("ab@gmail.com")
+    assert identity_key("ivo+matins@example.com") == identity_key("ivo@example.com")
+    # A provider whose dots mean something keeps them.
+    assert identity_key("i.vo@example.com") != identity_key("ivo@example.com")
+    # A local part that is only "+something" is not subaddressing, and an address
+    # that cannot be split still gets a key of its own.
+    assert identity_key("+tag@example.com") == "+tag@example.com"
+    assert identity_key("not-an-address") == "not-an-address"
+    assert identity_key("") == ""
+
+
+def test_a_respelled_gmail_address_cannot_get_a_second_code(client):
+    """The probe of 6-7 November: dots were a free extra budget per mailbox."""
+    first = client.post("/signin", data={"email": "af.u.c.aj.a.xor.5.84@gmail.com"})
+    assert "Check your email" in first.text
+    second = client.post("/signin", data={"email": "afucajaxor584@gmail.com"})
+    assert "A code was just sent" in second.text
+
+
+def test_a_code_works_whichever_spelling_the_reader_retypes(client):
+    client.post("/signin", data={"email": "a.b@gmail.com"})
+    code = client.sent_codes["a.b@gmail.com"]
+
+    verified = client.post(
+        "/signin/code",
+        data={"email": "ab@gmail.com", "code": code},
+        follow_redirects=False,
+    )
+
+    assert verified.status_code == 303
+
+
+def test_signing_in_again_keeps_the_address_already_on_file(client):
+    store = client.app.state.matins
+    secret = _signup_without_readwise(client)
+    store.link_email(secret, "me+matins@gmail.com")
+
+    store.link_email(secret, "me@gmail.com")
+
+    # The +tag is a filing rule, not a typo: the mailbox is the same one.
+    assert store.email_for_secret(secret) == "me+matins@gmail.com"
+
+
+def test_sign_in_is_also_limited_per_connection(client):
+    from later_ink.ratelimit import DurableLimiter
+
+    client.app.state.signin_limiter = DurableLimiter(
+        client.app.state.store, bucket="signin-test", limit=1, window=3600.0
+    )
+
+    first = client.post("/signin", data={"email": "one@example.com"})
+    second = client.post("/signin", data={"email": "two@example.com"})
+
+    assert "Check your email" in first.text
+    assert second.status_code == 429
+    assert "Too many codes requested from this connection" in second.text
+
+
+def test_an_abandoned_challenge_is_swept_a_day_after_it_expires(client):
+    import time as _time
+
+    store = client.app.state.matins
+    store.set_otp("gone@example.com", "gone@example.com", "x", ttl=1)
+    store.set_otp("live@example.com", "live@example.com", "y", ttl=3600)
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE otp SET expires_at = ? WHERE identity = ?",
+            (_time.time() - 2 * 86400, "gone@example.com"),
+        )
+
+    removed = store.purge_expired_otp()
+
+    assert removed == 1
+    assert store.otp_state("gone@example.com") is None
+    assert store.otp_state("live@example.com") is not None
+
+
+def test_a_challenge_keeps_the_address_it_was_sent_to(client):
+    client.post("/signin", data={"email": "Ivo.B@Example.com"})
+
+    state = client.app.state.matins.otp_state("ivo.b@example.com")
+
+    assert state is not None
+    assert state["identity"] == "ivo.b@example.com"
+    # What the reader typed, so the code goes to the address they own.
+    assert state["address"] == "ivo.b@example.com"
 
 
 def test_signin_does_not_say_whether_an_address_exists(client):
@@ -2944,4 +3038,5 @@ def test_a_story_reaching_the_front_page_is_dated_when_it_arrived(tmp_path, monk
     just = datetime.now(UTC).replace(microsecond=0, tzinfo=None) - timedelta(minutes=5)
     served["xml"] = _hn_xml(("fresh", just.strftime("%a, %d %b %Y %H:%M:%S +0000")))
     assert items()["fresh"] == just
+
 

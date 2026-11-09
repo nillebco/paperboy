@@ -84,6 +84,15 @@ def get_otp_cooldown() -> float:
     return float(_int("OTP_COOLDOWN_SECONDS", 60, minimum=1))
 
 
+def get_signin_per_ip_hour() -> int:
+    """Codes one connection may request per hour, whatever address it names.
+
+    The per-address limit is easy to walk around by respelling one mailbox
+    (gmail dots, +tags), so this is the bound that does not move. 0 disables it.
+    """
+    return _int("SIGNIN_PER_IP_HOUR", 6, minimum=0)
+
+
 def get_admin_token() -> str | None:
     return os.environ.get("ADMIN_TOKEN") or None
 
