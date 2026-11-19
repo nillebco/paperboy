@@ -87,6 +87,13 @@ def trust_proxy_headers() -> bool:
     return os.environ.get("TRUST_PROXY_HEADERS", "").lower() in ("1", "true", "yes")
 
 
+def get_analytics_collect_url() -> str | None:
+    """Collector endpoint for server-side page counts, property id included —
+    e.g. https://analytics.nilleb.com/api/v1/analytics/collect?property_id=<id>.
+    Unset (default) = nothing leaves the box. See analytics.py."""
+    return os.environ.get("ANALYTICS_COLLECT_URL") or None
+
+
 def get_stats_token() -> str | None:
     """When set, the landing page records a server-side referrer log (no IPs or
     cookies) and `/stats?token=<STATS_TOKEN>` shows it. Unset (default) = off, so

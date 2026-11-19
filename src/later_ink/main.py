@@ -17,7 +17,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, config, opds, pages
+from . import __version__, analytics, config, opds, pages
 from .cache import EpubCache, build_cache, cache_key
 from .connectors import readwise
 from .connectors.base import ArticleUnavailable, Connector, Folder, UpstreamError
@@ -381,6 +381,35 @@ async def security_headers(request: Request, call_next):
         # Overwrite rather than setdefault: a catalog feed or a page showing a
         # secret must not sit in a proxy cache, whatever the handler asked for.
         response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+@app.middleware("http")
+async def count_visit(request: Request, call_next):
+    """Report the response to the analytics collector, if one is configured.
+
+    Registered last, so it is outermost and sees the final status — a 429 from
+    the rate limiter or a 301 to the apex is not a visit. Keyed by the matched
+    route template, never the path: catalogue paths start with the secret.
+    """
+    response = await call_next(request)
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    if route_path is None:
+        return response
+    kind = analytics.event_type(
+        request.method, route_path, response.status_code,
+        response.headers.get("content-type", ""),
+    )
+    if kind:
+        analytics.track(
+            route_path=route_path,
+            kind=kind,
+            referer=request.headers.get("referer"),
+            client_ip=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            accept_language=request.headers.get("accept-language"),
+        )
     return response
 
 
